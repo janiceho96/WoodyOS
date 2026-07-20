@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: extractor
+  namespace: ai-nexus
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: ai-nexus-extractor } }
+  template:
+    metadata: { labels: { app: ai-nexus-extractor } }
+    spec:
+      containers:
+        - name: extractor
+          image: your-registry/ai-nexus-extractor:latest
+          ports: [{ containerPort: 8000 }]
+          env: [{ name: EXTRACTOR_TOKEN, valueFrom: { secretKeyRef: { name: ai-nexus-secrets, key: EXTRACTOR_TOKEN } } }]
+          readinessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 5 }
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: extractor, namespace: ai-nexus }
+spec:
+  selector: { app: ai-nexus-extractor }
+  ports: [{ port: 8000, targetPort: 8000 }]

@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: ai-nexus
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: ai-nexus-worker } }
+  template:
+    metadata: { labels: { app: ai-nexus-worker } }
+    spec:
+      containers:
+        - name: worker
+          image: your-registry/ai-nexus-api:latest
+          command: ["node", "dist/worker.js"]
+          envFrom: [{ configMapRef: { name: ai-nexus-config } }, { secretRef: { name: ai-nexus-secrets } }]
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "2", memory: 2Gi } }

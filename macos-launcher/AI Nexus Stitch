@@ -1,0 +1,55 @@
+#!/bin/zsh
+
+launcher_log="/private/tmp/ai-nexus-stitch-launcher.log"
+exec >>"$launcher_log" 2>&1
+
+echo "[$(/bin/date -Iseconds)] Starting AI Nexus Stitch"
+/usr/bin/open -a Docker
+
+docker_binary=""
+if [[ -x /usr/local/bin/docker ]]; then
+  docker_binary="/usr/local/bin/docker"
+elif [[ -x /opt/homebrew/bin/docker ]]; then
+  docker_binary="/opt/homebrew/bin/docker"
+fi
+
+if [[ -z "$docker_binary" ]]; then
+  echo "Docker command was not found."
+  /usr/bin/open -a TextEdit "$launcher_log"
+  exit 1
+fi
+
+docker_ready=false
+for attempt in {1..60}; do
+  if "$docker_binary" info >/dev/null 2>&1; then
+    docker_ready=true
+    break
+  fi
+  /bin/sleep 2
+done
+
+if [[ "$docker_ready" != true ]]; then
+  echo "Docker Desktop did not become ready within two minutes."
+  /usr/bin/open -a TextEdit "$launcher_log"
+  exit 1
+fi
+
+cd "/Users/macjanice/Documents/New project" || exit 1
+if ! "$docker_binary" compose up --build -d; then
+  echo "Docker Compose could not start AI Nexus."
+  /usr/bin/open -a TextEdit "$launcher_log"
+  exit 1
+fi
+
+for attempt in {1..60}; do
+  if /usr/bin/curl --fail --silent http://localhost:3002/health >/dev/null; then
+    echo "AI Nexus Stitch is ready."
+    /usr/bin/open http://localhost:3002/dashboard
+    exit 0
+  fi
+  /bin/sleep 2
+done
+
+echo "AI Nexus started, but the Stitch health endpoint did not become ready."
+/usr/bin/open -a TextEdit "$launcher_log"
+exit 1

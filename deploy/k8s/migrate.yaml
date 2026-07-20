@@ -1,0 +1,17 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: database-migrate
+  namespace: ai-nexus
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { app: ai-nexus-migrate }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: your-registry/ai-nexus-api:latest
+          command: ["node", "dist/db/migrate.js"]
+          envFrom: [{ configMapRef: { name: ai-nexus-config } }, { secretRef: { name: ai-nexus-secrets } }]

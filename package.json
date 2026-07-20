@@ -1,0 +1,41 @@
+{
+  "name": "ai-nexus-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "worker": "tsx src/worker.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@fastify/cors": "^11.0.0",
+    "@fastify/jwt": "10.2.0",
+    "@fastify/multipart": "^9.0.3",
+    "@fastify/oauth2": "^8.0.0",
+    "@fastify/swagger": "^9.4.0",
+    "@fastify/swagger-ui": "^5.2.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.34.0",
+    "dotenv": "^16.5.0",
+    "fastify": "^5.2.0",
+    "ioredis": "^5.4.2",
+    "openai": "^6.48.0",
+    "pg": "^8.13.0",
+    "undici": "8.7.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "4.1.10"
+  }
+}
