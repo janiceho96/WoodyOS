@@ -27,6 +27,9 @@ import { usageRoutes } from './routes/usage.js';
 import { copilotRoutes } from './routes/copilot.js';
 import { artifactRoutes } from './routes/artifacts.js';
 import { presentationThemeRoutes } from './routes/presentation-themes.js';
+import { workflowNodeRoutes } from './routes/workflow-nodes.js';
+import { workflowResourceRoutes } from './routes/workflow-resources.js';
+import { workflowActionRoutes } from './routes/workflow-actions.js';
 
 export async function buildApp() {
   if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) throw new Error('JWT_SECRET must be configured in production');
@@ -64,6 +67,9 @@ export async function buildApp() {
   await app.register(copilotRoutes, { prefix: '/v1/copilot' });
   await app.register(artifactRoutes, { prefix: '/v1/artifacts' });
   await app.register(presentationThemeRoutes, { prefix: '/v1/presentation-themes' });
+  await app.register(workflowNodeRoutes, { prefix: '/v1/workflow-nodes' });
+  await app.register(workflowResourceRoutes, { prefix: '/v1/workflow-resources' });
+  await app.register(workflowActionRoutes, { prefix: '/v1/workflow-actions' });
   return app;
 }
 

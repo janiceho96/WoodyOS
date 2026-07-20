@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, AlertTriangle, Download, Eye, FileArchive, FileSpreadsheet, FileText, LoaderCircle, Play, Presentation, RefreshCw, Square, TerminalSquare, Trash2 } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowUpRight, CalendarDays, CheckCircle2, CircleAlert, Download, Eye, FileArchive, FileSpreadsheet, FileText, LoaderCircle, Play, Presentation, RefreshCw, Search, Square, TerminalSquare, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import remarkGfm from 'remark-gfm';
 import { api, type Artifact, type ArtifactFormat, type TaskDetail } from '../../api';
 import { useWorkspace } from '../../app/workspace';
@@ -12,24 +12,34 @@ import { compact, duration, relative, taskCost } from '../../lib/format';
 export function ExecutionPage({ openTask }: { openTask: () => void }) {
   const { data, reportError } = useWorkspace();
   const [params, setParams] = useSearchParams();
-  const [filter, setFilter] = useState('all');
   const taskId = params.get('task');
   const agentId = params.get('agent');
+  const [filter, setFilter] = useState('all');
+  const [agentFilter, setAgentFilter] = useState(agentId ?? 'all');
+  const [dateFilter, setDateFilter] = useState<'all' | 'today' | 'week'>('all');
+  const [query, setQuery] = useState('');
   const detail = useQuery({ queryKey: ['task', taskId], queryFn: () => api.task(taskId!), enabled: Boolean(taskId), refetchInterval: (query) => {
     const task = query.state.data as TaskDetail | undefined;
     return ['queued', 'running', 'awaiting_approval'].includes(task?.status ?? '') || task?.artifacts?.some((artifact) => artifact.status !== 'ready' && artifact.status !== 'failed') ? 2_500 : false;
   } });
   useEffect(() => { if (detail.error) reportError(detail.error instanceof Error ? detail.error.message : 'Could not open execution'); }, [detail.error]);
-  const filtered = data.tasks.filter((task) => (!agentId || task.agent_id === agentId) && (filter === 'all' || task.status === filter));
+  const filtered = data.tasks.filter((task) => {
+    const created = new Date(task.created_at).getTime();
+    const now = Date.now();
+    const matchesDate = dateFilter === 'all' || (dateFilter === 'today' && now - created <= 86_400_000) || (dateFilter === 'week' && now - created <= 604_800_000);
+    const matchesQuery = !query.trim() || `${task.title} ${task.agent_name ?? ''}`.toLowerCase().includes(query.trim().toLowerCase());
+    return (!agentId || task.agent_id === agentId) && (agentFilter === 'all' || task.agent_id === agentFilter) && (filter === 'all' || task.status === filter) && matchesDate && matchesQuery;
+  });
   const totalCost = taskCost(filtered);
   return <div className="execution-page">
-    <PageHeader eyebrow="Observability" title="Execution Monitor" description="Real task status, event traces, output, errors, runtime, and cost." actions={<><span className="cost-pill">{totalCost.available ? `${totalCost.label} total` : 'Pricing unavailable'}</span><button className="button primary" onClick={openTask}><Play size={15}/>Run task</button></>}/>
+    <PageHeader eyebrow="Activity" title="Runs" description="Inspect agent work, outputs, files, usage, and recovery steps in one place." actions={<><span className="cost-pill">{totalCost.available ? `${totalCost.label} in view` : 'Pricing unavailable'}</span><button className="button primary" onClick={openTask}><Play size={15}/>Run task</button></>}/>
+    <section className="runs-filter-bar panel"><label><Search size={15}/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search task or agent"/></label><select aria-label="Filter runs by status" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">All statuses</option><option value="running">Running</option><option value="queued">Queued</option><option value="awaiting_approval">Needs approval</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option></select><select aria-label="Filter runs by agent" value={agentFilter} onChange={(event) => setAgentFilter(event.target.value)}><option value="all">All agents</option>{data.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select><select aria-label="Filter runs by date" value={dateFilter} onChange={(event) => setDateFilter(event.target.value as typeof dateFilter)}><option value="all">Any date</option><option value="today">Last 24 hours</option><option value="week">Last 7 days</option></select><span><CalendarDays size={14}/>{filtered.length} shown</span></section>
     <div className="execution-layout">
       <section className="panel run-list">
-        <div className="panel-header"><h2>Recent runs</h2><select aria-label="Filter executions" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">All statuses</option><option value="running">Running</option><option value="queued">Queued</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option></select></div>
+        <div className="panel-header"><div><span className="eyebrow">Agent tasks</span><h2>Recent runs</h2></div><small>Workflow runs remain in Workflows</small></div>
         {filtered.length ? <div>{filtered.map((task) => <button className={taskId === task.id ? 'active' : ''} key={task.id} onClick={() => setParams({ task: task.id })}><div><strong>{task.title}</strong><Status value={task.status}/></div><small>{task.agent_name ?? 'AI Agent'} · {relative(task.created_at)}</small><span><small>{taskCost([task]).label}</small>{detail.isFetching && taskId === task.id && <LoaderCircle size={13} className="spin"/>}</span></button>)}</div> : <EmptyState Icon={Activity} title="No executions found" text={data.tasks.length ? 'No runs match this status or agent filter.' : 'Run a task to start the execution timeline.'} action={!data.tasks.length && <button className="button primary" onClick={openTask}>Run task</button>}/>}
       </section>
-      <section className="panel trace-panel">{detail.data ? <ExecutionDetail task={detail.data} refresh={() => void detail.refetch()}/> : detail.isLoading ? <EmptyState Icon={LoaderCircle} title="Loading execution" text="Retrieving the event timeline and output."/> : <EmptyState Icon={TerminalSquare} title="Select an execution" text="Choose a run to inspect its event timeline and rendered output."/>}</section>
+      <section className="panel trace-panel">{detail.data ? <ExecutionDetail task={detail.data} refresh={() => void detail.refetch()}/> : detail.isLoading ? <EmptyState Icon={LoaderCircle} title="Loading execution" text="Retrieving the event timeline and output."/> : <EmptyState Icon={TerminalSquare} title="Select an execution" text="Choose a run to inspect its inputs, timeline, output and files."/>}</section>
     </div>
   </div>;
 }
@@ -37,6 +47,7 @@ export function ExecutionPage({ openTask }: { openTask: () => void }) {
 function ExecutionDetail({ task, refresh }: { task: TaskDetail; refresh: () => void }) {
   const queryClient = useQueryClient();
   const { report, reportError } = useWorkspace();
+  const navigate = useNavigate();
   const cancel = useMutation({
     mutationFn: () => api.cancelTask(task.id),
     onSuccess: async () => { report('Task cancelled'); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); await queryClient.invalidateQueries({ queryKey: ['task', task.id] }); },
@@ -45,14 +56,32 @@ function ExecutionDetail({ task, refresh }: { task: TaskDetail; refresh: () => v
   const cancellable = ['queued', 'running', 'awaiting_approval'].includes(task.status);
   const cost = taskCost([task], 5);
   return <div className="execution-detail">
-    <div className="trace-head"><div><span className="eyebrow">trace:{task.id.slice(0, 8)}</span><h2>{task.title}</h2><p>{task.agent_name ?? 'AI Agent'} · created {new Date(task.created_at).toLocaleString()}</p></div><div><Status value={task.status}/><button className="icon-button" onClick={refresh} aria-label="Refresh execution"><RefreshCw size={16}/></button>{cancellable && <button className="button danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}><Square size={13}/>Cancel</button>}</div></div>
+    <div className="trace-head"><div><span className="eyebrow">run:{task.id.slice(0, 8)}</span><h2>{task.title}</h2><p>{task.agent_name ?? 'AI Agent'} · created {new Date(task.created_at).toLocaleString()}</p></div><div><Status value={task.status}/><button className="icon-button" onClick={refresh} aria-label="Refresh execution"><RefreshCw size={16}/></button>{cancellable && <button className="button danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}><Square size={13}/>Cancel</button>}</div></div>
+    <RunStatusGuide task={task} openAgent={() => navigate(`/agents/${task.agent_id}/edit`)}/>
     <div className="execution-stats"><span><small>Duration</small><strong>{task.duration_ms ? duration(task.duration_ms) : '—'}</strong></span><span><small>Input tokens</small><strong>{compact(task.token_input ?? 0)}</strong></span><span><small>Output tokens</small><strong>{compact(task.token_output ?? 0)}</strong></span><span><small>Cost</small><strong>{cost.label}</strong></span></div>
-    <div className="trace-timeline"><h3>Event timeline</h3>{task.events.length ? task.events.map((event) => <div key={event.id}><i/><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><p>{event.message}</p>{event.payload && Object.keys(event.payload).length > 0 && <code>{JSON.stringify(event.payload)}</code>}</span></div>) : <p>No events recorded yet.</p>}</div>
+    {task.input && Object.keys(task.input).length > 0 && <section className="run-input-section"><div className="section-title"><div><span className="eyebrow">Request</span><h3>Input provided</h3></div></div><OutputViewer value={task.input}/></section>}
+    <div className="trace-timeline"><h3>Event timeline</h3>{task.events.length ? task.events.map((event) => <div key={event.id}><i/><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><p>{event.message}</p>{event.payload && Object.keys(event.payload).length > 0 && <details className="event-data"><summary>Technical event data</summary><code>{JSON.stringify(event.payload)}</code></details>}</span></div>) : <p>No events recorded yet.</p>}</div>
     {(task.output !== null && task.output !== undefined) && <section className="output-section"><h3>Agent result</h3><OutputViewer value={task.output}/></section>}
     <ArtifactPanel task={task} refresh={refresh}/>
     {(task.error !== null && task.error !== undefined) && <section className="output-section error"><h3>Execution error</h3><OutputViewer value={task.error} error/></section>}
     {task.status === 'completed' && (task.output === null || task.output === undefined) && <section className="output-section"><h3>Agent result</h3><p>This task completed without an output payload.</p></section>}
   </div>;
+}
+
+function RunStatusGuide({ task, openAgent }: { task: TaskDetail; openAgent: () => void }) {
+  if (task.status === 'failed') return <section className="run-status-guide failed"><CircleAlert size={20}/><div><strong>This run needs attention</strong><p>{failureGuidance(task.error)}</p><span>Nothing will retry automatically. Review the agent setup or start a new task after fixing the cause.</span></div><button className="button" onClick={openAgent}>Open agent <ArrowUpRight size={14}/></button></section>;
+  if (task.status === 'awaiting_approval') return <section className="run-status-guide waiting"><AlertTriangle size={20}/><div><strong>Waiting for approval</strong><p>This task is paused until an authorized person approves the required action.</p></div></section>;
+  if (task.status === 'completed') return <section className="run-status-guide complete"><CheckCircle2 size={20}/><div><strong>Run completed</strong><p>Review the result below, then open or download any requested files.</p></div></section>;
+  return <section className="run-status-guide active"><Activity size={20}/><div><strong>{task.status === 'queued' ? 'Run is queued' : 'Run is in progress'}</strong><p>Woody refreshes this view while the task and any requested file generation are still active.</p></div></section>;
+}
+
+function failureGuidance(error: unknown) {
+  const raw = outputText(error) ?? (typeof error === 'string' ? error : JSON.stringify(error ?? ''));
+  const value = raw.toLowerCase();
+  if (value.includes('budget') || value.includes('quota')) return 'The workspace AI budget was reached. Increase the budget or wait for it to reset, then start a new task.';
+  if (value.includes('api') || value.includes('provider') || value.includes('model')) return 'The configured AI provider or model could not complete this request. Check the agent model and AI provider settings.';
+  if (value.includes('tool') || value.includes('mcp') || value.includes('unauthorized')) return 'A connected integration was unavailable or not permitted. Review the agent access and connection health.';
+  return 'The run stopped before it could complete. Open the agent to review its instructions, model, and permitted integrations, then start a new task.';
 }
 
 function outputText(value: unknown) {

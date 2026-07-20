@@ -1,7 +1,12 @@
 import { z } from 'zod';
+import { workflowNodeConfigErrors, workflowNodeTypeSchema } from './registry.js';
 
-export const workflowNodeTypeSchema = z.enum(['trigger', 'agent', 'action', 'condition', 'approval', 'loop', 'output']);
-export const workflowNodeSchema = z.object({ id: z.string().min(1).max(100), type: workflowNodeTypeSchema, config: z.record(z.unknown()).default({}) });
+const reservedStateKeys = new Set(['__proto__', 'prototype', 'constructor', 'nodes', 'input', 'variables', 'workflow']);
+export const workflowNodeSchema = z.object({
+  id: z.string().min(1).max(100).regex(/^[A-Za-z][A-Za-z0-9_-]*$/, 'Node IDs must start with a letter and contain only letters, numbers, underscores, or hyphens').refine((id) => !reservedStateKeys.has(id), 'Node ID is reserved'),
+  type: workflowNodeTypeSchema,
+  config: z.record(z.unknown()).default({}),
+});
 export const workflowEdgeSchema = z.object({ source: z.string().min(1), target: z.string().min(1), condition: z.string().max(30).optional() });
 export const workflowDefinitionSchema = z.object({ nodes: z.array(workflowNodeSchema).min(2).max(200), edges: z.array(workflowEdgeSchema).max(500) });
 
@@ -81,6 +86,12 @@ function loopConfigErrors(node: WorkflowNode) {
   if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 100) errors.push(`Loop node ${node.id} maxIterations must be between 1 and 100`);
   if (!['fail', 'exit'].includes(String(node.config.onLimit ?? 'fail'))) errors.push(`Loop node ${node.id} onLimit must be fail or exit`);
   if (mode === 'forEach' && !String(node.config.collectionPath ?? '').trim()) errors.push(`For-each loop ${node.id} needs collectionPath`);
+  if (mode === 'forEach') {
+    for (const [field, fallback] of [['itemVariable', 'item'], ['indexVariable', 'index']] as const) {
+      const value = String(node.config[field] ?? fallback);
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(value) || reservedStateKeys.has(value)) errors.push(`Loop node ${node.id} ${field} must be a safe non-reserved variable name`);
+    }
+  }
   if (mode === 'while') {
     const condition = node.config.condition;
     if (!condition || typeof condition !== 'object' || Array.isArray(condition)) errors.push(`While loop ${node.id} needs a condition object`);
@@ -122,6 +133,7 @@ export function workflowDefinitionErrors(definition: WorkflowDefinition) {
       const formats = node.config.artifactFormats;
       if (formats !== undefined && (!Array.isArray(formats) || formats.some((format) => typeof format !== 'string' || !artifactFormats.has(format)) || new Set(formats).size !== formats.length)) errors.push(`Output node ${node.id} artifactFormats must contain unique pdf, docx, pptx or xlsx values`);
     }
+    errors.push(...workflowNodeConfigErrors(node));
     errors.push(...retryConfigErrors(node));
   }
 

@@ -129,21 +129,21 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     const workflowId = record.created_resource_ids.workflowId;
     if (!workflowId) return reply.code(409).send({ error: 'SOLUTION_WORKFLOW_MISSING' });
     await assertWorkspaceAiBudgetAvailable(request.user.workspaceId);
-    const workflow = await query<{ id: string; definition: WorkflowDefinition }>(
-      'SELECT id,definition FROM workflows WHERE id=$1 AND workspace_id=$2',
+    const workflow = await query<{ id: string; definition: WorkflowDefinition; draft_revision: number }>(
+      "SELECT id,definition,draft_revision FROM workflows WHERE id=$1 AND workspace_id=$2 AND status <> 'archived'",
       [workflowId, request.user.workspaceId],
     );
     if (!workflow.rowCount) return reply.code(409).send({ error: 'SOLUTION_WORKFLOW_MISSING' });
     const definition = workflow.rows[0].definition;
     const trigger = definition.nodes.find((node) => node.type === 'trigger');
     if (!trigger) return reply.code(409).send({ error: 'SOLUTION_WORKFLOW_TRIGGER_MISSING' });
-    const initialState = { input: runInput, ...runInput };
+    const initialState = { ...runInput, input: runInput, nodes: {}, variables: {} };
     const run = await query(
-      `INSERT INTO workflow_runs(workspace_id,workflow_id,input,definition_snapshot,state,cursor)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      `INSERT INTO workflow_runs(workspace_id,workflow_id,input,definition_snapshot,state,cursor,run_mode,draft_revision)
+       VALUES($1,$2,$3,$4,$5,$6,'test',$7) RETURNING *`,
       [
         request.user.workspaceId, workflowId, JSON.stringify(runInput), JSON.stringify(definition),
-        JSON.stringify(initialState), JSON.stringify({ nodeId: trigger.id, loops: {}, attempt: 1 }),
+        JSON.stringify(initialState), JSON.stringify({ nodeId: trigger.id, loops: {}, attempt: 1 }), workflow.rows[0].draft_revision,
       ],
     );
     await query(
@@ -177,8 +177,9 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
         id: string;
         created_resource_ids: { agentIds?: Record<string, string>; workflowId?: string };
         last_test_status: string | null;
+        last_test_revision: number | null;
       }>(
-        `SELECT i.id,i.created_resource_ids,r.status last_test_status
+        `SELECT i.id,i.created_resource_ids,r.status last_test_status,r.draft_revision last_test_revision
          FROM agent_solution_installations i
          LEFT JOIN workflow_runs r ON r.id=i.last_test_run_id
          WHERE i.id=$1 AND i.workspace_id=$2 AND i.status='draft' FOR UPDATE OF i`,
@@ -202,9 +203,29 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
         "UPDATE agents SET status='active',updated_at=now() WHERE workspace_id=$1 AND id=ANY($2::uuid[]) AND status='draft'",
         [request.user.workspaceId, agentIds],
       );
-      await client.query(
-        'UPDATE workflows SET enabled=true,updated_at=now() WHERE id=$1 AND workspace_id=$2',
+      const workflow = await client.query<{ id: string; name: string; description: string; definition: WorkflowDefinition; draft_revision: number }>(
+        "SELECT id,name,description,definition,draft_revision FROM workflows WHERE id=$1 AND workspace_id=$2 AND status <> 'archived' FOR UPDATE",
         [resources.workflowId, request.user.workspaceId],
+      );
+      if (!workflow.rowCount || installation.rows[0].last_test_revision !== workflow.rows[0].draft_revision) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ error: 'SOLUTION_CURRENT_DRAFT_TEST_REQUIRED' });
+      }
+      const nextVersion = await client.query<{ version: number }>(
+        'SELECT COALESCE(MAX(version),0)+1 version FROM workflow_versions WHERE workflow_id=$1',
+        [resources.workflowId],
+      );
+      const version = await client.query<{ id: string }>(
+        `INSERT INTO workflow_versions(workspace_id,workflow_id,version,name,description,definition,published_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [
+          request.user.workspaceId, resources.workflowId, nextVersion.rows[0].version, workflow.rows[0].name,
+          workflow.rows[0].description, JSON.stringify(workflow.rows[0].definition), request.user.sub,
+        ],
+      );
+      await client.query(
+        "UPDATE workflows SET published_version_id=$1,status='published',enabled=true,updated_at=now() WHERE id=$2 AND workspace_id=$3",
+        [version.rows[0].id, resources.workflowId, request.user.workspaceId],
       );
       await client.query(
         "UPDATE agent_solution_installations SET status='active',activated_at=now(),updated_at=now() WHERE id=$1",

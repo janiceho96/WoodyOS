@@ -9,6 +9,13 @@ const inputSchema = z.object({ name: z.string().min(1).max(260), sourceType: z.e
 const searchInput = z.object({ query: z.string().min(2).max(1000), limit: z.number().int().min(1).max(20).default(8) });
 export async function knowledgeRoutes(app: FastifyInstance) {
   app.get('/documents', { preHandler: app.authenticate }, asyncRoute(async (request) => ({ data: (await query('SELECT id,name,source_type,source_uri,status,metadata,created_at,updated_at FROM knowledge_documents WHERE workspace_id=$1 ORDER BY created_at DESC', [request.user.workspaceId])).rows })));
+  app.get('/documents/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    const document = (await query('SELECT id,name,source_type,source_uri,status,metadata,content,created_at,updated_at FROM knowledge_documents WHERE id=$1 AND workspace_id=$2', [id, request.user.workspaceId])).rows[0];
+    if (!document) return reply.code(404).send({ error: 'DOCUMENT_NOT_FOUND' });
+    const chunks = await query('SELECT id,ordinal,content,metadata FROM knowledge_chunks WHERE document_id=$1 AND workspace_id=$2 ORDER BY ordinal LIMIT 100', [id, request.user.workspaceId]);
+    return { ...document, chunks: chunks.rows, chunk_count: chunks.rows.length };
+  }));
   app.post('/documents', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(inputSchema, request.body, reply); if (!input) return;
     const result = await query('INSERT INTO knowledge_documents(workspace_id,name,source_type,source_uri,content,metadata,created_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,source_type,status,created_at', [request.user.workspaceId, input.name, input.sourceType, input.sourceUri ?? null, input.content ?? null, JSON.stringify(input.metadata), request.user.sub]);

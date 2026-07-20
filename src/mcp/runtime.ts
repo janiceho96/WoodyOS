@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 import { query } from '../db/client.js';
@@ -6,6 +5,7 @@ import type { EncryptedPayload } from '../lib/crypto.js';
 import { decryptMcpCredentials, requestHeaders } from './credentials.js';
 import { McpError } from './errors.js';
 import { mcpTransport } from './transports/index.js';
+import { actionArgumentHash, limitedActionResult, safeActionSummary } from '../lib/action-safety.js';
 
 export type AuthorizedMcpTool = {
   id: string;
@@ -42,6 +42,11 @@ export async function authorizedMcpTools(workspaceId: string, agentId: string) {
      AND t.enabled=true AND connection_access.enabled=true AND tool_access.enabled=true`,
     [workspaceId, agentId],
   )).rows;
+}
+
+export async function authorizedMcpTool(workspaceId: string, agentId: string, toolId: string) {
+  const tools = await authorizedMcpTools(workspaceId, agentId);
+  return tools.find((tool) => tool.id === toolId) ?? null;
 }
 
 function description(tool: AuthorizedMcpTool) {
@@ -89,39 +94,24 @@ export function assertMcpPermission(tool: AuthorizedMcpTool) {
   }
 }
 
-function redact(value: unknown, depth = 0): unknown {
-  if (depth > 6) return '[truncated]';
-  if (Array.isArray(value)) return value.slice(0, 50).map((entry) => redact(entry, depth + 1));
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 100).map(([key, entry]) => [
-      key,
-      /token|password|secret|authorization|api[-_]?key|cookie/i.test(key) ? '[redacted]' : redact(entry, depth + 1),
-    ]));
-  }
-  if (typeof value === 'string') return value.length > 500 ? `${value.slice(0, 500)}…` : value;
-  return value;
-}
-
 export function safeArgumentsSummary(input: Record<string, unknown>) {
-  return redact(input) as Record<string, unknown>;
+  return safeActionSummary(input);
 }
 
 export function argumentHash(input: Record<string, unknown>) {
-  return createHash('sha256').update(JSON.stringify(input)).digest('hex');
-}
-
-function limitedResult(result: unknown) {
-  const json = JSON.stringify(redact(result));
-  if (json.length <= 50_000) return JSON.parse(json) as unknown;
-  return { truncated: true, preview: json.slice(0, 50_000) };
+  return actionArgumentHash(input);
 }
 
 export async function executeAuthorizedMcpTool(input: {
   tool: AuthorizedMcpTool;
   arguments_: Record<string, unknown>;
   agentId: string;
-  taskId: string;
+  taskId?: string | null;
   workflowRunId?: string | null;
+  workflowNodeId?: string | null;
+  workflowIterationKey?: string | null;
+  workflowAttempt?: number | null;
+  workflowActionAuthorizationId?: string | null;
   toolCallId?: string;
 }) {
   assertMcpPermission(input.tool);
@@ -129,16 +119,21 @@ export async function executeAuthorizedMcpTool(input: {
   if (!callId) {
     callId = (await query<{ id: string }>(
       `INSERT INTO mcp_tool_calls(
-         workspace_id,connection_id,mcp_tool_id,agent_id,task_id,workflow_run_id,status,risk_level,
-         arguments_summary,arguments_hash,started_at
-       ) VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8,$9,now()) RETURNING id`,
+         workspace_id,connection_id,mcp_tool_id,agent_id,task_id,workflow_run_id,
+         workflow_node_id,workflow_iteration_key,workflow_attempt,workflow_action_authorization_id,
+         status,risk_level,arguments_summary,arguments_hash,started_at
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',$11,$12,$13,now()) RETURNING id`,
       [
         input.tool.workspace_id,
         input.tool.connection_id,
         input.tool.id,
         input.agentId,
-        input.taskId,
+        input.taskId ?? null,
         input.workflowRunId ?? null,
+        input.workflowNodeId ?? null,
+        input.workflowIterationKey ?? null,
+        input.workflowAttempt ?? null,
+        input.workflowActionAuthorizationId ?? null,
         input.tool.risk_level,
         JSON.stringify(safeArgumentsSummary(input.arguments_)),
         argumentHash(input.arguments_),
@@ -158,7 +153,7 @@ export async function executeAuthorizedMcpTool(input: {
     const session = await mcpTransport(input.tool.transport).connect({ endpointUrl: input.tool.endpoint_url, headers });
     try {
       const result = await session.callTool(input.tool.remote_name, input.arguments_);
-      const safeResult = limitedResult(result);
+      const safeResult = limitedActionResult(result);
       await query(
         `UPDATE mcp_tool_calls SET status=$1,result_summary=$2,duration_ms=$3,completed_at=now()
          WHERE id=$4 AND workspace_id=$5`,

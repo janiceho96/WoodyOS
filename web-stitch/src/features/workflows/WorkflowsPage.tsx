@@ -1,64 +1,121 @@
+import type { Connection } from '@xyflow/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, Bot, CheckCircle2, Download, Edit3, FileOutput, GitBranch, LoaderCircle, Play, Plus, RefreshCw, Repeat2, Save, ShieldCheck, Split, Trash2, Wrench, X, Zap } from 'lucide-react';
-import { useMemo, useState } from 'react';
-import { api, type Artifact, type ArtifactFormat, type Workflow, type WorkflowDefinition, type WorkflowNode } from '../../api';
+import { AlertTriangle, Blocks, Bot, BrainCircuit, CheckCircle2, Download, Edit3, FileOutput, GitBranch, LoaderCircle, Play, Plus, RefreshCw, Rocket, Save, Search, ShieldCheck, TestTube2, Trash2, Wrench, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api, type Artifact, type Workflow, type WorkflowDefinition, type WorkflowEditorLayout, type WorkflowNode, type WorkflowNodeCatalogEntry, type WorkflowResources } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
 import { relative } from '../../lib/format';
+import { WorkflowCanvas } from './WorkflowCanvas';
+import { autoLayoutPositions } from './workflowLayout';
 
-type EditableNodeType = 'agent' | 'action' | 'condition' | 'approval' | 'loop';
-type EdgeDraft = { source: string; target: string; condition: string };
+type PositionRecord = { nodeId: string; x: number; y: number };
+type GraphSnapshot = { nodes: WorkflowNode[]; edges: WorkflowDefinition['edges']; positions: PositionRecord[] };
 
 const initialNodes = (): WorkflowNode[] => [
   { id: 'trigger-1', type: 'trigger', config: { event: 'manual' } },
   { id: 'output-1', type: 'output', config: { artifactFormats: [] } },
 ];
-const initialEdges = () => [{ source: 'trigger-1', target: 'output-1' }];
+const initialEdges = (): WorkflowDefinition['edges'] => [{ source: 'trigger-1', target: 'output-1' }];
+const initialPositions = () => autoLayoutPositions(initialNodes(), initialEdges());
+const emptyResources: WorkflowResources = { version: 1, agents: [], apiTools: [], mcpTools: [], knowledge: { scope: 'workspace', total: 0, ready: 0, processing: 0, failed: 0 } };
 
 function idFor(type: WorkflowNode['type']) {
-  return `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  return `${type.replaceAll('_', '-')}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
 function parseValue(value: string) {
   try { return JSON.parse(value); } catch { return value; }
 }
 
-function configFor(type: EditableNodeType, agentId: string, toolId: string): Record<string, unknown> {
-  if (type === 'agent') return { agentId, responsibility: '', expectedOutput: 'Markdown', retry: { maxAttempts: 1, initialDelayMs: 1000, multiplier: 2, maxDelayMs: 60000 } };
-  if (type === 'action') return { toolId, input: {}, retry: { maxAttempts: 1, initialDelayMs: 1000, multiplier: 2, maxDelayMs: 60000 } };
+function configFor(type: WorkflowNode['type'], resources: WorkflowResources): Record<string, unknown> {
+  if (type === 'agent') return { agentId: resources.agents[0]?.id ?? '', responsibility: '', expectedOutput: 'Markdown', retry: { maxAttempts: 1, initialDelayMs: 1000, multiplier: 2, maxDelayMs: 60000 } };
+  if (type === 'action') return { toolId: resources.apiTools[0]?.id ?? '', input: {}, retry: { maxAttempts: 1, initialDelayMs: 1000, multiplier: 2, maxDelayMs: 60000 } };
+  if (type === 'api_action') return { toolId: resources.apiTools[0]?.id ?? '', input: {} };
+  if (type === 'mcp_action') return { agentId: resources.mcpTools[0]?.agentId ?? '', mcpToolId: resources.mcpTools[0]?.id ?? '', input: {} };
+  if (type === 'knowledge_search') return { query: '{{ input.query }}', limit: 8 };
   if (type === 'condition') return { path: 'input.approved', operator: 'equals', value: true };
   if (type === 'loop') return { mode: 'forEach', collectionPath: 'input.items', itemVariable: 'item', indexVariable: 'index', maxIterations: 10, onLimit: 'fail' };
-  return { prompt: 'Review this workflow step before it continues.' };
+  if (type === 'approval') return { prompt: 'Review this workflow step before it continues.' };
+  return {};
+}
+
+function cloneSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
+  return {
+    nodes: snapshot.nodes.map((node) => ({ ...node, config: structuredClone(node.config) })),
+    edges: snapshot.edges.map((edge) => ({ ...edge })),
+    positions: snapshot.positions.map((position) => ({ ...position })),
+  };
 }
 
 export function WorkflowsPage() {
   const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
+  const catalogQuery = useQuery({ queryKey: ['workflow-node-catalog'], queryFn: api.workflowNodeCatalog });
+  const resourcesQuery = useQuery({ queryKey: ['workflow-resources'], queryFn: api.workflowResources });
+  const catalog = useMemo(() => catalogQuery.data?.data ?? [], [catalogQuery.data]);
+  const resources = resourcesQuery.data ?? emptyResources;
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [loadingWorkflowId, setLoadingWorkflowId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [nodes, setNodes] = useState<WorkflowNode[]>(initialNodes);
   const [edges, setEdges] = useState<WorkflowDefinition['edges']>(initialEdges);
-  const [nodeType, setNodeType] = useState<EditableNodeType>('agent');
-  const [selectedAgent, setSelectedAgent] = useState(data.agents.find((agent) => agent.status === 'active')?.id ?? '');
-  const [selectedTool, setSelectedTool] = useState(data.tools.find((tool) => tool.enabled)?.id ?? '');
+  const [positions, setPositions] = useState<PositionRecord[]>(initialPositions);
+  const [viewport, setViewport] = useState<WorkflowEditorLayout['viewport']>({ x: 0, y: 0, zoom: 1 });
   const [selectedNodeId, setSelectedNodeId] = useState('trigger-1');
-  const [edgeDraft, setEdgeDraft] = useState<EdgeDraft>({ source: 'trigger-1', target: 'output-1', condition: '' });
+  const [paletteSearch, setPaletteSearch] = useState('');
+  const [simpleMode, setSimpleMode] = useState(true);
+  const [past, setPast] = useState<GraphSnapshot[]>([]);
+  const [future, setFuture] = useState<GraphSnapshot[]>([]);
+  const [canvasRevision, setCanvasRevision] = useState(0);
+  const [savedWorkflow, setSavedWorkflow] = useState<Workflow | null>(null);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(true);
+  const [testedRevision, setTestedRevision] = useState<number | null>(null);
   const [runTarget, setRunTarget] = useState<Workflow | null>(null);
+  const [runMode, setRunMode] = useState<'test' | 'production'>('production');
+  const [testTargetNodeId, setTestTargetNodeId] = useState<string | null>(null);
   const [runInput, setRunInput] = useState('{}');
   const [runId, setRunId] = useState('');
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? nodes[0];
+  const selectedDefinition = catalog.find((entry) => entry.type === selectedNode?.type);
 
-  const reset = () => {
-    setEditingId(null); setName(''); setDescription(''); setNodes(initialNodes()); setEdges(initialEdges()); setSelectedNodeId('trigger-1');
+  const snapshot = useCallback(() => cloneSnapshot({ nodes, edges, positions }), [nodes, edges, positions]);
+  const commit = useCallback((next: GraphSnapshot) => {
+    setPast((current) => [...current, snapshot()].slice(-50));
+    setFuture([]);
+    const cloned = cloneSnapshot(next);
+    setNodes(cloned.nodes); setEdges(cloned.edges); setPositions(cloned.positions);
+    setHasUnsavedChanges(true);
+  }, [snapshot]);
+  const undo = () => {
+    const previous = past.at(-1); if (!previous) return;
+    setFuture((current) => [snapshot(), ...current].slice(0, 50));
+    setPast((current) => current.slice(0, -1));
+    const restored = cloneSnapshot(previous); setNodes(restored.nodes); setEdges(restored.edges); setPositions(restored.positions); setHasUnsavedChanges(true);
   };
+  const redo = () => {
+    const next = future[0]; if (!next) return;
+    setPast((current) => [...current, snapshot()].slice(-50));
+    setFuture((current) => current.slice(1));
+    const restored = cloneSnapshot(next); setNodes(restored.nodes); setEdges(restored.edges); setPositions(restored.positions); setHasUnsavedChanges(true);
+  };
+  const reset = () => {
+    const freshNodes = initialNodes(); const freshEdges = initialEdges();
+    setEditingId(null); setSavedWorkflow(null); setName(''); setDescription(''); setNodes(freshNodes); setEdges(freshEdges); setPositions(autoLayoutPositions(freshNodes, freshEdges)); setViewport({ x: 0, y: 0, zoom: 1 }); setSelectedNodeId('trigger-1'); setPast([]); setFuture([]); setTestedRevision(null); setHasUnsavedChanges(true); setCanvasRevision((value) => value + 1);
+  };
+
   const save = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (name.trim().length < 2) throw new Error('Workflow name needs at least 2 characters.');
-      const body = { name: name.trim(), description: description.trim(), definition: { nodes, edges }, enabled: true };
-      return editingId ? api.updateWorkflow(editingId, body) : api.createWorkflow(body);
+      const body = { name: name.trim(), description: description.trim(), definition: { nodes, edges }, ...(editingId ? {} : { enabled: false }) };
+      const saved = editingId ? await api.updateWorkflow(editingId, body) : await api.createWorkflow(body);
+      const completePositions = nodes.map((node, index) => positions.find((position) => position.nodeId === node.id) ?? { nodeId: node.id, x: 50 + index * 285, y: 280 });
+      try { await api.saveWorkflowLayout(saved.id, { schemaVersion: 1, positions: completePositions, viewport }); }
+      catch (error) { throw new Error(`${editingId ? 'Workflow changes were saved' : 'Workflow was created'}, but the canvas layout could not be saved: ${error instanceof Error ? error.message : 'unknown layout error'}`); }
+      return saved;
     },
-    onSuccess: async () => { report(editingId ? 'Workflow updated and validated' : 'Workflow saved and validated'); reset(); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); },
+    onSuccess: async (saved) => { setEditingId(saved.id); setSavedWorkflow(saved); setHasUnsavedChanges(false); setTestedRevision(saved.latest_test_revision === saved.draft_revision && saved.latest_test_status === 'completed' ? saved.draft_revision : null); report('Draft and canvas saved. Test this revision before publishing.'); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not save workflow'),
   });
   const run = useMutation({
@@ -66,9 +123,10 @@ export function WorkflowsPage() {
       if (!runTarget) throw new Error('Choose a workflow.');
       const parsed = JSON.parse(runInput || '{}');
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Workflow input must be a JSON object.');
-      return api.runWorkflow(runTarget.id, parsed);
+      if (runMode === 'test' && testTargetNodeId) return api.testWorkflowNode(runTarget.id, testTargetNodeId, parsed);
+      return runMode === 'test' ? api.testWorkflow(runTarget.id, parsed) : api.runWorkflow(runTarget.id, parsed);
     },
-    onSuccess: async (result) => { setRunId(result.id); setRunTarget(null); report('Workflow run queued'); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); },
+    onSuccess: async (result) => { setRunId(result.id); setRunTarget(null); report(runMode === 'test' ? 'Draft test queued' : 'Workflow run queued'); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not run workflow'),
   });
   const runDetail = useQuery({
@@ -78,67 +136,165 @@ export function WorkflowsPage() {
       return ['queued', 'running', 'awaiting_approval'].includes(detail?.status ?? '') || detail?.artifacts?.some((item) => !['ready', 'failed', 'skipped'].includes(item.status)) ? 2_000 : false;
     },
   });
+  useEffect(() => {
+    if (runDetail.data?.run_mode === 'test' && !runDetail.data.test_target_node_id && runDetail.data.status === 'completed' && runDetail.data.draft_revision) {
+      setTestedRevision(runDetail.data.draft_revision);
+      void queryClient.invalidateQueries({ queryKey: ['workspace'] });
+    }
+  }, [queryClient, runDetail.data?.draft_revision, runDetail.data?.run_mode, runDetail.data?.status, runDetail.data?.test_target_node_id]);
+  const publish = useMutation({
+    mutationFn: () => {
+      if (!editingId) throw new Error('Save the workflow draft first.');
+      return api.publishWorkflow(editingId);
+    },
+    onSuccess: async (workflow) => { setSavedWorkflow(workflow); report(`Workflow version ${workflow.published_version ?? 1} published`); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); },
+    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not publish workflow'),
+  });
   const decide = useMutation({
     mutationFn: ({ approvalId, decision }: { approvalId: string; decision: 'approved' | 'rejected' }) => api.decideWorkflowApproval(runId, approvalId, decision),
     onSuccess: async (_, variables) => { report(`Workflow ${variables.decision}`); await runDetail.refetch(); },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not resolve approval'),
   });
+  const decideAction = useMutation({
+    mutationFn: ({ authorizationId, decision }: { authorizationId: string; decision: 'approved' | 'rejected' }) => api.decideWorkflowAction(authorizationId, decision),
+    onSuccess: async (_, variables) => { report(`External action ${variables.decision}`); await runDetail.refetch(); },
+    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not resolve action confirmation'),
+  });
 
-  const addNode = () => {
-    if (nodeType === 'agent' && !selectedAgent) return reportError('Choose an active agent first.');
-    if (nodeType === 'action' && !selectedTool) return reportError('Choose an enabled tool first.');
-    const node: WorkflowNode = { id: idFor(nodeType), type: nodeType, config: configFor(nodeType, selectedAgent, selectedTool) };
-    setNodes((current) => [...current.slice(0, -1), node, current[current.length - 1]]);
-    if (nodes.length === 2 && edges.length === 1 && edges[0].source === 'trigger-1' && edges[0].target === 'output-1') {
-      setEdges(nodeType === 'condition' || nodeType === 'loop' ? [{ source: 'trigger-1', target: node.id }] : [{ source: 'trigger-1', target: node.id }, { source: node.id, target: 'output-1' }]);
+  const addNode = (type: WorkflowNode['type'], position?: { x: number; y: number }) => {
+    if (['trigger', 'output'].includes(type)) return;
+    const definition = catalog.find((entry) => entry.type === type);
+    if (!definition?.available) return reportError(definition?.availabilityReason ?? 'That node is unavailable.');
+    const config = configFor(type, resources);
+    if (type === 'agent' && !config.agentId) return reportError('Create or activate an agent before adding an Agent node.');
+    if (['action', 'api_action'].includes(type) && !config.toolId) return reportError('Connect an API tool before adding an API action.');
+    if (type === 'mcp_action' && (!config.agentId || !config.mcpToolId)) return reportError('Assign an enabled MCP tool to an active agent before adding an App action.');
+    const node: WorkflowNode = { id: idFor(type), type, config };
+    const outputIndex = Math.max(1, nodes.findIndex((item) => item.type === 'output'));
+    const nextNodes = [...nodes.slice(0, outputIndex), node, ...nodes.slice(outputIndex)];
+    let nextEdges = edges;
+    if (nodes.length === 2 && edges.length === 1 && edges[0].source === nodes[0].id && edges[0].target === nodes[1].id) {
+      nextEdges = ['condition', 'loop'].includes(type) ? [{ source: nodes[0].id, target: node.id }] : [{ source: nodes[0].id, target: node.id }, { source: node.id, target: nodes[1].id }];
     }
+    const nextPositions = [...positions, { nodeId: node.id, x: position?.x ?? 330, y: position?.y ?? 280 }];
+    commit({ nodes: nextNodes, edges: nextEdges, positions: nextPositions });
     setSelectedNodeId(node.id);
-    setEdgeDraft({ source: node.id, target: 'output-1', condition: '' });
   };
-  const removeNode = (id: string) => {
-    setNodes((current) => current.filter((node) => node.id !== id));
-    setEdges((current) => current.filter((edge) => edge.source !== id && edge.target !== id));
-    setSelectedNodeId('trigger-1');
+  const removeNodes = (ids: string[]) => {
+    const removable = new Set(ids.filter((id) => !['trigger', 'output'].includes(nodes.find((node) => node.id === id)?.type ?? '')));
+    if (!removable.size) return;
+    commit({ nodes: nodes.filter((node) => !removable.has(node.id)), edges: edges.filter((edge) => !removable.has(edge.source) && !removable.has(edge.target)), positions: positions.filter((position) => !removable.has(position.nodeId)) });
+    setSelectedNodeId(nodes.find((node) => node.type === 'trigger')?.id ?? '');
   };
-  const updateConfig = (changes: Record<string, unknown>) => setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, config: { ...node.config, ...changes } } : node));
-  const addEdge = () => {
-    if (!edgeDraft.source || !edgeDraft.target || edgeDraft.source === edgeDraft.target) return reportError('Choose two different nodes.');
-    const source = nodes.find((node) => node.id === edgeDraft.source);
-    const condition = edgeDraft.condition || undefined;
-    if (source?.type === 'condition' && !['true', 'false'].includes(condition ?? '')) return reportError('Condition edges must be true or false.');
-    if (source?.type === 'loop' && !['body', 'done'].includes(condition ?? '')) return reportError('Loop edges must be body or done.');
-    if (condition === 'continue' && nodes.find((node) => node.id === edgeDraft.target)?.type !== 'loop') return reportError('Continue edges must return to a loop node.');
-    if (edges.some((edge) => edge.source === edgeDraft.source && edge.target === edgeDraft.target && edge.condition === condition)) return reportError('That edge already exists.');
-    setEdges((current) => [...current, { source: edgeDraft.source, target: edgeDraft.target, ...(condition ? { condition } : {}) }]);
+  const updateConfig = (changes: Record<string, unknown>) => {
+    if (!selectedNode) return;
+    commit({ nodes: nodes.map((node) => node.id === selectedNode.id ? { ...node, config: { ...node.config, ...changes } } : node), edges, positions });
   };
-  const loadWorkflow = (workflow: Workflow) => {
-    setEditingId(workflow.id); setName(workflow.name); setDescription(workflow.description); setNodes(workflow.definition.nodes); setEdges(workflow.definition.edges); setSelectedNodeId(workflow.definition.nodes[0]?.id ?? ''); window.scrollTo({ top: 0, behavior: 'smooth' });
+  const connect = (connection: Connection) => {
+    if (!connection.source || !connection.target || connection.source === connection.target) return reportError('Connect two different nodes.');
+    const source = nodes.find((node) => node.id === connection.source);
+    const target = nodes.find((node) => node.id === connection.target);
+    if (!source || !target || target.type === 'trigger' || source.type === 'output') return reportError('That connection direction is not valid.');
+    const sourcePort = catalog.find((entry) => entry.type === source.type)?.outputPorts.find((port) => port.id === (connection.sourceHandle ?? 'output'));
+    const targetPort = catalog.find((entry) => entry.type === target.type)?.inputPorts.find((port) => port.id === (connection.targetHandle ?? 'input'));
+    if (sourcePort && targetPort && sourcePort.dataType !== 'any' && targetPort.dataType !== 'any' && sourcePort.dataType !== targetPort.dataType) {
+      return reportError(`${sourcePort.label} produces ${sourcePort.dataType}, but ${targetPort.label} expects ${targetPort.dataType}.`);
+    }
+    let condition = connection.sourceHandle && connection.sourceHandle !== 'output' ? connection.sourceHandle : undefined;
+    if (target.type === 'loop' && !['condition', 'loop'].includes(source.type) && !condition) condition = 'continue';
+    if (source.type === 'condition' && !['true', 'false'].includes(condition ?? '')) return reportError('Use the True or False handle from a Condition.');
+    if (source.type === 'loop' && !['body', 'done'].includes(condition ?? '')) return reportError('Use the Body or Done handle from a Loop.');
+    if (edges.some((edge) => edge.source === source.id && edge.target === target.id && edge.condition === condition)) return reportError('That connection already exists.');
+    commit({ nodes, edges: [...edges, { source: source.id, target: target.id, ...(condition ? { condition } : {}) }], positions });
+  };
+  const deleteEdges = (removed: WorkflowDefinition['edges']) => {
+    commit({ nodes, edges: edges.filter((edge) => !removed.some((candidate) => candidate.source === edge.source && candidate.target === edge.target && candidate.condition === edge.condition)), positions });
+  };
+  const moveNode = (id: string, position: { x: number; y: number }) => commit({ nodes, edges, positions: [...positions.filter((item) => item.nodeId !== id), { nodeId: id, ...position }] });
+  const autoLayout = () => commit({ nodes, edges, positions: autoLayoutPositions(nodes, edges) });
+  const loadWorkflow = async (workflow: Workflow) => {
+    setLoadingWorkflowId(workflow.id);
+    try {
+      const layout = await api.workflowLayout(workflow.id);
+      setEditingId(workflow.id); setSavedWorkflow(workflow); setName(workflow.name); setDescription(workflow.description); setNodes(workflow.definition.nodes); setEdges(workflow.definition.edges); setPositions(layout.positions.length ? layout.positions : autoLayoutPositions(workflow.definition.nodes, workflow.definition.edges)); setViewport(layout.viewport); setSelectedNodeId(workflow.definition.nodes[0]?.id ?? ''); setPast([]); setFuture([]); setTestedRevision(workflow.latest_test_status === 'completed' && workflow.latest_test_revision === workflow.draft_revision ? workflow.draft_revision : null); setHasUnsavedChanges(false); setCanvasRevision((value) => value + 1); window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (cause) { reportError(cause instanceof Error ? cause.message : 'Could not load workflow canvas'); }
+    finally { setLoadingWorkflowId(null); }
   };
 
-  const validationHints = useMemo(() => {
-    const hints: string[] = [];
-    if (nodes.some((node) => node.type === 'condition')) hints.push('Conditions require true and false edges.');
-    if (nodes.some((node) => node.type === 'loop')) hints.push('Loops require body, done and a body continue edge.');
-    return hints;
-  }, [nodes]);
+  const palette = useMemo(() => {
+    const simpleTypes = new Set<WorkflowNode['type']>(['agent', 'api_action', 'mcp_action', 'knowledge_search', 'approval']);
+    const search = paletteSearch.trim().toLowerCase();
+    return catalog.filter((entry) => !['trigger', 'output'].includes(entry.type) && (!simpleMode || simpleTypes.has(entry.type)) && (!search || `${entry.title} ${entry.description} ${entry.category}`.toLowerCase().includes(search)));
+  }, [catalog, paletteSearch, simpleMode]);
+  const validation = useMemo(() => clientValidation(nodes, edges, catalog), [nodes, edges, catalog]);
+  const activeNodeIds = useMemo(() => new Set(runDetail.data?.workflow_id === editingId ? runDetail.data.nodeStates?.filter((state) => ['running', 'waiting'].includes(state.status)).map((state) => state.node_id) ?? [] : []), [editingId, runDetail.data]);
+  const labelFor = useCallback((node: WorkflowNode) => nodeLabel(node, resources, data.agents, data.tools), [resources, data.agents, data.tools]);
+  const estimatedCalls = nodes.filter((node) => node.type === 'agent').length;
+
+  if (catalogQuery.isLoading || resourcesQuery.isLoading) return <div className="workflow-page"><PageHeader eyebrow="Automation" title="Workflow Designer" description="Loading the safe node catalog and connected resources…"/><section className="panel workflow-loading"><LoaderCircle className="spin" size={22}/>Preparing workflow tools</section></div>;
+  if (catalogQuery.isError || resourcesQuery.isError) return <div className="workflow-page"><PageHeader eyebrow="Automation" title="Workflow Designer" description="The workflow foundation could not be loaded."/><section className="panel workflow-load-error"><AlertTriangle size={22}/><div><strong>Rebuild the Woody backend</strong><p>{catalogQuery.error?.message ?? resourcesQuery.error?.message ?? 'Workflow catalogs are unavailable.'}</p></div><button className="button" onClick={() => { void catalogQuery.refetch(); void resourcesQuery.refetch(); }}><RefreshCw size={14}/>Try again</button></section></div>;
 
   return <div className="workflow-page">
-    <PageHeader eyebrow="Automation" title="Workflow Designer" description="Author resumable branches, bounded loops, retry policies, approvals and downloadable outputs." actions={<>{editingId && <button className="button" onClick={reset}><X size={14}/>Cancel edit</button>}<button className="button primary" onClick={() => save.mutate()} disabled={save.isPending}>{save.isPending ? <LoaderCircle className="spin" size={15}/> : <Save size={15}/>} {editingId ? 'Update workflow' : 'Save workflow'}</button></>}/>
-    <div className="workflow-meta panel"><label>Workflow name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="Customer feedback processor"/></label><label>Description<input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What outcome does this workflow produce?"/></label></div>
-    <div className="workflow-layout advanced">
-      <aside className="node-library panel"><span className="eyebrow">Node library</span><h2>Add a control or work node</h2><p>Nodes and edges are validated as a deterministic graph before save.</p><label>Node type<select value={nodeType} onChange={(event) => setNodeType(event.target.value as EditableNodeType)}><option value="agent">Agent</option><option value="action">Tool action</option><option value="condition">True/false branch</option><option value="loop">Controlled loop</option><option value="approval">Human approval</option></select></label>{nodeType === 'agent' && <label>Active agent<select value={selectedAgent} onChange={(event) => setSelectedAgent(event.target.value)}><option value="">Choose agent</option>{data.agents.filter((agent) => agent.status === 'active').map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>}{nodeType === 'action' && <label>Enabled tool<select value={selectedTool} onChange={(event) => setSelectedTool(event.target.value)}><option value="">Choose tool</option>{data.tools.filter((tool) => tool.enabled).map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></label>}<button className="button" onClick={addNode}><Plus size={15}/>Add node</button><div className="validation-note"><ShieldCheck size={17}/><span><strong>Safety bounds</strong>Retries stop after five attempts, loops after 100 iterations, and arbitrary cycles remain invalid. Write-capable tools require a directly preceding human approval and cannot auto-retry.</span></div>{validationHints.map((hint) => <p className="inline-warning" key={hint}>{hint}</p>)}</aside>
-      <section className="workflow-canvas advanced panel"><div className="dot-grid"/><div className="graph-node-grid">{nodes.map((node) => <button type="button" className={`workflow-node ${node.type} ${selectedNodeId === node.id ? 'selected' : ''}`} key={node.id} onClick={() => setSelectedNodeId(node.id)}><span>{nodeIcon(node.type)}<small>{node.type}</small>{!['trigger', 'output'].includes(node.type) && <i role="button" tabIndex={0} onClick={(event) => { event.stopPropagation(); removeNode(node.id); }}><Trash2 size={12}/></i>}</span><strong>{nodeLabel(node, data.agents, data.tools)}</strong><small>{node.id}</small></button>)}</div><div className="graph-edges"><span className="eyebrow">Connections</span>{edges.length ? edges.map((edge, index) => <div key={`${edge.source}-${edge.target}-${edge.condition ?? index}`}><code>{edge.source}</code><ArrowRight size={13}/>{edge.condition && <b>{edge.condition}</b>}<code>{edge.target}</code><button className="icon-button" onClick={() => setEdges((current) => current.filter((_, item) => item !== index))}><X size={12}/></button></div>) : <p>No connections yet.</p>}</div></section>
-      <aside className="workflow-inspector panel"><span className="eyebrow">Node inspector</span>{selectedNode && <NodeInspector node={selectedNode} nodes={nodes} agents={data.agents} tools={data.tools} update={updateConfig}/>}<div className="edge-builder"><h3>Add connection</h3><label>From<select value={edgeDraft.source} onChange={(event) => setEdgeDraft({ ...edgeDraft, source: event.target.value })}>{nodes.map((node) => <option key={node.id} value={node.id}>{node.id}</option>)}</select></label><label>To<select value={edgeDraft.target} onChange={(event) => setEdgeDraft({ ...edgeDraft, target: event.target.value })}>{nodes.map((node) => <option key={node.id} value={node.id}>{node.id}</option>)}</select></label><label>Branch label<select value={edgeDraft.condition} onChange={(event) => setEdgeDraft({ ...edgeDraft, condition: event.target.value })}><option value="">Normal</option><option value="true">True</option><option value="false">False</option><option value="body">Loop body</option><option value="done">Loop done</option><option value="continue">Continue loop</option></select></label><button className="button" onClick={addEdge}><GitBranch size={14}/>Connect</button></div></aside>
+    <PageHeader eyebrow="Automation" title="Workflow Designer" description="Build a safe, resumable process by connecting agents, Knowledge and exact app actions." actions={<>{editingId && <button className="button" onClick={reset}><X size={14}/>Close draft</button>}<button className="button" onClick={() => save.mutate()} disabled={save.isPending || validation.length > 0 || name.trim().length < 2 || (!hasUnsavedChanges && Boolean(editingId))}>{save.isPending ? <LoaderCircle className="spin" size={15}/> : <Save size={15}/>}Save draft</button><button className="button" disabled={!savedWorkflow || hasUnsavedChanges || run.isPending} onClick={() => { if (savedWorkflow) { setRunMode('test'); setTestTargetNodeId(null); setRunTarget(savedWorkflow); setRunInput('{}'); } }}><TestTube2 size={14}/>Test draft</button><button className="button primary" disabled={!savedWorkflow || hasUnsavedChanges || testedRevision !== savedWorkflow.draft_revision || publish.isPending} onClick={() => publish.mutate()}>{publish.isPending ? <LoaderCircle className="spin" size={14}/> : <Rocket size={14}/>}Publish</button></>}/>
+    <div className="workflow-lifecycle panel" aria-label="Workflow lifecycle"><span className={editingId ? 'complete' : 'active'}>1. Save draft</span><span className={testedRevision === savedWorkflow?.draft_revision ? 'complete' : editingId && !hasUnsavedChanges ? 'active' : ''}>2. Test</span><span className={savedWorkflow?.status === 'published' && !hasUnsavedChanges ? 'complete' : testedRevision === savedWorkflow?.draft_revision ? 'active' : ''}>3. Publish</span><span className={savedWorkflow?.status === 'published' ? 'active' : ''}>4. Run</span></div>
+    <div className="workflow-meta panel"><label>Workflow name<input value={name} onChange={(event) => { setName(event.target.value); setHasUnsavedChanges(true); }} placeholder="Customer feedback processor"/></label><label>Outcome description<input value={description} onChange={(event) => { setDescription(event.target.value); setHasUnsavedChanges(true); }} placeholder="What outcome does this workflow produce?"/></label><div className="workflow-readiness"><Status value={validation.length ? 'needs attention' : hasUnsavedChanges ? 'draft' : savedWorkflow?.status ?? 'draft'}/><small>{validation.length ? `${validation.length} issue${validation.length === 1 ? '' : 's'} before save` : hasUnsavedChanges ? 'Save this draft before testing' : `${estimatedCalls} estimated model call${estimatedCalls === 1 ? '' : 's'} per straight path`}</small></div></div>
+    <div className="workflow-layout visual">
+      <aside className="node-library panel">
+        <span className="eyebrow">Node library</span><h2>Drag work onto the canvas</h2><p>{simpleMode ? 'Common building blocks only. Switch to Advanced for branches, loops and legacy tools.' : 'All installed node types, including advanced control flow.'}</p>
+        <label className="palette-search"><Search size={14}/><input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Search nodes"/></label>
+        <div className="node-palette">{palette.map((entry) => <button key={entry.type} type="button" draggable={entry.available} disabled={!entry.available} onDragStart={(event) => { event.dataTransfer.setData('application/woody-node', entry.type); event.dataTransfer.effectAllowed = 'move'; }} onClick={() => addNode(entry.type)}><span>{paletteIcon(entry.type)}</span><span><strong>{entry.title}</strong><small>{entry.description}</small></span><Plus size={14}/></button>)}</div>
+        <div className="resource-summary"><span><Bot size={14}/><strong>{resources.agents.length}</strong> agents</span><span><Blocks size={14}/><strong>{resources.mcpTools.length}</strong> app actions</span><span><BrainCircuit size={14}/><strong>{resources.knowledge.ready}</strong> ready documents</span></div>
+      </aside>
+      <section className="workflow-canvas visual panel">
+        <WorkflowCanvas key={`${editingId ?? 'new'}:${canvasRevision}`} nodes={nodes} edges={edges} positions={positions} viewport={viewport} catalog={catalog} selectedNodeId={selectedNodeId} activeNodeIds={activeNodeIds} simpleMode={simpleMode} canUndo={past.length > 0} canRedo={future.length > 0} labelFor={labelFor} onSelectNode={setSelectedNodeId} onMoveNode={moveNode} onViewportChange={(next) => { setViewport(next); }} onConnect={connect} onDeleteNodes={removeNodes} onDeleteEdges={deleteEdges} onDropNode={addNode} onAutoLayout={autoLayout} onUndo={undo} onRedo={redo} onToggleMode={() => setSimpleMode((value) => !value)}/>
+      </section>
+      <aside className="workflow-inspector panel">
+        <span className="eyebrow">Inspector</span>
+        {selectedNode && selectedDefinition ? <SchemaNodeInspector node={selectedNode} definition={selectedDefinition} nodes={nodes} resources={resources} update={updateConfig} remove={() => removeNodes([selectedNode.id])}/> : <p>Select a node to configure it.</p>}
+        {selectedNode && selectedNode.type !== 'trigger' && <button className="button node-test-button" disabled={!savedWorkflow || hasUnsavedChanges || run.isPending} onClick={() => { if (savedWorkflow) { setRunMode('test'); setTestTargetNodeId(selectedNode.id); setRunTarget(savedWorkflow); setRunInput('{}'); } }}><TestTube2 size={14}/>Test to this node</button>}
+        <div className="workflow-review-summary"><h3>Pre-save review</h3><ReviewLine label="Model calls" value={`${estimatedCalls} on a straight path`}/><ReviewLine label="Knowledge" value={nodes.some((node) => node.type === 'knowledge_search') ? 'Workspace Knowledge' : 'Not used'}/><ReviewLine label="External actions" value={`${nodes.filter((node) => ['api_action', 'mcp_action', 'action'].includes(node.type)).length}`}/><ReviewLine label="Confirmation" value={nodes.some((node) => ['api_action', 'mcp_action'].includes(node.type)) ? 'Risk checked at runtime' : 'No connected actions'}/>{validation.map((message) => <p className="inline-warning" key={message}>{message}</p>)}</div>
+      </aside>
     </div>
-    <section className="saved-workflows panel"><div className="panel-header"><div><span className="eyebrow">Saved automation</span><h2>Workflows</h2></div></div>{data.workflows.length ? <div className="workflow-list">{data.workflows.map((workflow) => <div key={workflow.id}><span className="workflow-list-icon"><GitBranch size={18}/></span><span><strong>{workflow.name}</strong><small>{workflow.description || `${workflow.definition?.nodes?.length ?? 0} nodes`} · updated {relative(workflow.updated_at)}</small></span><Status value={workflow.enabled ? 'active' : 'paused'}/><button className="button" onClick={() => loadWorkflow(workflow)}><Edit3 size={13}/>Edit</button><button className="button primary" disabled={!workflow.enabled} onClick={() => { setRunTarget(workflow); setRunInput('{}'); }}><Play size={14}/>Prepare run</button></div>)}</div> : <EmptyState Icon={GitBranch} title="No saved workflows" text="Build the first graph above and save it."/>}</section>
-    {runTarget && <section className="workflow-run-prep panel"><div><span className="eyebrow">Run input</span><h2>{runTarget.name}</h2><p>Provide a JSON object. For a for-each loop using <code>input.items</code>, include <code>{'{"items":[...]}'}</code>.</p></div><textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} spellCheck={false}/><div><button className="button" onClick={() => setRunTarget(null)}>Cancel</button><button className="button primary" disabled={run.isPending} onClick={() => run.mutate()}>{run.isPending ? <LoaderCircle className="spin" size={14}/> : <Play size={14}/>}Run workflow</button></div></section>}
-    {runId && <WorkflowRunPanel detail={runDetail.data} loading={runDetail.isLoading} refresh={() => void runDetail.refetch()} decide={(approvalId, decision) => decide.mutate({ approvalId, decision })} deciding={decide.isPending}/>} 
+    <section className="saved-workflows panel"><div className="panel-header"><div><span className="eyebrow">Saved automation</span><h2>Workflows</h2></div></div>{data.workflows.length ? <div className="workflow-list">{data.workflows.map((workflow) => <div key={workflow.id}><span className="workflow-list-icon"><GitBranch size={18}/></span><span><strong>{workflow.name}</strong><small>{workflow.description || `${workflow.definition?.nodes?.length ?? 0} nodes`} · draft r{workflow.draft_revision}{workflow.published_version ? ` · live v${workflow.published_version}` : ''} · updated {relative(workflow.updated_at)}</small></span><Status value={workflow.status}/><button className="button" disabled={loadingWorkflowId === workflow.id} onClick={() => void loadWorkflow(workflow)}>{loadingWorkflowId === workflow.id ? <LoaderCircle className="spin" size={13}/> : <Edit3 size={13}/>}Edit</button><button className="button primary" disabled={workflow.status !== 'published' || !workflow.enabled} onClick={() => { setRunMode('production'); setTestTargetNodeId(null); setRunTarget(workflow); setRunInput('{}'); }}><Play size={14}/>Prepare run</button></div>)}</div> : <EmptyState Icon={GitBranch} title="No saved workflows" text="Build your first process on the canvas and save it."/>}</section>
+    {runTarget && <section className="workflow-run-prep panel"><div><span className="eyebrow">{runMode === 'test' ? 'Test input' : 'Run input'}</span><h2>{runTarget.name}{testTargetNodeId ? ` · ${testTargetNodeId}` : ''}</h2><p>{runMode === 'test' ? testTargetNodeId ? 'Woody follows the real draft path and stops after this node, so mappings and permissions are tested safely.' : 'This isolated test uses the current saved draft and does not change the published version.' : 'This production run uses the immutable published version.'} Provide a JSON object. Safe mappings such as <code>{'{{ input.topic }}'}</code> use these values.</p></div><textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} spellCheck={false}/><div><button className="button" onClick={() => setRunTarget(null)}>Cancel</button><button className="button primary" disabled={run.isPending} onClick={() => run.mutate()}>{run.isPending ? <LoaderCircle className="spin" size={14}/> : runMode === 'test' ? <TestTube2 size={14}/> : <Play size={14}/>} {runMode === 'test' ? testTargetNodeId ? 'Test node path' : 'Test draft' : 'Run workflow'}</button></div></section>}
+    {runId && <WorkflowRunPanel detail={runDetail.data} loading={runDetail.isLoading} refresh={() => void runDetail.refetch()} decide={(approvalId, decision) => decide.mutate({ approvalId, decision })} decideAction={(authorizationId, decision) => decideAction.mutate({ authorizationId, decision })} deciding={decide.isPending || decideAction.isPending}/>}
   </div>;
 }
 
-function NodeInspector({ node, nodes, agents, tools, update }: { node: WorkflowNode; nodes: WorkflowNode[]; agents: Array<{ id: string; name: string }>; tools: Array<{ id: string; name: string }>; update: (changes: Record<string, unknown>) => void }) {
+function SchemaNodeInspector({ node, definition, nodes, resources, update, remove }: { node: WorkflowNode; definition: WorkflowNodeCatalogEntry; nodes: WorkflowNode[]; resources: WorkflowResources; update: (changes: Record<string, unknown>) => void; remove: () => void }) {
   const retry = node.config.retry && typeof node.config.retry === 'object' ? node.config.retry as Record<string, unknown> : {};
-  return <div className="node-config"><h2>{node.type} settings</h2><code>{node.id}</code>{node.type === 'agent' && <><label>Agent<select value={String(node.config.agentId ?? '')} onChange={(event) => update({ agentId: event.target.value })}>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label><label>Responsibility<textarea value={String(node.config.responsibility ?? '')} onChange={(event) => update({ responsibility: event.target.value })}/></label><RetryEditor retry={retry} update={(value) => update({ retry: value })}/></>}{node.type === 'action' && <><label>Tool<select value={String(node.config.toolId ?? '')} onChange={(event) => update({ toolId: event.target.value })}>{tools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></label><label>Input JSON<textarea value={JSON.stringify(node.config.input ?? {}, null, 2)} onChange={(event) => update({ input: parseValue(event.target.value) })}/></label><RetryEditor retry={retry} update={(value) => update({ retry: value })}/></>}{node.type === 'condition' && <ConditionEditor config={node.config} update={update}/>} {node.type === 'loop' && <LoopEditor config={node.config} update={update}/>} {node.type === 'approval' && <label>Approval prompt<textarea value={String(node.config.prompt ?? '')} onChange={(event) => update({ prompt: event.target.value })}/></label>}{node.type === 'output' && <><label>Return result from<select value={String(node.config.fromNodeId ?? '')} onChange={(event) => update({ fromNodeId: event.target.value || undefined })}><option value="">Entire workflow state</option>{nodes.filter((item) => item.id !== node.id && item.type !== 'trigger').map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label><fieldset><legend>Generate files</legend>{(['pdf', 'docx', 'pptx', 'xlsx'] as ArtifactFormat[]).map((format) => { const selected = Array.isArray(node.config.artifactFormats) && node.config.artifactFormats.includes(format); return <label className="check-row" key={format}><input type="checkbox" checked={selected} onChange={(event) => { const current = Array.isArray(node.config.artifactFormats) ? node.config.artifactFormats as ArtifactFormat[] : []; update({ artifactFormats: event.target.checked ? [...current, format] : current.filter((item) => item !== format) }); }}/><span>{format.toUpperCase()}</span></label>; })}</fieldset></>}</div>;
+  const previousNodes = nodes.filter((item) => item.id !== node.id && item.type !== 'output');
+  return <div className="node-config"><div className="inspector-title"><span>{paletteIcon(node.type)}</span><div><h2>{definition.title}</h2><code>{node.id}</code></div>{!['trigger', 'output'].includes(node.type) && <button className="icon-button danger" onClick={remove} aria-label={`Delete ${definition.title}`}><Trash2 size={14}/></button>}</div><p>{definition.description}</p>
+    {definition.configFields.filter((field) => {
+      if (node.type !== 'loop') return true;
+      const whileMode = String(node.config.mode ?? 'forEach') === 'while';
+      if (field.key === 'condition') return whileMode;
+      if (['collectionPath', 'itemVariable', 'indexVariable'].includes(field.key)) return !whileMode;
+      return true;
+    }).map((field) => <ConfigField key={field.key} field={field} node={node} nodes={nodes} resources={resources} update={update}/>) }
+    {definition.retryable && <RetryEditor retry={retry} update={(value) => update({ retry: value })}/>}
+    {['api_action', 'mcp_action'].includes(node.type) && previousNodes.length > 0 && <label>Map a previous output<select value="" onChange={(event) => { if (!event.target.value) return; const current = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input as Record<string, unknown> : {}; update({ input: { ...current, data: `{{ nodes.${event.target.value} }}` } }); }}><option value="">Choose output to insert</option>{previousNodes.map((item) => <option value={item.id} key={item.id}>{item.id} → input.data</option>)}</select><small>Inserts a safe reference; no JavaScript is executed.</small></label>}
+    <div className="node-permission-summary"><ShieldCheck size={16}/><span><strong>{permissionTitle(node, resources)}</strong><small>{permissionDetail(node, resources)}</small></span></div>
+  </div>;
+}
+
+function ConfigField({ field, node, nodes, resources, update }: { field: WorkflowNodeCatalogEntry['configFields'][number]; node: WorkflowNode; nodes: WorkflowNode[]; resources: WorkflowResources; update: (changes: Record<string, unknown>) => void }) {
+  const value = node.config[field.key];
+  if (field.control === 'resource') {
+    if (field.resource === 'agent') return <label>{field.label}{field.required && ' *'}<select value={String(value ?? '')} onChange={(event) => update({ [field.key]: event.target.value })}><option value="">Choose agent</option>{resources.agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name} · {agent.role}</option>)}</select></label>;
+    if (field.resource === 'api_tool') return <label>{field.label}{field.required && ' *'}<select value={String(value ?? '')} onChange={(event) => update({ [field.key]: event.target.value })}><option value="">Choose API</option>{resources.apiTools.map((tool) => <option value={tool.id} key={tool.id}>{tool.name}</option>)}</select></label>;
+    if (field.resource === 'mcp_tool') {
+      const current = `${String(node.config.agentId ?? '')}:${String(node.config.mcpToolId ?? '')}`;
+      return <label>{field.label}{field.required && ' *'}<select value={current} onChange={(event) => { const [agentId, mcpToolId] = event.target.value.split(':'); update({ agentId, mcpToolId }); }}><option value=":">Choose app action</option>{resources.mcpTools.map((tool) => <option value={`${tool.agentId}:${tool.id}`} key={`${tool.agentId}:${tool.id}`}>{tool.connectionName} · {tool.title ?? tool.remoteName} · {tool.riskLevel.replaceAll('_', ' ')}</option>)}</select></label>;
+    }
+    return <label>{field.label}<select value={String(value ?? '')} onChange={(event) => update({ [field.key]: event.target.value || undefined })}><option value="">Entire workflow state</option>{nodes.filter((item) => item.id !== node.id && item.type !== 'trigger').map((item) => <option value={item.id} key={item.id}>{item.id}</option>)}</select></label>;
+  }
+  if (field.control === 'select') return <label>{field.label}{field.required && ' *'}<select value={String(value ?? field.options?.[0]?.value ?? '')} onChange={(event) => update({ [field.key]: event.target.value })}>{field.options?.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select>{field.help && <small>{field.help}</small>}</label>;
+  if (field.control === 'number') return <label>{field.label}{field.required && ' *'}<input type="number" min={field.key === 'maxIterations' ? 1 : undefined} max={field.key === 'maxIterations' ? 100 : undefined} value={Number(value ?? (field.key === 'maxIterations' ? 10 : 8))} onChange={(event) => update({ [field.key]: Number(event.target.value) })}/>{field.help && <small>{field.help}</small>}</label>;
+  if (field.control === 'json') return <label>{field.label}{field.required && ' *'}<textarea value={typeof value === 'string' ? value : JSON.stringify(value ?? {}, null, 2)} onChange={(event) => update({ [field.key]: parseValue(event.target.value) })} spellCheck={false}/>{field.help && <small>{field.help}</small>}</label>;
+  if (field.control === 'multiselect') return <fieldset><legend>{field.label}</legend>{field.options?.map((option) => { const selected = Array.isArray(value) && value.includes(option.value); return <label className="check-row" key={option.value}><input type="checkbox" checked={selected} onChange={(event) => { const current = Array.isArray(value) ? value as string[] : []; update({ [field.key]: event.target.checked ? [...current, option.value] : current.filter((item) => item !== option.value) }); }}/><span>{option.label}</span></label>; })}</fieldset>;
+  const Element = field.control === 'textarea' ? 'textarea' : 'input';
+  return <label>{field.label}{field.required && ' *'}<Element value={String(value ?? '')} onChange={(event) => update({ [field.key]: event.target.value })}/>{field.help && <small>{field.help}</small>}</label>;
 }
 
 function RetryEditor({ retry, update }: { retry: Record<string, unknown>; update: (value: Record<string, unknown>) => void }) {
@@ -146,20 +302,10 @@ function RetryEditor({ retry, update }: { retry: Record<string, unknown>; update
   return <fieldset className="retry-editor"><legend>Retry policy</legend><label>Maximum attempts<input type="number" min="1" max="5" value={Number(retry.maxAttempts ?? 1)} onChange={(event) => change('maxAttempts', Number(event.target.value))}/></label><label>Initial delay (ms)<input type="number" min="0" max="60000" step="500" value={Number(retry.initialDelayMs ?? 1000)} onChange={(event) => change('initialDelayMs', Number(event.target.value))}/></label><label>Backoff multiplier<input type="number" min="1" max="4" step="0.5" value={Number(retry.multiplier ?? 2)} onChange={(event) => change('multiplier', Number(event.target.value))}/></label><label>Maximum delay (ms)<input type="number" min="0" max="300000" step="1000" value={Number(retry.maxDelayMs ?? 60000)} onChange={(event) => change('maxDelayMs', Number(event.target.value))}/></label></fieldset>;
 }
 
-function ConditionEditor({ config, update, prefix = '' }: { config: Record<string, unknown>; update: (changes: Record<string, unknown>) => void; prefix?: string }) {
-  return <><label>{prefix}State path<input value={String(config.path ?? '')} onChange={(event) => update({ path: event.target.value })} placeholder="input.approved"/></label><label>Operator<select value={String(config.operator ?? 'equals')} onChange={(event) => update({ operator: event.target.value })}><option value="equals">Equals</option><option value="not_equals">Not equal</option><option value="greater_than">Greater than</option><option value="greater_or_equal">Greater or equal</option><option value="less_than">Less than</option><option value="less_or_equal">Less or equal</option><option value="contains">Contains</option><option value="exists">Exists</option><option value="not_exists">Does not exist</option></select></label>{!['exists', 'not_exists'].includes(String(config.operator)) && <label>Comparison value<input value={typeof config.value === 'string' ? config.value : JSON.stringify(config.value ?? '')} onChange={(event) => update({ value: parseValue(event.target.value) })}/></label>}</>;
-}
-
-function LoopEditor({ config, update }: { config: Record<string, unknown>; update: (changes: Record<string, unknown>) => void }) {
-  const mode = String(config.mode ?? 'forEach');
-  const condition = config.condition && typeof config.condition === 'object' ? config.condition as Record<string, unknown> : { path: 'input.continue', operator: 'equals', value: true };
-  return <><label>Loop mode<select value={mode} onChange={(event) => update({ mode: event.target.value, ...(event.target.value === 'while' ? { condition } : {}) })}><option value="forEach">For each item</option><option value="while">While condition</option></select></label>{mode === 'forEach' ? <><label>Collection path<input value={String(config.collectionPath ?? '')} onChange={(event) => update({ collectionPath: event.target.value })} placeholder="input.items"/></label><label>Item variable<input value={String(config.itemVariable ?? 'item')} onChange={(event) => update({ itemVariable: event.target.value })}/></label><label>Index variable<input value={String(config.indexVariable ?? 'index')} onChange={(event) => update({ indexVariable: event.target.value })}/></label></> : <ConditionEditor prefix="While " config={condition} update={(changes) => update({ condition: { ...condition, ...changes } })}/>}<label>Maximum iterations<input type="number" min="1" max="100" value={Number(config.maxIterations ?? 10)} onChange={(event) => update({ maxIterations: Number(event.target.value) })}/></label><label>When limit is reached<select value={String(config.onLimit ?? 'fail')} onChange={(event) => update({ onLimit: event.target.value })}><option value="fail">Fail safely</option><option value="exit">Exit loop</option></select></label></>;
-}
-
-function WorkflowRunPanel({ detail, loading, refresh, decide, deciding }: { detail: Awaited<ReturnType<typeof api.workflowRun>> | undefined; loading: boolean; refresh: () => void; decide: (id: string, decision: 'approved' | 'rejected') => void; deciding: boolean }) {
+function WorkflowRunPanel({ detail, loading, refresh, decide, decideAction, deciding }: { detail: Awaited<ReturnType<typeof api.workflowRun>> | undefined; loading: boolean; refresh: () => void; decide: (id: string, decision: 'approved' | 'rejected') => void; decideAction: (id: string, decision: 'approved' | 'rejected') => void; deciding: boolean }) {
   if (loading) return <section className="workflow-run panel"><p>Loading workflow trace…</p></section>;
   if (!detail) return null;
-  return <section className="workflow-run panel"><div className="panel-header"><div><span className="eyebrow">Latest launched run</span><h2>Persisted run trace</h2></div><div><Status value={detail.status}/><button className="icon-button" onClick={refresh}><RefreshCw size={14}/></button></div></div>{detail.nodeStates?.length ? <div className="workflow-node-states">{detail.nodeStates.map((state) => <article key={state.id}><span>{nodeIconByStatus(state.status)}</span><span><strong>{state.node_id}</strong><small>{state.iteration_key} · attempt {state.attempt}</small></span><Status value={state.status}/></article>)}</div> : null}<div className="workflow-run-events">{detail.events?.map((event) => <div key={event.id}><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.message}</small></span></div>)}</div>{detail.approvals?.filter((approval) => approval.status === 'pending').map((approval) => <div className="workflow-approval" key={approval.id}><span><strong>Approval required</strong><small>{approval.node_id}</small></span><button className="button danger" disabled={deciding} onClick={() => decide(approval.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decide(approval.id, 'approved')}>Approve</button></div>)}{detail.artifacts?.length ? <WorkflowArtifacts artifacts={detail.artifacts}/> : null}{detail.output !== undefined && <pre className="json-output">{JSON.stringify(detail.output, null, 2)}</pre>}</section>;
+  return <section className="workflow-run panel"><div className="panel-header"><div><span className="eyebrow">Latest launched run</span><h2>Persisted run trace</h2></div><div><Status value={detail.status}/><button className="icon-button" onClick={refresh}><RefreshCw size={14}/></button></div></div>{detail.nodeStates?.length ? <div className="workflow-node-states">{detail.nodeStates.map((state) => <article key={state.id}><span>{nodeIconByStatus(state.status)}</span><span><strong>{state.node_id}</strong><small>{state.iteration_key} · attempt {state.attempt}</small></span><Status value={state.status}/></article>)}</div> : null}<div className="workflow-run-events">{detail.events?.map((event) => <div key={event.id}><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.message}</small></span></div>)}</div>{detail.approvals?.filter((approval) => approval.status === 'pending').map((approval) => <div className="workflow-approval" key={approval.id}><span><strong>Business approval required</strong><small>{approval.node_id}</small></span><button className="button danger" disabled={deciding} onClick={() => decide(approval.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decide(approval.id, 'approved')}>Approve</button></div>)}{detail.actionAuthorizations?.filter((authorization) => authorization.status === 'awaiting_confirmation').map((authorization) => <div className="workflow-approval action-bound" key={authorization.id}><span><strong>Confirm external action</strong><small>{authorization.target_summary ?? authorization.operation} · {authorization.risk_level.replaceAll('_', ' ')}</small><code>{JSON.stringify(authorization.arguments_summary)}</code></span><button className="button danger" disabled={deciding} onClick={() => decideAction(authorization.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decideAction(authorization.id, 'approved')}>Confirm action</button></div>)}{detail.artifacts?.length ? <WorkflowArtifacts artifacts={detail.artifacts}/> : null}{detail.output !== undefined && <pre className="json-output">{JSON.stringify(detail.output, null, 2)}</pre>}</section>;
 }
 
 function WorkflowArtifacts({ artifacts }: { artifacts: Artifact[] }) {
@@ -171,26 +317,59 @@ function WorkflowArtifacts({ artifacts }: { artifacts: Artifact[] }) {
   return <div className="workflow-artifacts"><h3>Generated files</h3>{artifacts.map((artifact) => <article key={artifact.id}><FileOutput size={16}/><span><strong>{artifact.filename}</strong><small>{artifact.status}</small></span><Status value={artifact.status}/>{artifact.status === 'ready' && <button className="icon-button" onClick={() => void open(artifact)}><Download size={14}/></button>}</article>)}</div>;
 }
 
-function nodeLabel(node: WorkflowNode, agents: Array<{ id: string; name: string }>, tools: Array<{ id: string; name: string }>) {
-  if (node.type === 'trigger') return 'Manual trigger';
-  if (node.type === 'output') return 'Return output';
-  if (node.type === 'agent') return agents.find((item) => item.id === node.config.agentId)?.name ?? 'Agent';
-  if (node.type === 'action') return tools.find((item) => item.id === node.config.toolId)?.name ?? 'Tool action';
+function clientValidation(nodes: WorkflowNode[], edges: WorkflowDefinition['edges'], catalog: WorkflowNodeCatalogEntry[]) {
+  const errors: string[] = [];
+  if (nodes.filter((node) => node.type === 'trigger').length !== 1) errors.push('Keep exactly one trigger.');
+  if (!nodes.some((node) => node.type === 'output')) errors.push('Add an output node.');
+  const known = new Set(nodes.map((node) => node.id));
+  if (edges.some((edge) => !known.has(edge.source) || !known.has(edge.target))) errors.push('Remove connections to missing nodes.');
+  for (const node of nodes) {
+    const definition = catalog.find((entry) => entry.type === node.type);
+    for (const field of definition?.configFields.filter((item) => item.required) ?? []) if (!node.config[field.key]) errors.push(`${definition?.title ?? node.type}: choose ${field.label.toLowerCase()}.`);
+    const outgoing = edges.filter((edge) => edge.source === node.id);
+    if (node.type === 'condition' && (!outgoing.some((edge) => edge.condition === 'true') || !outgoing.some((edge) => edge.condition === 'false'))) errors.push(`Condition ${node.id} needs True and False connections.`);
+    if (node.type === 'loop' && (!outgoing.some((edge) => edge.condition === 'body') || !outgoing.some((edge) => edge.condition === 'done'))) errors.push(`Loop ${node.id} needs Body and Done connections.`);
+    if (!['condition', 'loop', 'output'].includes(node.type) && outgoing.length !== 1) errors.push(`${node.id} needs exactly one outgoing connection.`);
+  }
+  return [...new Set(errors)];
+}
+
+function nodeLabel(node: WorkflowNode, resources: WorkflowResources, fallbackAgents: Array<{ id: string; name: string }>, fallbackTools: Array<{ id: string; name: string }>) {
+  if (node.type === 'trigger') return 'Manual input';
+  if (node.type === 'output') return 'Return result';
+  if (node.type === 'agent') return resources.agents.find((item) => item.id === node.config.agentId)?.name ?? fallbackAgents.find((item) => item.id === node.config.agentId)?.name ?? 'Choose agent';
+  if (node.type === 'action' || node.type === 'api_action') return resources.apiTools.find((item) => item.id === node.config.toolId)?.name ?? fallbackTools.find((item) => item.id === node.config.toolId)?.name ?? 'Choose API';
+  if (node.type === 'mcp_action') { const tool = resources.mcpTools.find((item) => item.id === node.config.mcpToolId && item.agentId === node.config.agentId); return tool ? `${tool.connectionName} · ${tool.title ?? tool.remoteName}` : 'Choose app action'; }
+  if (node.type === 'knowledge_search') return `Search: ${String(node.config.query ?? 'query')}`;
   if (node.type === 'condition') return `${String(node.config.path ?? 'state')} ${String(node.config.operator ?? 'equals')}`;
   if (node.type === 'loop') return `${String(node.config.mode ?? 'forEach')} · max ${String(node.config.maxIterations ?? 10)}`;
   return 'Human approval';
 }
 
-function nodeIcon(type: WorkflowNode['type']) {
-  if (type === 'trigger') return <Zap size={16}/>;
-  if (type === 'agent') return <Bot size={16}/>;
-  if (type === 'action') return <Wrench size={16}/>;
-  if (type === 'condition') return <Split size={16}/>;
-  if (type === 'loop') return <Repeat2 size={16}/>;
-  if (type === 'approval') return <ShieldCheck size={16}/>;
-  return <FileOutput size={16}/>;
+function permissionTitle(node: WorkflowNode, resources: WorkflowResources) {
+  if (node.type === 'mcp_action') return `${resources.mcpTools.find((item) => item.id === node.config.mcpToolId)?.riskLevel.replaceAll('_', ' ') ?? 'Unknown'} app permission`;
+  if (node.type === 'api_action' || node.type === 'action') return 'API permission checked by the server';
+  if (node.type === 'knowledge_search') return 'Workspace Knowledge · read only';
+  if (node.type === 'agent') return 'Uses the selected agent’s access';
+  return 'No external access';
 }
 
-function nodeIconByStatus(status: string) {
-  return ['failed'].includes(status) ? <X size={14}/> : ['running', 'retrying'].includes(status) ? <LoaderCircle className="spin" size={14}/> : <CheckCircle2 size={14}/>;
+function permissionDetail(node: WorkflowNode, resources: WorkflowResources) {
+  if (node.type === 'mcp_action') { const tool = resources.mcpTools.find((item) => item.id === node.config.mcpToolId && item.agentId === node.config.agentId); return tool ? `${tool.connectionName}; ${tool.toolPermission.replace('_', ' ')}. Risky writes require confirmation for the final arguments.` : 'Choose an allowed app action.'; }
+  if (node.type === 'api_action') return 'Read calls run immediately; writes and unknown actions pause for argument-bound confirmation.';
+  if (node.type === 'action') return 'Legacy write actions require a directly preceding Approval node.';
+  if (node.type === 'knowledge_search') return `${resources.knowledge.ready} indexed documents are currently searchable.`;
+  return 'This node does not directly perform an external write.';
 }
+
+function paletteIcon(type: WorkflowNode['type']) {
+  if (type === 'agent') return <Bot size={16}/>;
+  if (type === 'mcp_action') return <Blocks size={16}/>;
+  if (type === 'knowledge_search') return <BrainCircuit size={16}/>;
+  if (type === 'api_action' || type === 'action') return <Wrench size={16}/>;
+  if (type === 'approval') return <ShieldCheck size={16}/>;
+  return <GitBranch size={16}/>;
+}
+
+function ReviewLine({ label, value }: { label: string; value: string }) { return <div><small>{label}</small><strong>{value}</strong></div>; }
+function nodeIconByStatus(status: string) { return status === 'failed' ? <X size={14}/> : ['running', 'retrying', 'waiting'].includes(status) ? <LoaderCircle className="spin" size={14}/> : <CheckCircle2 size={14}/>; }

@@ -1,5 +1,6 @@
 import { query } from '../db/client.js';
 import type { ToolRecord } from '../tools/runtime.js';
+import { searchWorkspaceKnowledge } from '../knowledge/retrieval.js';
 
 export type AgentModelConfig = {
   temperature: number;
@@ -108,20 +109,9 @@ export function resolveAgentRuntimePolicy(agent: AgentRuntimeSource, configuredT
 }
 
 export async function retrieveAgentKnowledge(workspaceId: string, requestText: string, limit = 4) {
-  const search = requestText.replace(/\s+/g, ' ').trim().slice(0, 1000);
-  if (search.length < 2) return '';
-  const result = await query<{ name: string; content: string }>(
-    `SELECT d.name,c.content
-       FROM knowledge_chunks c
-       JOIN knowledge_documents d ON d.id=c.document_id
-      WHERE c.workspace_id=$1
-        AND c.search_vector @@ plainto_tsquery('simple',$2)
-      ORDER BY ts_rank(c.search_vector,plainto_tsquery('simple',$2)) DESC,c.ordinal
-      LIMIT $3`,
-    [workspaceId, search, Math.min(8, Math.max(1, limit))],
-  );
-  if (!result.rows.length) return '';
-  return result.rows
-    .map((row, index) => `[Knowledge ${index + 1}: ${row.name}]\n${row.content.slice(0, 4000)}`)
+  const results = await searchWorkspaceKnowledge(workspaceId, requestText, Math.min(8, Math.max(1, limit)));
+  if (!results.length) return '';
+  return results
+    .map((row, index) => `[Knowledge ${index + 1}: ${row.documentName}]\n${row.content}`)
     .join('\n\n');
 }

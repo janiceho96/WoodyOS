@@ -2,8 +2,60 @@ import { describe, expect, it } from 'vitest';
 import { workflowDefinitionErrors } from '../src/routes/workflows.js';
 import { evaluateCondition, valueAtPath } from '../src/workflows/definition.js';
 import { loopResult } from '../src/workflows/runtime.js';
+import { publicWorkflowNodeCatalog, workflowNodeConfigErrors } from '../src/workflows/registry.js';
+import { workflowLayoutErrors, workflowLayoutInputSchema } from '../src/workflows/layout.js';
+import { actionArgumentHash, safeActionSummary } from '../src/lib/action-safety.js';
+import { workflowActionNeedsConfirmation } from '../src/policy/action-gateway.js';
 
 describe('workflow definition validation', () => {
+  it('publishes a sanitized registry backed by installed adapters', () => {
+    const catalog = publicWorkflowNodeCatalog();
+    expect(catalog.map((entry) => entry.type)).toEqual(expect.arrayContaining(['trigger', 'agent', 'action', 'api_action', 'mcp_action', 'knowledge_search']));
+    expect(catalog.find((entry) => entry.type === 'agent')).toMatchObject({ available: true, adapter: 'agent', risk: 'unknown' });
+    expect(catalog.find((entry) => entry.type === 'mcp_action')).toMatchObject({ available: true, adapter: 'mcp', retryable: false });
+    expect(catalog.find((entry) => entry.type === 'knowledge_search')).toMatchObject({ available: true, adapter: 'knowledge' });
+    expect(catalog.every((entry) => !('configSchema' in entry))).toBe(true);
+  });
+
+  it('validates registered node configuration', () => {
+    expect(workflowNodeConfigErrors({ id: 'research', type: 'agent', config: {} })).toEqual(expect.arrayContaining([expect.stringContaining('agentId')]));
+    expect(workflowNodeConfigErrors({ id: 'research', type: 'agent', config: { agentId: '00000000-0000-4000-8000-000000000001' } })).toEqual([]);
+    expect(workflowNodeConfigErrors({ id: 'notion', type: 'mcp_action', config: { agentId: '00000000-0000-4000-8000-000000000001', mcpToolId: '00000000-0000-4000-8000-000000000002' } })).toEqual([]);
+    expect(workflowNodeConfigErrors({ id: 'unsafe-retry', type: 'mcp_action', config: { agentId: '00000000-0000-4000-8000-000000000001', mcpToolId: '00000000-0000-4000-8000-000000000002', retry: { maxAttempts: 2 } } })).toEqual([expect.stringContaining('does not support automatic retries')]);
+  });
+
+  it('validates bounded editor layout without mixing it into the executable graph', () => {
+    const layout = workflowLayoutInputSchema.parse({
+      positions: [{ nodeId: 'start', x: 10, y: 20 }, { nodeId: 'finish', x: 400, y: 20 }],
+      viewport: { x: 5, y: 6, zoom: 1.25 },
+    });
+    const definition = {
+      nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'finish', type: 'output' as const, config: {} }],
+      edges: [{ source: 'start', target: 'finish' }],
+    };
+    expect(layout.schemaVersion).toBe(1);
+    expect(workflowLayoutErrors(layout, definition)).toEqual([]);
+    expect(workflowLayoutErrors({ ...layout, positions: [{ nodeId: 'missing', x: 0, y: 0 }] }, definition)).toEqual(['Layout references unknown node missing']);
+    expect(workflowLayoutInputSchema.safeParse({ positions: [{ nodeId: 'start', x: 0, y: 0 }, { nodeId: 'start', x: 1, y: 1 }] }).success).toBe(false);
+  });
+
+  it('redacts action audit data and requires confirmation for every non-read risk', () => {
+    const input = { query: 'safe', apiKey: 'must-not-leak', nested: { password: 'hidden' }, value: 'sk-exampleSecret1234567890' };
+    expect(safeActionSummary(input)).toEqual({ query: 'safe', apiKey: '[redacted]', nested: { password: '[redacted]' }, value: '[redacted]' });
+    expect(actionArgumentHash(input)).toMatch(/^[a-f0-9]{64}$/);
+    expect(actionArgumentHash({ first: 1, second: { a: true, b: false } })).toBe(actionArgumentHash({ second: { b: false, a: true }, first: 1 }));
+    expect(workflowActionNeedsConfirmation('read')).toBe(false);
+    for (const risk of ['write', 'external_write', 'destructive', 'unknown'] as const) expect(workflowActionNeedsConfirmation(risk)).toBe(true);
+  });
+
+  it('rejects node and loop variable names that could overwrite reserved workflow state', () => {
+    expect(() => workflowLayoutInputSchema.parse({ positions: [] })).not.toThrow();
+    expect(workflowDefinitionErrors({
+      nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'loop', type: 'loop', config: { mode: 'forEach', collectionPath: 'input.items', itemVariable: 'nodes', maxIterations: 2 } }, { id: 'finish', type: 'output', config: {} }],
+      edges: [{ source: 'start', target: 'loop' }, { source: 'loop', target: 'finish', condition: 'done' }, { source: 'loop', target: 'loop', condition: 'body' }],
+    })).toEqual(expect.arrayContaining(['Loop node loop itemVariable must be a safe non-reserved variable name']));
+  });
+
   it('accepts a connected trigger-to-output workflow', () => {
     expect(workflowDefinitionErrors({
       nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'finish', type: 'output', config: {} }],

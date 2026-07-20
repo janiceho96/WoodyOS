@@ -25,6 +25,9 @@ const errorMessages: Record<string, string> = {
   AI_PROVIDER_REQUEST_FAILED: 'Woody could not reach the AI provider. Check the base URL, network connection, and provider status.',
   PROMPT_COMPILER_INVALID_RESPONSE: 'The AI provider returned a response Woody could not safely turn into an agent proposal. Try again or use a stronger JSON-capable model.',
   WORKFLOW_QUEUE_UNAVAILABLE: 'The workflow queue is unavailable. Ensure the Woody worker and Redis are running, then try the test again.',
+  WORKFLOW_PUBLISH_REQUIRED: 'Save this workflow as a draft, test it successfully, then publish it.',
+  WORKFLOW_SUCCESSFUL_TEST_REQUIRED: 'The current draft must complete a successful test before it can be published.',
+  WORKFLOW_NOT_PUBLISHED: 'This workflow is not published yet. Test and publish it before running it.',
 };
 export const auth = {
   get: () => token,
@@ -126,7 +129,7 @@ export type Artifact = {
 export type TaskDetail = Task & { input?: Record<string, unknown>; events: TaskEvent[]; artifacts: Artifact[] };
 export type WorkflowNode = {
   id: string;
-  type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output';
+  type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output' | 'api_action' | 'mcp_action' | 'knowledge_search';
   config: Record<string, unknown>;
 };
 export type WorkflowDefinition = {
@@ -139,6 +142,13 @@ export type Workflow = {
   description: string;
   definition: WorkflowDefinition;
   enabled: boolean;
+  status: 'draft' | 'published' | 'paused' | 'archived';
+  draft_revision: number;
+  published_version_id?: string | null;
+  published_version?: number | null;
+  latest_test_status?: string | null;
+  latest_test_revision?: number | null;
+  latest_test_run_id?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -146,14 +156,48 @@ export type WorkflowRun = {
   id: string;
   workflow_id: string;
   status: string;
+  run_mode?: 'test' | 'production';
+  draft_revision?: number | null;
+  workflow_version_id?: string | null;
+  test_target_node_id?: string | null;
   input: Record<string, unknown>;
   output?: unknown;
   created_at: string;
   completed_at?: string | null;
   events?: Array<{ id: string; node_id: string | null; event_type: string; message: string; payload?: Record<string, unknown>; created_at: string }>;
   approvals?: Array<{ id: string; node_id: string; status: 'pending' | 'approved' | 'rejected'; comment?: string | null; requested_at: string; resolved_at?: string | null }>;
+  actionAuthorizations?: Array<{ id: string; node_id: string; iteration_key: string; attempt: number; adapter: 'api' | 'mcp' | 'browser'; resource_id: string; operation: string; target_summary?: string | null; risk_level: string; arguments_summary: Record<string, unknown>; arguments_hash: string; status: 'awaiting_confirmation' | 'approved' | 'executing' | 'rejected' | 'expired' | 'consumed' | 'failed'; requested_at: string; expires_at: string; resolved_at?: string | null; consumed_at?: string | null; error_message?: string | null }>;
   nodeStates?: Array<{ id: string; node_id: string; iteration_key: string; attempt: number; status: string; output?: unknown; error?: unknown; started_at: string; completed_at?: string | null }>;
   artifacts?: Artifact[];
+};
+export type WorkflowNodeCatalogEntry = {
+  type: WorkflowNode['type'];
+  category: 'trigger' | 'ai' | 'integration' | 'knowledge' | 'logic' | 'human' | 'output';
+  title: string;
+  description: string;
+  icon: string;
+  adapter: 'logic' | 'agent' | 'legacy_tool' | 'api' | 'mcp' | 'knowledge' | 'file';
+  risk: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
+  available: boolean;
+  availabilityReason?: string;
+  retryable: boolean;
+  inputPorts: Array<{ id: string; label: string; dataType: string; required?: boolean }>;
+  outputPorts: Array<{ id: string; label: string; dataType: string; required?: boolean }>;
+  configFields: Array<{ key: string; label: string; control: 'text' | 'textarea' | 'number' | 'select' | 'json' | 'resource' | 'multiselect'; required?: boolean; resource?: 'agent' | 'api_tool' | 'mcp_tool' | 'node'; options?: Array<{ value: string; label: string }>; help?: string }>;
+};
+export type WorkflowResources = {
+  version: number;
+  agents: Array<Pick<Agent, 'id' | 'name' | 'role' | 'status'>>;
+  apiTools: Array<Pick<Tool, 'id' | 'name' | 'kind' | 'description' | 'permissions'>>;
+  mcpTools: Array<{ id: string; connectionId: string; connectionName: string; remoteName: string; title?: string | null; description: string; inputSchema: Record<string, unknown>; riskLevel: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown'; agentId: string; connectionPermission: 'read' | 'read_write'; toolPermission: 'read' | 'read_write' }>;
+  knowledge: { scope: 'workspace'; total: number; ready: number; processing: number; failed: number };
+};
+export type WorkflowEditorLayout = {
+  workflowId?: string;
+  schemaVersion: number;
+  positions: Array<{ nodeId: string; x: number; y: number }>;
+  viewport: { x: number; y: number; zoom: number };
+  updatedAt?: string | null;
 };
 export type AgentSolutionAgent = {
   key: string;
@@ -229,6 +273,11 @@ export type Document = {
   metadata?: Record<string, unknown>;
   created_at: string;
   updated_at?: string;
+};
+export type KnowledgeDocumentDetail = Document & {
+  content?: string | null;
+  chunks: Array<{ id: string; ordinal: number; content: string; metadata?: Record<string, unknown> }>;
+  chunk_count: number;
 };
 export type KnowledgeResult = {
   id: string;
@@ -466,18 +515,30 @@ export const api = {
   },
 
   workflows: () => request<{ data: Workflow[] }>('/v1/workflows'),
+  workflowNodeCatalog: () => request<{ version: number; data: WorkflowNodeCatalogEntry[] }>('/v1/workflow-nodes'),
+  workflowResources: () => request<WorkflowResources>('/v1/workflow-resources'),
+  workflowLayout: (id: string) => request<WorkflowEditorLayout>(`/v1/workflows/${id}/layout`),
+  saveWorkflowLayout: (id: string, layout: Omit<WorkflowEditorLayout, 'workflowId' | 'updatedAt'>) => request<WorkflowEditorLayout>(`/v1/workflows/${id}/layout`, { method: 'PUT', body: JSON.stringify(layout) }),
   createWorkflow: (body: Record<string, unknown>) =>
     request<Workflow>('/v1/workflows', { method: 'POST', body: JSON.stringify(body) }),
   updateWorkflow: (id: string, body: Record<string, unknown>) =>
     request<Workflow>(`/v1/workflows/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   runWorkflow: (id: string, input: Record<string, unknown> = {}) =>
     request<WorkflowRun>(`/v1/workflows/${id}/runs`, { method: 'POST', body: JSON.stringify({ input }) }),
+  testWorkflow: (id: string, input: Record<string, unknown> = {}) =>
+    request<WorkflowRun>(`/v1/workflows/${id}/test-runs`, { method: 'POST', body: JSON.stringify({ input }) }),
+  testWorkflowNode: (id: string, nodeId: string, input: Record<string, unknown> = {}) =>
+    request<WorkflowRun>(`/v1/workflows/${id}/nodes/${encodeURIComponent(nodeId)}/test-runs`, { method: 'POST', body: JSON.stringify({ input }) }),
+  publishWorkflow: (id: string) =>
+    request<Workflow>(`/v1/workflows/${id}/publish`, { method: 'POST' }),
   workflowRun: (id: string) => request<WorkflowRun>(`/v1/workflows/runs/${id}`),
   decideWorkflowApproval: (runId: string, approvalId: string, decision: 'approved' | 'rejected', comment = '') =>
     request(`/v1/workflows/runs/${runId}/approvals/${approvalId}`, {
       method: 'POST',
       body: JSON.stringify({ decision, comment }),
     }),
+  decideWorkflowAction: (authorizationId: string, decision: 'approved' | 'rejected', comment = '') =>
+    request(`/v1/workflow-actions/${authorizationId}/decision`, { method: 'POST', body: JSON.stringify({ decision, comment }) }),
 
   starterSolutions: () => request<{ data: AgentSolution[] }>('/v1/starter-solutions'),
   starterSolution: (slug: string) => request<AgentSolution>(`/v1/starter-solutions/${slug}`),
@@ -515,6 +576,7 @@ export const api = {
     request<{ id: string; status: 'active' }>(`/v1/agent-solutions/installations/${id}/activate`, { method: 'POST' }),
 
   documents: () => request<{ data: Document[] }>('/v1/knowledge/documents'),
+  document: (id: string) => request<KnowledgeDocumentDetail>(`/v1/knowledge/documents/${id}`),
   createDocument: (body: Record<string, unknown>) =>
     request<Document>('/v1/knowledge/documents', { method: 'POST', body: JSON.stringify(body) }),
   uploadDocument: (file: File) => {

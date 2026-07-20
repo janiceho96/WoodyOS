@@ -5,6 +5,7 @@ import type { Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
 
 export type StoredConfig = { version: 1; iv: string; tag: string; data: string };
 export type ToolRecord = { id: string; name: string; kind: 'mcp' | 'api' | 'plugin' | 'internal'; config: StoredConfig; permissions: string[] };
+export type ToolRiskLevel = 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
 
 export function toolRequiresApproval(tool: ToolRecord) {
   const permissionSignals = tool.permissions.join(' ').toLowerCase();
@@ -15,6 +16,19 @@ export function toolRequiresApproval(tool: ToolRecord) {
     return String(config.method ?? 'POST').toUpperCase() !== 'GET';
   } catch {
     return true;
+  }
+}
+
+export function toolRiskLevel(tool: ToolRecord): ToolRiskLevel {
+  const signals = tool.permissions.join(' ').toLowerCase();
+  if (/(^|[\s._:-])(delete|remove|destroy|purge)([\s._:-]|$)/.test(signals)) return 'destructive';
+  if (/(^|[\s._:-])(send|publish|message|email|external_write)([\s._:-]|$)/.test(signals)) return 'external_write';
+  try {
+    const config = decryptJson(tool.config);
+    if (config.readOnly === true || String(config.method ?? 'POST').toUpperCase() === 'GET') return 'read';
+    return 'write';
+  } catch {
+    return 'unknown';
   }
 }
 

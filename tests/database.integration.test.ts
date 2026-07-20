@@ -286,6 +286,62 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(tool.statusCode, tool.body).toBe(201);
     const workflow = await app.inject({ method: 'POST', url: '/v1/workflows', headers, payload: { name: 'Research workflow', definition: { nodes: [{ id: 'start', type: 'trigger' }, { id: 'finish', type: 'output', config: { output: { done: true }, artifactFormats: ['pdf', 'docx', 'pptx', 'xlsx'] } }], edges: [{ source: 'start', target: 'finish' }] } } });
     expect(workflow.statusCode, workflow.body).toBe(201);
+    const nodeCatalog = await app.inject({ method: 'GET', url: '/v1/workflow-nodes', headers });
+    expect(nodeCatalog.statusCode, nodeCatalog.body).toBe(200);
+    expect(nodeCatalog.json().data).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'agent', available: true, adapter: 'agent' }),
+      expect.objectContaining({ type: 'mcp_action', available: true, adapter: 'mcp' }),
+      expect.objectContaining({ type: 'knowledge_search', available: true, adapter: 'knowledge' }),
+    ]));
+    expect(JSON.stringify(nodeCatalog.json())).not.toContain('configSchema');
+    const resources = await app.inject({ method: 'GET', url: '/v1/workflow-resources', headers });
+    expect(resources.statusCode, resources.body).toBe(200);
+    expect(resources.json()).toMatchObject({ version: 1, knowledge: { scope: 'workspace' } });
+    expect(resources.json().agents).toEqual(expect.arrayContaining([expect.objectContaining({ id: agentId })]));
+    expect(resources.json().apiTools).toEqual(expect.arrayContaining([expect.objectContaining({ id: tool.json().id, name: 'Knowledge API' })]));
+    expect(JSON.stringify(resources.json())).not.toMatch(/encrypted_credentials|api.?key|authorization/i);
+    const savedLayout = await app.inject({
+      method: 'PUT',
+      url: `/v1/workflows/${workflow.json().id}/layout`,
+      headers,
+      payload: { positions: [{ nodeId: 'start', x: 40, y: 120 }, { nodeId: 'finish', x: 420, y: 120 }], viewport: { x: 10, y: 20, zoom: 1.1 } },
+    });
+    expect(savedLayout.statusCode, savedLayout.body).toBe(200);
+    expect(savedLayout.json()).toMatchObject({ workflowId: workflow.json().id, schemaVersion: 1, viewport: { x: 10, y: 20, zoom: 1.1 } });
+    const restoredLayout = await app.inject({ method: 'GET', url: `/v1/workflows/${workflow.json().id}/layout`, headers });
+    expect(restoredLayout.statusCode, restoredLayout.body).toBe(200);
+    expect(restoredLayout.json().positions).toEqual([{ nodeId: 'start', x: 40, y: 120 }, { nodeId: 'finish', x: 420, y: 120 }]);
+    const invalidLayout = await app.inject({ method: 'PUT', url: `/v1/workflows/${workflow.json().id}/layout`, headers, payload: { positions: [{ nodeId: 'missing', x: 0, y: 0 }] } });
+    expect(invalidLayout.statusCode, invalidLayout.body).toBe(400);
+    expect(invalidLayout.json()).toMatchObject({ error: 'INVALID_WORKFLOW_LAYOUT' });
+    const prematureRun = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/runs`, headers, payload: { input: { topic: 'agents' } } });
+    expect(prematureRun.statusCode, prematureRun.body).toBe(409);
+    expect(prematureRun.json()).toMatchObject({ error: 'WORKFLOW_NOT_PUBLISHED' });
+    const nodeTest = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/nodes/finish/test-runs`, headers, payload: { input: { topic: 'agents' } } });
+    expect(nodeTest.statusCode, nodeTest.body).toBe(202);
+    const completedNodeTest = await waitFor(
+      () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${nodeTest.json().id}`, headers }),
+      (response) => response.statusCode === 200 && response.json().status === 'completed',
+    );
+    expect(completedNodeTest.json()).toMatchObject({ run_mode: 'test', test_target_node_id: 'finish' });
+    const nodeTestIsNotPublishGate = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/publish`, headers });
+    expect(nodeTestIsNotPublishGate.statusCode, nodeTestIsNotPublishGate.body).toBe(409);
+    const draftTest = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/test-runs`, headers, payload: { input: { topic: 'agents' } } });
+    expect(draftTest.statusCode, draftTest.body).toBe(202);
+    const completedTest = await waitFor(
+      () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${draftTest.json().id}`, headers }),
+      (response) => response.statusCode === 200 && response.json().status === 'completed' && response.json().artifacts?.every((item: { status: string }) => item.status === 'ready'),
+    );
+    expect(completedTest.json()).toMatchObject({ run_mode: 'test', draft_revision: workflow.json().draft_revision });
+    const published = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/publish`, headers });
+    expect(published.statusCode, published.body).toBe(200);
+    expect(published.json()).toMatchObject({ status: 'published', enabled: true, published_version: 1 });
+    const editedDraft = await app.inject({ method: 'PATCH', url: `/v1/workflows/${workflow.json().id}`, headers, payload: { description: 'A newer untested draft' } });
+    expect(editedDraft.statusCode, editedDraft.body).toBe(200);
+    expect(editedDraft.json().draft_revision).toBe(workflow.json().draft_revision + 1);
+    const untestedPublish = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/publish`, headers });
+    expect(untestedPublish.statusCode, untestedPublish.body).toBe(409);
+    expect(untestedPublish.json()).toMatchObject({ error: 'WORKFLOW_SUCCESSFUL_TEST_REQUIRED' });
     const workflowRun = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/runs`, headers, payload: { input: { topic: 'agents' } } });
     expect(workflowRun.statusCode, workflowRun.body).toBe(202);
     let completedWorkflow;
@@ -304,6 +360,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
       };
       throw new Error(`Workflow artifact generation did not finish: ${JSON.stringify({ run: body.status, output: body.output, artifacts: body.artifacts?.map(({ format, status, error_message }) => ({ format, status, error: error_message ?? null })), recentEvents: body.events?.slice(-4) })}`, { cause: error });
     }
+    expect(completedWorkflow.json()).toMatchObject({ run_mode: 'production', workflow_version_id: published.json().published_version_id });
     expect(completedWorkflow.json().output).toMatchObject({ topic: 'agents', done: true });
     expect(completedWorkflow.json().artifacts.map((item: { format: string }) => item.format).sort()).toEqual(['docx', 'pdf', 'pptx', 'xlsx']);
     const integrationApiUrl = (process.env.INTEGRATION_API_URL ?? 'http://localhost:3001').replace(/\/$/, '');
@@ -326,7 +383,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
       { source: 'route', target: 'no', condition: 'false' },
     ] } } });
     expect(branchWorkflow.statusCode, branchWorkflow.body).toBe(201);
-    const branchRun = await app.inject({ method: 'POST', url: `/v1/workflows/${branchWorkflow.json().id}/runs`, headers, payload: { input: { approved: true } } });
+    const branchRun = await app.inject({ method: 'POST', url: `/v1/workflows/${branchWorkflow.json().id}/test-runs`, headers, payload: { input: { approved: true } } });
     const completedBranch = await waitFor(
       () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${branchRun.json().id}`, headers }),
       (response) => response.statusCode === 200 && response.json().status === 'completed',
@@ -346,7 +403,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
       { source: 'review-item', target: 'items', condition: 'continue' },
     ] } } });
     expect(loopWorkflow.statusCode, loopWorkflow.body).toBe(201);
-    const loopRun = await app.inject({ method: 'POST', url: `/v1/workflows/${loopWorkflow.json().id}/runs`, headers, payload: { input: { items: ['one', 'two'] } } });
+    const loopRun = await app.inject({ method: 'POST', url: `/v1/workflows/${loopWorkflow.json().id}/test-runs`, headers, payload: { input: { items: ['one', 'two'] } } });
     for (let iteration = 0; iteration < 2; iteration++) {
       const waiting = await waitFor(
         () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${loopRun.json().id}`, headers }),
@@ -371,7 +428,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
       { id: 'finish', type: 'output' },
     ], edges: [{ source: 'start', target: 'unstable' }, { source: 'unstable', target: 'finish' }] } } });
     expect(retryWorkflow.statusCode, retryWorkflow.body).toBe(201);
-    const retryRun = await app.inject({ method: 'POST', url: `/v1/workflows/${retryWorkflow.json().id}/runs`, headers, payload: { input: {} } });
+    const retryRun = await app.inject({ method: 'POST', url: `/v1/workflows/${retryWorkflow.json().id}/test-runs`, headers, payload: { input: {} } });
     const failedRetry = await waitFor(
       () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${retryRun.json().id}`, headers }),
       (response) => response.statusCode === 200 && response.json().status === 'failed',
@@ -391,7 +448,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
 
     const approvalWorkflow = await app.inject({ method: 'POST', url: '/v1/workflows', headers, payload: { name: 'Approval workflow', definition: { nodes: [{ id: 'start', type: 'trigger' }, { id: 'review', type: 'approval' }, { id: 'finish', type: 'output', config: { output: { approved: true } } }], edges: [{ source: 'start', target: 'review' }, { source: 'review', target: 'finish' }] } } });
     expect(approvalWorkflow.statusCode, approvalWorkflow.body).toBe(201);
-    const approvalRun = await app.inject({ method: 'POST', url: `/v1/workflows/${approvalWorkflow.json().id}/runs`, headers, payload: { input: { subject: 'approval-resume' } } });
+    const approvalRun = await app.inject({ method: 'POST', url: `/v1/workflows/${approvalWorkflow.json().id}/test-runs`, headers, payload: { input: { subject: 'approval-resume' } } });
     expect(approvalRun.statusCode, approvalRun.body).toBe(202);
     const awaitingApproval = await waitFor(
       () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${approvalRun.json().id}`, headers }),

@@ -68,9 +68,18 @@ export function McpMarketplacePage() {
     url.searchParams.delete('connection');
     window.history.replaceState({}, '', url);
   }, [queryClient, report, reportError]);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const connectionId = url.searchParams.get('connection');
+    if (!connectionId || !connections.data?.data.some((connection) => connection.id === connectionId)) return;
+    setTab('installed');
+    setSelectedId(connectionId);
+    url.searchParams.delete('connection');
+    window.history.replaceState({}, '', url);
+  }, [connections.data]);
 
   return <div className="mcp-page">
-    <PageHeader eyebrow="Protocol integrations" title="MCP Marketplace" description="Install remote MCP servers, review every exposed tool, and grant least-privilege agent access." actions={<>
+    <PageHeader eyebrow="Advanced integrations" title="MCP connections" description="Connect remote application servers, review their real actions, and grant least-privilege agent access." actions={<>
       <button className="button" onClick={() => setInstallTarget({ kind: 'custom' })}><Plus size={15}/>Custom server</button>
       <button className="button primary" disabled={sync.isPending} onClick={() => sync.mutate()}>{sync.isPending ? <LoaderCircle className="spin" size={15}/> : <RefreshCw size={15}/>}Sync Registry</button>
     </>}/>
