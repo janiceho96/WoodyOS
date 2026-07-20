@@ -36,7 +36,7 @@ export function StarterSolutionsPage() {
       <button className={tab === 'installed' ? 'active' : ''} onClick={() => setTab('installed')}><GitBranch size={15}/>Installed drafts</button>
     </div>
     {tab === 'starters' && <StarterCatalog openInstalled={() => setTab('installed')}/>}
-    {tab === 'generate' && <PromptCompiler openInstalled={() => setTab('installed')}/>}
+    {tab === 'generate' && <PromptCompiler initialPrompt={params.get('prompt') ?? ''} openInstalled={() => setTab('installed')}/>}
     {tab === 'installed' && <InstalledSolutions/>}
   </div>;
 }
@@ -90,11 +90,11 @@ function StarterCatalog({ openInstalled }: { openInstalled: () => void }) {
   </>;
 }
 
-function PromptCompiler({ openInstalled }: { openInstalled: () => void }) {
+function PromptCompiler({ openInstalled, initialPrompt = '' }: { openInstalled: () => void; initialPrompt?: string }) {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<'automatic' | 'single' | 'multi'>('automatic');
-  const [prompt, setPrompt] = useState('');
+  const [prompt, setPrompt] = useState(initialPrompt);
   const [persistPrompt, setPersistPrompt] = useState(false);
   const [proposal, setProposal] = useState<AgentSolution | null>(null);
   const compile = useMutation({

@@ -1,12 +1,14 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, BookOpen, Command, GitBranch, HardDriveUpload, LoaderCircle, Plus, ShieldCheck, Wrench } from 'lucide-react';
+import { AlertTriangle, Blocks, BookOpen, Command, GitBranch, HardDriveUpload, LoaderCircle, Plus, ShieldCheck, Wrench } from 'lucide-react';
 import { type FormEvent } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api, type Tool } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
 
 export function ToolsPage({ openConnect }: { openConnect: () => void }) {
   const { data, report, reportError } = useWorkspace();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const test = useMutation({
     mutationFn: (tool: Tool) => api.testTool(tool.id).then(() => tool),
@@ -25,7 +27,7 @@ export function ToolsPage({ openConnect }: { openConnect: () => void }) {
     { name: 'Notion', category: 'Knowledge', Icon: BookOpen, explanation: 'OAuth connector is not configured in this backend.' },
   ];
   return <div className="tools-page">
-    <PageHeader eyebrow="Integrations" title="Tools Marketplace" description="Connect real API or MCP tools without exposing credentials in the browser." actions={<button className="button primary" onClick={openConnect}><Plus size={15}/>Connect API tool</button>}/>
+    <PageHeader eyebrow="Resources" title="Integrations" description="Connect applications and APIs, then control exactly which agents may use them." actions={<><button className="button" onClick={() => navigate('/mcp')}><Blocks size={15}/>MCP catalog</button><button className="button primary" onClick={openConnect}><Plus size={15}/>Custom API</button></>}/>
     <section className="market-grid">{catalog.map(({ name, category, Icon, explanation }) => <article className="market-card panel" key={name}><div><span><Icon size={21}/></span><Status value="idle"/></div><h2>{name}</h2><p>{category} integration template.</p><button className="button" disabled title={explanation}>Connect</button><small>{explanation}</small></article>)}</section>
     <section className="panel connected-tools"><div className="panel-header"><div><span className="eyebrow">Workspace runtime</span><h2>Connected tools</h2></div></div>{data.tools.length ? <div>{data.tools.map((tool) => <article key={tool.id}><span className="tool-glyph"><Wrench size={18}/></span><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><Status value={tool.enabled ? 'active' : 'paused'}/><button className="button" disabled={!tool.enabled || test.isPending} onClick={() => test.mutate(tool)}>Test connection</button><button className="button" disabled={toggle.isPending} onClick={() => toggle.mutate(tool)}>{tool.enabled ? 'Disable' : 'Enable'}</button></article>)}</div> : <EmptyState Icon={Wrench} title="No tools connected" text="Connect a public HTTPS API or MCP endpoint for your agents." action={<button className="button primary" onClick={openConnect}>Connect API tool</button>}/>}</section>
   </div>;

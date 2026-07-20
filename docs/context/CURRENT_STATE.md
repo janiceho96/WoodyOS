@@ -4,6 +4,8 @@ Last verified: 2026-07-20.
 
 ## Working
 
+- Phase 1 UX foundation: grouped seven-item navigation, goal-first dashboard, contextual Templates/MCP entry points, Runs terminology, live-work indicator, and direct dashboard-to-Prompt-to-Agent handoff.
+- Guided Agent Builder: five-step Purpose, Instructions, Resources, Model, and Review flow with progressive model controls, explicit least-access permissions, live summary, draft/publish distinction, and responsive navigation.
 - Authentication, onboarding, dashboard, agents, queued tasks, and task output viewing.
 - Markdown output viewing plus generated PDF, DOCX, PPTX, and XLSX artifacts.
 - Knowledge upload, extraction, chunking, full-text search, and optional vector search.
@@ -13,6 +15,7 @@ Last verified: 2026-07-20.
 
 ## Partial
 
+- UX redesign: the shell, dashboard, and Agent Builder are complete in source; workflow canvas, Knowledge assignment, integration details, and human-readable recovery flows remain later phases.
 - Workflow editor: functional node/edge authoring and inspector, but not a free-positioned drag-and-drop canvas.
 - Knowledge retrieval: workspace-wide; agent runtime currently relies on full-text retrieval.
 - MCP tools in workflows: MCP runtime is robust, but the workflow editor does not yet expose exact discovered app/tool nodes.

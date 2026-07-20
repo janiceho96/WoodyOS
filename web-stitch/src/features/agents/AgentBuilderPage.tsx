@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Bot, Check, ChevronRight, Code2, Database, Globe2, LoaderCircle, Play, Rocket, Save, Settings, Sparkles, TerminalSquare, Wrench, X, Zap } from 'lucide-react';
+import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, type Agent } from '../../api';
@@ -13,13 +13,22 @@ type Draft = {
   capabilities: { webBrowser: boolean; codeInterpreter: boolean; knowledgeBase: boolean };
   toolIds: string[];
 };
+type BuilderStep = 'purpose' | 'instructions' | 'resources' | 'model' | 'review';
+
+const steps: Array<{ id: BuilderStep; label: string; hint: string }> = [
+  { id: 'purpose', label: 'Purpose', hint: 'Identity and outcome' },
+  { id: 'instructions', label: 'Instructions', hint: 'Rules and format' },
+  { id: 'resources', label: 'Resources', hint: 'Knowledge and access' },
+  { id: 'model', label: 'Model', hint: 'Quality and budget' },
+  { id: 'review', label: 'Review', hint: 'Safety and publish' },
+];
 
 function fromAgent(agent?: Agent, defaultModel = ''): Draft {
   return {
     name: agent?.name ?? '', role: agent?.role ?? '', goal: agent?.goal ?? '', personality: agent?.personality ?? '',
     instructions: agent?.instructions ?? '', model: agent?.model ?? defaultModel,
     temperature: agent?.model_config?.temperature ?? 0.2, maxTokens: agent?.model_config?.maxTokens ?? 4096,
-    topP: agent?.model_config?.topP ?? 1, status: agent?.status === 'archived' ? 'draft' : agent?.status ?? 'active',
+    topP: agent?.model_config?.topP ?? 1, status: agent?.status === 'archived' ? 'draft' : agent?.status ?? 'draft',
     capabilities: agent?.capabilities ?? { webBrowser: false, codeInterpreter: false, knowledgeBase: true },
     toolIds: agent?.tool_ids ?? [],
   };
@@ -33,19 +42,30 @@ export function AgentBuilderPage() {
   const agent = useMemo(() => data.agents.find((item) => item.id === agentId), [data.agents, agentId]);
   const defaultModel = data.runtime?.defaultModel ?? '';
   const [draft, setDraft] = useState<Draft>(() => fromAgent(agent, defaultModel));
+  const [step, setStep] = useState<BuilderStep>('purpose');
   const [formError, setFormError] = useState('');
   useEffect(() => {
     setDraft((current) => {
       if (agent) return fromAgent(agent, defaultModel);
       return current.model || !defaultModel ? current : { ...current, model: defaultModel };
     });
-  }, [agent?.id, defaultModel]);
+  }, [agent, defaultModel]);
+
+  const validation = {
+    purpose: draft.name.trim().length >= 2 && draft.role.trim().length >= 2 && draft.goal.trim().length >= 2,
+    instructions: draft.instructions.trim().length >= 10,
+    resources: true,
+    model: draft.model.trim().length >= 2 && draft.maxTokens >= 128,
+    review: false,
+  };
+  const ready = validation.purpose && validation.model;
+  const activeTools = data.tools.filter((tool) => draft.toolIds.includes(tool.id));
+  const currentIndex = steps.findIndex((item) => item.id === step);
 
   const mutation = useMutation({
     mutationFn: async (status: Agent['status']) => {
-      if (draft.name.trim().length < 2 || draft.role.trim().length < 2 || draft.goal.trim().length < 2) {
-        throw new Error('Name, role, and goal each need at least 2 characters.');
-      }
+      if (!validation.purpose) throw new Error('Complete the agent name, role, and goal before saving.');
+      if (!validation.model) throw new Error('Choose a valid model and output-token limit.');
       const body = {
         name: draft.name.trim(), role: draft.role.trim(), goal: draft.goal.trim(), personality: draft.personality.trim() || null,
         instructions: draft.instructions, model: draft.model.trim(), status,
@@ -55,9 +75,9 @@ export function AgentBuilderPage() {
       };
       return agent ? api.updateAgent(agent.id, body) : api.createAgent(body);
     },
-    onSuccess: async (saved) => {
+    onSuccess: async (saved, status) => {
       setFormError('');
-      report(agent ? 'Agent configuration updated' : 'Agent deployed');
+      report(status === 'active' ? `${saved.name} is published and ready to run` : `${saved.name} saved as a draft`);
       await queryClient.invalidateQueries({ queryKey: ['workspace'] });
       navigate(`/agents/${saved.id}/edit`, { replace: true });
     },
@@ -69,47 +89,76 @@ export function AgentBuilderPage() {
 
   const toggleCapability = (key: keyof Draft['capabilities']) => setDraft((current) => ({ ...current, capabilities: { ...current.capabilities, [key]: !current.capabilities[key] } }));
   const toggleTool = (id: string) => setDraft((current) => ({ ...current, toolIds: current.toolIds.includes(id) ? current.toolIds.filter((toolId) => toolId !== id) : [...current.toolIds, id] }));
-  return <div className="builder-page">
+  const move = (direction: -1 | 1) => setStep(steps[Math.max(0, Math.min(steps.length - 1, currentIndex + direction))].id);
+
+  return <div className="builder-page guided-builder">
     <div className="builder-toolbar">
-      <div><span className="eyebrow">Builder <ChevronRight size={12}/></span><strong>{agent ? agent.name : 'New agent'}</strong><Status value={agent?.status ?? 'draft'}/></div>
-      <div>{!agent && <button className="button" onClick={() => navigate('/solutions?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => navigate('/agents')}>Discard</button><button className="button" disabled={mutation.isPending} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Deploy agent</button></div>
+      <div><span className="eyebrow">Agents <ChevronRight size={12}/></span><strong>{agent ? agent.name : 'New agent draft'}</strong><Status value={agent?.status ?? 'draft'}/></div>
+      <div>{!agent && <button className="button" onClick={() => navigate('/solutions?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => navigate('/agents')}>Close</button><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Publish agent</button></div>
     </div>
-    {formError && <div className="inline-error"><AlertTriangle size={15}/>{formError}</div>}
-    <div className="builder-layout">
-      <section className="builder-pane identity-pane">
-        <div className="builder-section-title"><Bot size={18}/><h2>Identity</h2></div>
-        <label>Agent name <span>*</span><input value={draft.name} maxLength={120} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="e.g. Research Analyst"/></label>
-        <label>Role <span>*</span><input value={draft.role} maxLength={240} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="e.g. Senior market researcher"/></label>
-        <label>Goal <span>*</span><textarea value={draft.goal} maxLength={5000} onChange={(event) => setDraft({ ...draft, goal: event.target.value })} placeholder="Define the outcome this agent owns."/></label>
-        <label>Personality<input value={draft.personality} maxLength={80} onChange={(event) => setDraft({ ...draft, personality: event.target.value })} placeholder="Analytical, concise, cautious"/></label>
-        <div className="builder-section-title"><TerminalSquare size={18}/><h2>Instructions</h2></div>
-        <label>System prompt <small>Markdown supported</small><textarea className="instruction-editor" value={draft.instructions} maxLength={20000} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} placeholder="Rules, boundaries, preferred response format…"/></label>
-        <small className="token-estimate">≈ {Math.ceil(draft.instructions.length / 4)} prompt tokens</small>
-      </section>
-      <section className="builder-preview">
-        <div className="preview-head"><span><i/>Configuration preview</span><small>Live local preview</small></div>
-        <div className="preview-canvas">
-          <div className="preview-agent"><span className="agent-glyph large"><Sparkles size={30}/></span><span className="eyebrow">{draft.status} agent</span><h1>{draft.name || 'Untitled Agent'}</h1><p>{draft.role || 'Add a role to define this agent.'}</p></div>
-          <div className="preview-goal"><span className="eyebrow">Primary objective</span><p>{draft.goal || 'Your agent goal will appear here as you build.'}</p></div>
-          <div className="preview-capabilities">{Object.entries(draft.capabilities).map(([key, enabled]) => <span className={enabled ? 'enabled' : ''} key={key}>{enabled ? <Check size={13}/> : <X size={13}/>} {humanize(key)}</span>)}</div>
-          <div className="sandbox-note"><Play size={17}/><div><strong>Test with a real task after deployment</strong><p>Sandbox work uses the execution monitor so output, cost, and events remain auditable.</p></div></div>
-        </div>
-      </section>
-      <section className="builder-pane config-pane">
-        <div className="builder-section-title"><Zap size={18}/><h2>Capabilities</h2></div>
-        {([
-          ['webBrowser', 'Web browser', 'Use connected web-capable tools.', Globe2],
-          ['codeInterpreter', 'Code interpreter', 'Allow code-oriented execution tools.', Code2],
-          ['knowledgeBase', 'Knowledge base', 'Search indexed workspace context.', Database],
-        ] as const).map(([key, label, text, Icon]) => <button className={`toggle-card ${draft.capabilities[key] ? 'active' : ''}`} key={key} onClick={() => toggleCapability(key)} type="button"><span><Icon size={18}/></span><div><strong>{label}</strong><small>{text}</small></div><i/></button>)}
-        <div className="builder-section-title"><Wrench size={18}/><h2>Connected tools</h2></div>
-        {data.tools.filter((tool) => tool.enabled).length ? <div className="tool-checks">{data.tools.filter((tool) => tool.enabled).map((tool) => <label key={tool.id}><input type="checkbox" checked={draft.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span>{tool.name}<small>{tool.kind}</small></span></label>)}</div> : <p className="muted-note">No enabled tools are available. Connect one in Tools Marketplace.</p>}
-        <div className="builder-section-title"><Settings size={18}/><h2>Model settings</h2></div>
-        <label>Foundation model <small>{data.runtime ? `${data.runtime.provider.replace('-', ' ')} default` : 'Loading runtime default…'}</small><input value={draft.model} maxLength={160} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder={defaultModel || 'Provider model name'}/></label>
-        <label>Temperature <strong className="field-value">{draft.temperature}</strong><input type="range" min="0" max="2" step="0.1" value={draft.temperature} onChange={(event) => setDraft({ ...draft, temperature: Number(event.target.value) })}/></label>
-        <label>Max output tokens<input type="number" min="128" max="128000" value={draft.maxTokens} onChange={(event) => setDraft({ ...draft, maxTokens: Number(event.target.value) })}/></label>
-        <label>Top P <strong className="field-value">{draft.topP}</strong><input type="range" min="0" max="1" step="0.05" value={draft.topP} onChange={(event) => setDraft({ ...draft, topP: Number(event.target.value) })}/></label>
-      </section>
+    {formError && <div className="inline-error builder-error"><AlertTriangle size={15}/><span><strong>Agent was not saved.</strong>{formError}</span></div>}
+    <div className="guided-builder-layout">
+      <aside className="builder-steps" aria-label="Agent builder steps">
+        <div><span className="eyebrow">Build progress</span><strong>{ready ? 'Ready to review' : 'Draft in progress'}</strong></div>
+        {steps.map((item, index) => <button key={item.id} className={step === item.id ? 'active' : ''} onClick={() => setStep(item.id)}><i>{validation[item.id] || (item.id === 'review' && ready) ? <Check size={13}/> : index + 1}</i><span><strong>{item.label}</strong><small>{item.hint}</small></span><ChevronRight size={14}/></button>)}
+        <div className="builder-safety-note"><ShieldCheck size={17}/><span><strong>Least access by default</strong><small>Tools remain unavailable until you explicitly select them.</small></span></div>
+      </aside>
+
+      <main className="builder-step-content">
+        {step === 'purpose' && <BuilderSection Icon={Bot} eyebrow="Step 1" title="Give this agent one clear responsibility" description="A focused agent is easier to test, safer to operate, and produces more consistent work.">
+          <label>Agent name <span>*</span><input value={draft.name} maxLength={120} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="Research Analyst"/></label>
+          <label>Role <span>*</span><input value={draft.role} maxLength={240} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="Senior market researcher"/><small>Describe what kind of specialist this is.</small></label>
+          <label>Outcome this agent owns <span>*</span><textarea className="builder-large-field" value={draft.goal} maxLength={5000} onChange={(event) => setDraft({ ...draft, goal: event.target.value })} placeholder="Research a market and return a cited comparison of the strongest competitors."/><small>Write an observable result rather than a broad topic.</small></label>
+          <label>Working style <small>Optional</small><input value={draft.personality} maxLength={80} onChange={(event) => setDraft({ ...draft, personality: event.target.value })} placeholder="Analytical, concise, cautious"/></label>
+        </BuilderSection>}
+
+        {step === 'instructions' && <BuilderSection Icon={FileText} eyebrow="Step 2" title="Set rules and an output contract" description="Tell the agent how to work, what to avoid, and how a successful answer should be structured.">
+          <div className="instruction-prompts"><button onClick={() => setDraft({ ...draft, instructions: `${draft.instructions}${draft.instructions ? '\n\n' : ''}## Process\n1. Verify the request and available context.\n2. Complete the work step by step.\n3. Check the result against the goal.` })}>Add process</button><button onClick={() => setDraft({ ...draft, instructions: `${draft.instructions}${draft.instructions ? '\n\n' : ''}## Boundaries\n- Do not invent facts.\n- State uncertainty clearly.\n- Ask for approval before external write actions.` })}>Add safety rules</button><button onClick={() => setDraft({ ...draft, instructions: `${draft.instructions}${draft.instructions ? '\n\n' : ''}## Output\nReturn a concise Markdown report with a summary, findings, evidence, and recommended next actions.` })}>Add output format</button></div>
+          <label>Agent instructions <small>Markdown supported</small><textarea className="instruction-editor" value={draft.instructions} maxLength={20000} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} placeholder="Describe the process, boundaries, quality checks, and required output…"/></label>
+          <div className="field-foot"><span>≈ {Math.ceil(draft.instructions.length / 4)} prompt tokens</span><span>{draft.instructions.length.toLocaleString()} / 20,000 characters</span></div>
+          {!validation.instructions && <div className="gentle-warning"><AlertTriangle size={15}/>Instructions are optional, but at least a short process and output format are recommended.</div>}
+        </BuilderSection>}
+
+        {step === 'resources' && <BuilderSection Icon={Database} eyebrow="Step 3" title="Choose what this agent may access" description="Capabilities and integrations are explicit. Selecting a tool grants access only to this agent.">
+          <div className="resource-group"><div><h3>Capabilities</h3><p>Enable only what the responsibility requires.</p></div>{([
+            ['webBrowser', 'Web access', 'Use connected web-capable tools. This does not create a browser by itself.', Globe2],
+            ['codeInterpreter', 'Code-oriented work', 'Allow compatible execution tools for code and data tasks.', Code2],
+            ['knowledgeBase', 'Workspace knowledge', 'Search indexed workspace documents. Per-document assignment is not available yet.', Database],
+          ] as const).map(([key, label, text, Icon]) => <button className={`permission-card ${draft.capabilities[key] ? 'active' : ''}`} key={key} onClick={() => toggleCapability(key)} type="button"><span><Icon size={18}/></span><div><strong>{label}</strong><small>{text}</small></div><i>{draft.capabilities[key] ? <Check size={13}/> : <X size={13}/>}</i></button>)}</div>
+          <div className="resource-group"><div><h3>Connected integrations</h3><p>Only enabled API tools appear here. MCP access remains controlled by its agent allowlist.</p></div>{data.tools.filter((tool) => tool.enabled).length ? <div className="permission-list">{data.tools.filter((tool) => tool.enabled).map((tool) => <label key={tool.id}><input type="checkbox" checked={draft.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><b>{draft.toolIds.includes(tool.id) ? 'Allowed' : 'No access'}</b></label>)}</div> : <div className="resource-empty"><Wrench size={18}/><span><strong>No enabled integrations</strong><small>Connect an API or MCP application from Integrations first.</small></span><button className="button" onClick={() => navigate('/tools')}>Open Integrations</button></div>}</div>
+        </BuilderSection>}
+
+        {step === 'model' && <BuilderSection Icon={BrainCircuit} eyebrow="Step 4" title="Choose quality and usage limits" description="The workspace default is usually the safest starting point. Advanced controls are available when the task requires them.">
+          <label>Foundation model <span>*</span><input value={draft.model} maxLength={160} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder={defaultModel || 'Provider model name'}/><small>{data.runtime ? `Current ${data.runtime.provider.replace('-', ' ')} workspace default: ${defaultModel}` : 'Loading workspace runtime…'}</small></label>
+          <details className="advanced-settings"><summary><Settings size={16}/><span><strong>Advanced model controls</strong><small>Adjust creativity and response size</small></span><ChevronRight size={15}/></summary><div><label>Temperature <strong className="field-value">{draft.temperature}</strong><input type="range" min="0" max="2" step="0.1" value={draft.temperature} onChange={(event) => setDraft({ ...draft, temperature: Number(event.target.value) })}/><small>Lower values are more predictable; higher values are more varied.</small></label><label>Maximum output tokens<input type="number" min="128" max="128000" value={draft.maxTokens} onChange={(event) => setDraft({ ...draft, maxTokens: Number(event.target.value) })}/></label><label>Top P <strong className="field-value">{draft.topP}</strong><input type="range" min="0" max="1" step="0.05" value={draft.topP} onChange={(event) => setDraft({ ...draft, topP: Number(event.target.value) })}/></label></div></details>
+          <div className="model-summary"><Zap size={18}/><span><strong>{draft.model || 'No model selected'}</strong><small>Up to {draft.maxTokens.toLocaleString()} output tokens · temperature {draft.temperature}</small></span></div>
+        </BuilderSection>}
+
+        {step === 'review' && <BuilderSection Icon={ShieldCheck} eyebrow="Step 5" title="Review before publishing" description="Publishing makes this agent available for tasks. It does not automatically run work or grant new permissions.">
+          <div className="agent-review-card"><div className="review-identity"><span className="agent-glyph large"><Sparkles size={28}/></span><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="Integrations" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API tool access'} good={!activeTools.length}/><ReviewRow label="Web and code" value={[draft.capabilities.webBrowser && 'Web-capable tools', draft.capabilities.codeInterpreter && 'Code-oriented tools'].filter(Boolean).join(', ') || 'Not enabled'} good={!draft.capabilities.webBrowser && !draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
+          <div className="publish-boundary"><ShieldCheck size={19}/><div><strong>What happens when you publish</strong><p>The configuration is saved and the agent becomes selectable for tasks. No task starts automatically, no external action is performed, and MCP permissions remain separately enforced.</p></div></div>
+          <div className="review-actions"><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save as draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}><Rocket size={15}/>{agent?.status === 'active' ? 'Update published agent' : 'Publish agent'}</button>{agent && <button className="button" onClick={() => navigate(`/executions?agent=${agent.id}`)}><Play size={15}/>Open test runs</button>}</div>
+        </BuilderSection>}
+
+        <footer className="builder-step-footer"><button className="button" disabled={currentIndex === 0} onClick={() => move(-1)}><ChevronLeft size={15}/>Previous</button><span>Step {currentIndex + 1} of {steps.length}</span>{currentIndex < steps.length - 1 ? <button className="button primary" onClick={() => move(1)}>Continue<ChevronRight size={15}/></button> : <button className="button" onClick={() => setStep('purpose')}>Review from start</button>}</footer>
+      </main>
+
+      <aside className="builder-live-summary">
+        <span className="eyebrow">Live summary</span><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.role || 'Add a role to define this specialist.'}</p>
+        <div><small>Outcome</small><strong>{draft.goal || 'Not defined yet'}</strong></div>
+        <div><small>Access</small><span>{Object.entries(draft.capabilities).map(([key, enabled]) => <i className={enabled ? 'enabled' : ''} key={key}>{enabled ? <Check size={11}/> : <X size={11}/>} {humanize(key)}</i>)}</span></div>
+        <div><small>Integrations</small><strong>{activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'None assigned'}</strong></div>
+        <div><small>Model</small><strong>{draft.model || 'Not selected'}</strong></div>
+        <div className="summary-readiness"><Status value={ready ? 'ready' : 'draft'}/><span>{ready ? 'Required fields complete' : 'Complete Purpose and Model'}</span></div>
+      </aside>
     </div>
   </div>;
+}
+
+function BuilderSection({ Icon, eyebrow, title, description, children }: { Icon: typeof Bot; eyebrow: string; title: string; description: string; children: React.ReactNode }) {
+  return <section className="guided-section"><header><span><Icon size={20}/></span><div><small className="eyebrow">{eyebrow}</small><h1>{title}</h1><p>{description}</p></div></header><div className="guided-fields">{children}</div></section>;
+}
+
+function ReviewRow({ label, value, good }: { label: string; value: string; good: boolean }) {
+  return <div className="review-row"><span className={good ? 'good' : ''}>{good ? <Check size={13}/> : <AlertTriangle size={13}/>}</span><small>{label}</small><strong>{value}</strong></div>;
 }

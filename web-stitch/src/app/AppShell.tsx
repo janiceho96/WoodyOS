@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Blocks, Bot, BookOpen, Boxes, CircleHelp, LayoutDashboard, LogOut, Menu, Moon, RefreshCw, Search, Settings, Sun, WandSparkles, Workflow, Wrench, X } from 'lucide-react';
+import { Activity, BarChart3, Bot, BookOpen, CircleHelp, LayoutDashboard, LogOut, Menu, Moon, PlugZap, RefreshCw, Search, Settings, Sun, Workflow, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api, auth, type Onboarding, type Session } from '../api';
@@ -15,16 +15,13 @@ import { WorkspaceContext, useWorkspaceData } from './workspace';
 export type AppDialog = 'task' | 'document' | 'tool' | 'search' | null;
 
 const nav = [
-  { path: '/dashboard', label: 'Dashboard', Icon: LayoutDashboard },
-  { path: '/agents', label: 'Agents', Icon: Bot },
-  { path: '/agents/new', label: 'Builder', Icon: WandSparkles },
-  { path: '/solutions', label: 'Starter Solutions', Icon: Boxes },
-  { path: '/workflows', label: 'Workflows', Icon: Workflow },
-  { path: '/knowledge', label: 'Knowledge Base', Icon: BookOpen },
-  { path: '/tools', label: 'Tools', Icon: Wrench },
-  { path: '/mcp', label: 'MCP Marketplace', Icon: Blocks },
-  { path: '/executions', label: 'Logs', Icon: Activity },
-  { path: '/analytics', label: 'Analytics', Icon: BarChart3 },
+  { path: '/dashboard', label: 'Home', Icon: LayoutDashboard, group: 'Workspace' },
+  { path: '/agents', label: 'Agents', Icon: Bot, group: 'Build' },
+  { path: '/workflows', label: 'Workflows', Icon: Workflow, group: 'Build' },
+  { path: '/knowledge', label: 'Knowledge', Icon: BookOpen, group: 'Resources' },
+  { path: '/tools', label: 'Integrations', Icon: PlugZap, group: 'Resources' },
+  { path: '/executions', label: 'Runs', Icon: Activity, group: 'Activity' },
+  { path: '/analytics', label: 'Analytics', Icon: BarChart3, group: 'Activity' },
 ];
 
 export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: {
@@ -40,7 +37,8 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
   const [onboarding, setOnboarding] = useState<Onboarding>(session.user.onboarding);
   const [showOnboarding, setShowOnboarding] = useState(!session.user.onboarding.completed);
   const data = workspace.data ?? { agents: [], tasks: [], workflows: [], documents: [], tools: [] };
-  const label = nav.find((item) => location.pathname === item.path || (item.path === '/agents' && location.pathname.startsWith('/agents/')))?.label ?? (location.pathname === '/settings' ? 'Settings' : location.pathname === '/mascot-lab' ? 'Mascot Lab' : 'Woody Workspace');
+  const label = nav.find((item) => location.pathname === item.path || (item.path === '/agents' && location.pathname.startsWith('/agents/')))?.label ?? (location.pathname === '/solutions' ? 'Create' : location.pathname === '/mcp' ? 'Integrations' : location.pathname === '/settings' ? 'Settings' : location.pathname === '/mascot-lab' ? 'Mascot Lab' : 'Woody Workspace');
+  const liveWork = data.tasks.filter((task) => ['queued', 'running'].includes(task.status));
   const report = (message: string) => { setNotice(message); setError(''); };
   const reportError = (message: string) => { setError(message); setNotice(''); };
   const value = useMemo(() => ({
@@ -62,11 +60,11 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
     <div className="app-shell">
       <aside className={`side-rail ${mobileOpen ? 'open' : ''}`}>
         <div className="brand-block"><BrandMark/><div><strong>Woody</strong><small>Agent OS</small></div><button className="icon-button mobile-only" onClick={() => setMobileOpen(false)} aria-label="Close navigation"><X size={19}/></button></div>
-        <nav className="primary-nav" aria-label="Primary navigation">{nav.map(({ path, label: itemLabel, Icon }) => <button key={path} className={location.pathname === path || (path === '/agents' && location.pathname.startsWith('/agents/') && location.pathname !== '/agents/new') ? 'active' : ''} onClick={() => go(path)}><Icon size={19}/><span>{itemLabel}</span></button>)}</nav>
+        <nav className="primary-nav" aria-label="Primary navigation">{['Workspace', 'Build', 'Resources', 'Activity'].map((group) => <div className="nav-group" key={group}><span>{group}</span>{nav.filter((item) => item.group === group).map(({ path, label: itemLabel, Icon }) => <button key={path} className={location.pathname === path || (path === '/agents' && location.pathname.startsWith('/agents/')) || (path === '/tools' && location.pathname === '/mcp') ? 'active' : ''} onClick={() => go(path)}><Icon size={18}/><span>{itemLabel}</span>{path === '/executions' && liveWork.length > 0 && <b>{liveWork.length}</b>}</button>)}</div>)}</nav>
         <div className="rail-footer"><button className={location.pathname === '/settings' ? 'active' : ''} onClick={() => go('/settings')}><Settings size={19}/><span>Settings</span></button><div className="identity-card"><span className="avatar">{session.user.displayName.slice(0, 1).toUpperCase()}</span><div><strong>{session.user.displayName}</strong><small>{session.workspace.name}</small></div><button className="icon-button" aria-label="Sign out" title="Sign out" onClick={() => value.signOut()}><LogOut size={16}/></button></div></div>
       </aside>
       <div className="workspace">
-        <header className="top-nav"><button className="icon-button mobile-only" onClick={() => setMobileOpen(true)} aria-label="Open navigation"><Menu size={20}/></button><div className="workspace-title"><span>{label}</span><small>{workspace.isFetching ? 'Syncing live data…' : 'Woody Workspace'}</small></div><button className="global-search" onClick={() => setDialog('search')} aria-label="Search workspace"><Search size={17}/><span>Search commands, agents, logs…</span><kbd>⌘K</kbd></button><div className="top-actions"><button className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>{theme === 'dark' ? <Sun size={18}/> : <Moon size={18}/>}</button><a className="icon-button" href="/docs" target="_blank" rel="noreferrer" aria-label="Open API documentation"><CircleHelp size={18}/></a><button className="icon-button" onClick={() => void workspace.refetch()} aria-label="Refresh workspace"><RefreshCw size={18} className={workspace.isFetching ? 'spin' : ''}/></button><span className="avatar small">{session.user.displayName.slice(0, 1).toUpperCase()}</span></div></header>
+        <header className="top-nav"><button className="icon-button mobile-only" onClick={() => setMobileOpen(true)} aria-label="Open navigation"><Menu size={20}/></button><div className="workspace-title"><span>{label}</span><small>{workspace.isFetching ? 'Syncing live data…' : 'Woody Workspace'}</small></div><button className="global-search" onClick={() => setDialog('search')} aria-label="Search workspace"><Search size={17}/><span>Search agents, runs, knowledge…</span><kbd>⌘K</kbd></button><div className="top-actions">{liveWork.length > 0 && <button className="live-work-pill" onClick={() => go('/executions')}><i/>{liveWork.length} active</button>}<button className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>{theme === 'dark' ? <Sun size={18}/> : <Moon size={18}/>}</button><a className="icon-button" href="/docs" target="_blank" rel="noreferrer" aria-label="Open help and API documentation"><CircleHelp size={18}/></a><button className="icon-button" onClick={() => void workspace.refetch()} aria-label="Refresh workspace"><RefreshCw size={18} className={workspace.isFetching ? 'spin' : ''}/></button><span className="avatar small">{session.user.displayName.slice(0, 1).toUpperCase()}</span></div></header>
         <main className="page-canvas"><Notice text={error || notice} error={Boolean(error)} dismiss={() => { setError(''); setNotice(''); }}/>{workspace.error && <Notice text={workspace.error instanceof Error ? workspace.error.message : 'Could not load workspace data'} error dismiss={() => void workspace.refetch()}/>}<Outlet context={{ openDialog: setDialog, theme, setTheme, onboarding, resumeOnboarding: () => setShowOnboarding(true), restartOnboarding: async () => { const next = await api.restartOnboarding(); setOnboarding(next); setShowOnboarding(true); report('Onboarding restarted'); } }}/></main>
       </div>
     </div>
