@@ -427,16 +427,38 @@ export async function workflowRoutes(app: FastifyInstance) {
     const runId = (request.params as { runId: string }).runId;
     const run = await query('SELECT * FROM workflow_runs WHERE id=$1 AND workspace_id=$2', [runId, request.user.workspaceId]);
     if (!run.rowCount) return reply.code(404).send({ error: 'WORKFLOW_RUN_NOT_FOUND' });
-    const [events, approvals, actionAuthorizations, nodeStates, artifacts] = await Promise.all([
+    const [events, approvals, actionAuthorizations, nodeStates, artifacts, usage] = await Promise.all([
       query('SELECT * FROM workflow_run_events WHERE workflow_run_id=$1 ORDER BY created_at', [runId]),
       query('SELECT * FROM workflow_approvals WHERE workflow_run_id=$1 ORDER BY requested_at', [runId]),
       query(`SELECT id,node_id,iteration_key,attempt,adapter,resource_id,operation,target_summary,risk_level,
              arguments_summary,arguments_hash,status,requested_at,expires_at,resolved_at,consumed_at,error_message
-             FROM workflow_action_authorizations WHERE workflow_run_id=$1 ORDER BY requested_at`, [runId]),
+             FROM action_authorizations WHERE workflow_run_id=$1 ORDER BY requested_at`, [runId]),
       query('SELECT * FROM workflow_run_node_states WHERE workflow_run_id=$1 ORDER BY started_at,attempt', [runId]),
       query('SELECT * FROM artifacts WHERE workflow_run_id=$1 ORDER BY created_at', [runId]),
+      query<{ agent_tasks: number; input_tokens: number; output_tokens: number; estimated_cost_usd: string }>(
+        `SELECT count(*)::int agent_tasks,
+         COALESCE(sum(token_input),0)::int input_tokens,
+         COALESCE(sum(token_output),0)::int output_tokens,
+         COALESCE(sum(estimated_cost_usd),0)::text estimated_cost_usd
+         FROM tasks WHERE workflow_run_id=$1`,
+        [runId],
+      ),
     ]);
-    return { ...run.rows[0], events: events.rows, approvals: approvals.rows, actionAuthorizations: actionAuthorizations.rows, nodeStates: nodeStates.rows, artifacts: artifacts.rows };
+    const totals = usage.rows[0] ?? { agent_tasks: 0, input_tokens: 0, output_tokens: 0, estimated_cost_usd: '0' };
+    return {
+      ...run.rows[0],
+      events: events.rows,
+      approvals: approvals.rows,
+      actionAuthorizations: actionAuthorizations.rows,
+      nodeStates: nodeStates.rows,
+      artifacts: artifacts.rows,
+      usage: {
+        agentTasks: Number(totals.agent_tasks),
+        inputTokens: Number(totals.input_tokens),
+        outputTokens: Number(totals.output_tokens),
+        estimatedCostUsd: Number(totals.estimated_cost_usd),
+      },
+    };
   }));
   app.post('/runs/:runId/approvals/:approvalId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;

@@ -14,9 +14,11 @@ import {
   type ReactFlowInstance,
   useNodesState,
 } from '@xyflow/react';
-import { Bot, Blocks, BrainCircuit, FileOutput, Maximize2, Network, PlugZap, Repeat2, ShieldCheck, Split, Undo2, Redo2, Wrench, Zap } from 'lucide-react';
+import { Bot, Blocks, BrainCircuit, FileOutput, Globe2, Maximize2, Network, PanelRightOpen, PlugZap, Repeat2, ShieldCheck, Split, Undo2, Redo2, Wrench, Zap } from 'lucide-react';
 import { memo, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
-import type { WorkflowDefinition, WorkflowNode, WorkflowNodeCatalogEntry } from '../../api';
+import type { Agent, WorkflowDefinition, WorkflowNode, WorkflowNodeCatalogEntry } from '../../api';
+import { AppBrandMark } from '../../components/AppBrandMark';
+import { AgentAvatar } from '../../components/agents/AgentAvatar';
 
 type PositionRecord = { nodeId: string; x: number; y: number };
 type CanvasNodeData = Record<string, unknown> & {
@@ -24,6 +26,8 @@ type CanvasNodeData = Record<string, unknown> & {
   definition: WorkflowNodeCatalogEntry;
   label: string;
   active: boolean;
+  brand?: { appId?: string | null; title: string; color?: string | null } | null;
+  agent?: Pick<Agent, 'id' | 'name' | 'role' | 'avatar_config' | 'updated_at'> | null;
 };
 type CanvasNode = Node<CanvasNodeData, 'woody'>;
 
@@ -38,7 +42,10 @@ export type WorkflowCanvasProps = {
   simpleMode: boolean;
   canUndo: boolean;
   canRedo: boolean;
+  inspectorOpen: boolean;
   labelFor: (node: WorkflowNode) => string;
+  brandFor: (node: WorkflowNode) => CanvasNodeData['brand'];
+  agentFor: (node: WorkflowNode) => CanvasNodeData['agent'];
   onSelectNode: (id: string) => void;
   onMoveNode: (id: string, position: { x: number; y: number }) => void;
   onViewportChange: (viewport: { x: number; y: number; zoom: number }) => void;
@@ -49,7 +56,8 @@ export type WorkflowCanvasProps = {
   onAutoLayout: () => void;
   onUndo: () => void;
   onRedo: () => void;
-  onToggleMode: () => void;
+  onSetMode: (simple: boolean) => void;
+  onToggleInspector: () => void;
 };
 
 function iconFor(type: WorkflowNode['type']) {
@@ -59,6 +67,7 @@ function iconFor(type: WorkflowNode['type']) {
   if (type === 'api_action') return <PlugZap size={16}/>;
   if (type === 'mcp_action') return <Blocks size={16}/>;
   if (type === 'knowledge_search') return <BrainCircuit size={16}/>;
+  if (type === 'browser') return <Globe2 size={16}/>;
   if (type === 'condition') return <Split size={16}/>;
   if (type === 'loop') return <Repeat2 size={16}/>;
   if (type === 'approval') return <ShieldCheck size={16}/>;
@@ -66,11 +75,11 @@ function iconFor(type: WorkflowNode['type']) {
 }
 
 const WorkflowCanvasNode = memo(function WorkflowCanvasNode({ data, selected }: NodeProps<CanvasNode>) {
-  const { workflowNode, definition, label, active } = data;
+  const { workflowNode, definition, label, active, brand, agent } = data;
   const outputs = definition.outputPorts;
   return <div className={`flow-node-card ${workflowNode.type} ${selected ? 'selected' : ''} ${active ? 'executing' : ''}`}>
     {definition.inputPorts.length > 0 && <Handle type="target" position={Position.Left} id="input" className="typed-handle input"/>}
-    <div className="flow-node-head"><span>{iconFor(workflowNode.type)}</span><small>{definition.title}</small>{active && <i>RUNNING</i>}</div>
+    <div className="flow-node-head"><span>{brand ? <AppBrandMark appId={brand.appId} title={brand.title} color={brand.color} size="small"/> : agent ? <AgentAvatar agent={agent} size="xs" status={active ? 'busy' : undefined} decorative/> : iconFor(workflowNode.type)}</span><small>{brand ? `${brand.title} action` : definition.title}</small>{active && <i>RUNNING</i>}</div>
     <strong>{label}</strong>
     <code>{workflowNode.id}</code>
     {outputs.map((port, index) => <div className="flow-port-label" key={port.id} style={{ top: `${((index + 1) / (outputs.length + 1)) * 100}%` }}>{port.label}</div>)}
@@ -85,7 +94,7 @@ function edgeId(edge: WorkflowDefinition['edges'][number], index: number) {
 }
 
 export function WorkflowCanvas(props: WorkflowCanvasProps) {
-  const { catalog, positions, nodes, selectedNodeId, activeNodeIds, labelFor, viewport } = props;
+  const { catalog, positions, nodes, selectedNodeId, activeNodeIds, labelFor, brandFor, agentFor, viewport } = props;
   const wrapper = useRef<HTMLDivElement>(null);
   const [instance, setInstance] = useState<ReactFlowInstance<CanvasNode, Edge> | null>(null);
   const catalogByType = useMemo(() => new Map(catalog.map((entry) => [entry.type, entry])), [catalog]);
@@ -94,8 +103,8 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
     const definition = catalogByType.get(workflowNode.type);
     if (!definition) return [];
     const position = positionById.get(workflowNode.id) ?? { x: 50 + index * 285, y: 280 };
-    return [{ id: workflowNode.id, type: 'woody', position: { x: position.x, y: position.y }, data: { workflowNode, definition, label: labelFor(workflowNode), active: activeNodeIds?.has(workflowNode.id) ?? false }, selected: selectedNodeId === workflowNode.id, deletable: !['trigger', 'output'].includes(workflowNode.type) }];
-  }), [catalogByType, positionById, nodes, selectedNodeId, activeNodeIds, labelFor]);
+    return [{ id: workflowNode.id, type: 'woody', position: { x: position.x, y: position.y }, data: { workflowNode, definition, label: labelFor(workflowNode), brand: brandFor(workflowNode), agent: agentFor(workflowNode), active: activeNodeIds?.has(workflowNode.id) ?? false }, selected: selectedNodeId === workflowNode.id, deletable: !['trigger', 'output'].includes(workflowNode.type) }];
+  }), [catalogByType, positionById, nodes, selectedNodeId, activeNodeIds, labelFor, brandFor, agentFor]);
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<CanvasNode>(derivedNodes);
   useEffect(() => setFlowNodes(derivedNodes), [derivedNodes, setFlowNodes]);
   const flowEdges = useMemo<Edge[]>(() => props.edges.map((edge, index) => ({
@@ -121,13 +130,21 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
     if (document.fullscreenElement) await document.exitFullscreen();
     else await wrapper.current.requestFullscreen();
   };
+  const toggleInspector = async () => {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    props.onToggleInspector();
+  };
 
   return <div className="visual-workflow-canvas" ref={wrapper} onDrop={onDrop} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }}>
     <div className="canvas-toolbar" aria-label="Workflow canvas controls">
-      <button type="button" onClick={props.onToggleMode}><Network size={14}/>{props.simpleMode ? 'Simple' : 'Advanced'}</button>
+      <div className="canvas-mode-switch" role="group" aria-label="Workflow editing mode">
+        <button type="button" className={props.simpleMode ? 'active' : ''} aria-pressed={props.simpleMode} onClick={() => props.onSetMode(true)}><Network size={14}/>Simple</button>
+        <button type="button" className={!props.simpleMode ? 'active' : ''} aria-pressed={!props.simpleMode} onClick={() => props.onSetMode(false)}>Advanced</button>
+      </div>
       <button type="button" onClick={props.onUndo} disabled={!props.canUndo} aria-label="Undo"><Undo2 size={14}/></button>
       <button type="button" onClick={props.onRedo} disabled={!props.canRedo} aria-label="Redo"><Redo2 size={14}/></button>
       <button type="button" onClick={props.onAutoLayout}>Auto layout</button>
+      <button type="button" className={`inspector-toggle ${props.inspectorOpen ? 'active' : ''}`} aria-pressed={props.inspectorOpen} onClick={() => void toggleInspector()}><PanelRightOpen size={14}/>Inspector</button>
       <button type="button" onClick={() => void fullscreen()} aria-label="Toggle full screen"><Maximize2 size={14}/></button>
     </div>
     <ReactFlow<CanvasNode, Edge>

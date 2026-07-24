@@ -5,7 +5,11 @@ import { audit } from '../lib/audit.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { encryptJson } from '../lib/crypto.js';
 import { invokeTool, type StoredConfig } from '../tools/runtime.js';
+import { demoApiCatalog, publicDemoApi } from '../tools/demo-catalog.js';
+import { jobToolCatalog, jobToolInstallSchema, materializeJobTool } from '../tools/jobs/catalog.js';
+import { materializeWebTool, webCatalogToolName, webResearchCatalog, webToolInstallSchema } from '../tools/web/catalog.js';
 const inputSchema = z.object({ name: z.string().min(2).max(100), kind: z.enum(['mcp', 'api', 'plugin', 'internal']), description: z.string().max(2000).default(''), config: z.record(z.unknown()).default({}), permissions: z.array(z.string().min(1)).default([]), enabled: z.boolean().default(true) });
+const demoParams = z.object({ slug: z.string().regex(/^[a-z0-9-]{2,80}$/) });
 
 export function toolConfigurationError(kind: z.infer<typeof inputSchema>['kind'] | undefined, config: Record<string, unknown> | undefined) {
   if (!kind || !config || (kind !== 'api' && kind !== 'mcp')) return null;
@@ -24,6 +28,81 @@ export function toolConfigurationError(kind: z.infer<typeof inputSchema>['kind']
 
 export async function toolRoutes(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => ({ data: (await query('SELECT id,name,kind,description,permissions,enabled,created_at,updated_at FROM tools WHERE workspace_id=$1 ORDER BY name', [request.user.workspaceId])).rows })));
+  app.get('/demos', { preHandler: app.authenticate }, asyncRoute(async (request) => {
+    const installedNames = new Set((await query<{ name: string }>('SELECT name FROM tools WHERE workspace_id=$1 AND name = ANY($2::text[])', [request.user.workspaceId, demoApiCatalog.map((demo) => demo.name)])).rows.map((row) => row.name));
+    return { data: demoApiCatalog.map((demo) => ({ ...publicDemoApi(demo), installed: installedNames.has(demo.name) })) };
+  }));
+  app.get('/web/catalog', { preHandler: app.authenticate }, asyncRoute(async (request) => {
+    const installed = new Set((await query<{ name: string }>("SELECT name FROM tools WHERE workspace_id=$1 AND kind='internal' AND permissions ? 'web.read'", [request.user.workspaceId])).rows.map((row) => row.name));
+    return { data: webResearchCatalog.map((entry) => ({ ...entry, installed: installed.has(webCatalogToolName(entry.id)) })) };
+  }));
+  app.get('/jobs/catalog', { preHandler: app.authenticate }, asyncRoute(async (request) => {
+    const installed = new Set((await query<{ name: string }>("SELECT name FROM tools WHERE workspace_id=$1 AND kind='internal' AND permissions ? 'jobs.read'", [request.user.workspaceId])).rows.map((row) => row.name));
+    return { data: jobToolCatalog.map((entry) => ({ ...entry, installed: installed.has('Jobs · Adzuna Search') })) };
+  }));
+  app.post('/jobs/install', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
+    const input = parse(jobToolInstallSchema, request.body, reply); if (!input) return;
+    const normalized = jobToolInstallSchema.parse(input);
+    const definition = materializeJobTool(normalized);
+    const existing = await query<{ id: string }>('SELECT id FROM tools WHERE workspace_id=$1 AND name=$2', [request.user.workspaceId, definition.name]);
+    if (existing.rowCount) {
+      const updated = (await query(
+        `UPDATE tools SET kind=$1,description=$2,config=$3,permissions=$4,enabled=true,updated_at=now()
+         WHERE id=$5 AND workspace_id=$6
+         RETURNING id,name,kind,description,permissions,enabled,created_at,updated_at`,
+        [definition.kind, definition.description, JSON.stringify(encryptJson(definition.config)), JSON.stringify(definition.permissions), existing.rows[0].id, request.user.workspaceId],
+      )).rows[0];
+      await audit(request.user.workspaceId, request.user.sub, 'tool.jobs_reconfigured', 'tool', updated.id, { provider: normalized.provider, country: normalized.country });
+      return updated;
+    }
+    const created = (await query(
+      `INSERT INTO tools(workspace_id,name,kind,description,config,permissions,enabled)
+       VALUES($1,$2,$3,$4,$5,$6,true)
+       RETURNING id,name,kind,description,permissions,enabled,created_at,updated_at`,
+      [request.user.workspaceId, definition.name, definition.kind, definition.description, JSON.stringify(encryptJson(definition.config)), JSON.stringify(definition.permissions)],
+    )).rows[0];
+    await audit(request.user.workspaceId, request.user.sub, 'tool.jobs_installed', 'tool', created.id, { provider: normalized.provider, country: normalized.country });
+    return reply.code(201).send(created);
+  }));
+  app.post('/web/install', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
+    const input = parse(webToolInstallSchema, request.body, reply); if (!input) return;
+    const normalized = webToolInstallSchema.parse(input);
+    const definition = materializeWebTool(normalized);
+    const existing = await query<{ id: string }>('SELECT id FROM tools WHERE workspace_id=$1 AND name=$2', [request.user.workspaceId, definition.name]);
+    if (existing.rowCount) {
+      const updated = (await query(
+        `UPDATE tools SET kind=$1,description=$2,config=$3,permissions=$4,enabled=true,updated_at=now()
+         WHERE id=$5 AND workspace_id=$6
+         RETURNING id,name,kind,description,permissions,enabled,created_at,updated_at`,
+        [definition.kind, definition.description, JSON.stringify(encryptJson(definition.config)), JSON.stringify(definition.permissions), existing.rows[0].id, request.user.workspaceId],
+      )).rows[0];
+      await audit(request.user.workspaceId, request.user.sub, 'tool.web_reconfigured', 'tool', updated.id, { provider: normalized.provider });
+      return updated;
+    }
+    const created = (await query(
+      `INSERT INTO tools(workspace_id,name,kind,description,config,permissions,enabled)
+       VALUES($1,$2,$3,$4,$5,$6,true)
+       RETURNING id,name,kind,description,permissions,enabled,created_at,updated_at`,
+      [request.user.workspaceId, definition.name, definition.kind, definition.description, JSON.stringify(encryptJson(definition.config)), JSON.stringify(definition.permissions)],
+    )).rows[0];
+    await audit(request.user.workspaceId, request.user.sub, 'tool.web_installed', 'tool', created.id, { provider: normalized.provider });
+    return reply.code(201).send(created);
+  }));
+  app.post('/demos/:slug/install', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
+    const params = parse(demoParams, request.params, reply); if (!params) return;
+    const demo = demoApiCatalog.find((entry) => entry.slug === params.slug);
+    if (!demo) return reply.code(404).send({ error: 'DEMO_API_NOT_FOUND' });
+    const existing = await query('SELECT id,name,kind,description,permissions,enabled,created_at,updated_at FROM tools WHERE workspace_id=$1 AND name=$2', [request.user.workspaceId, demo.name]);
+    if (existing.rowCount) return { ...existing.rows[0], alreadyInstalled: true };
+    const created = (await query(
+      `INSERT INTO tools(workspace_id,name,kind,description,config,permissions,enabled)
+       VALUES($1,$2,'api',$3,$4,$5,true)
+       RETURNING id,name,kind,description,permissions,enabled,created_at,updated_at`,
+      [request.user.workspaceId, demo.name, demo.description, JSON.stringify(encryptJson(demo.config)), JSON.stringify(demo.permissions)],
+    )).rows[0];
+    await audit(request.user.workspaceId, request.user.sub, 'tool.demo_installed', 'tool', created.id, { demo: demo.slug, provider: demo.provider });
+    return reply.code(201).send({ ...created, alreadyInstalled: false });
+  }));
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(inputSchema, request.body, reply); if (!input) return;
     const configError = toolConfigurationError(input.kind, input.config);

@@ -5,10 +5,11 @@ import unittest
 
 from docx import Document
 from openpyxl import load_workbook
+from PIL import Image
 from pypdf import PdfReader
 from pptx import Presentation
 
-from main import generate_docx, generate_pdf, generate_pptx, generate_xlsx, markdown_blocks
+from main import generate_docx, generate_pdf, generate_pptx, generate_xlsx, markdown_blocks, normalize_avatar
 
 
 SAMPLE = """# Quarterly Review
@@ -55,6 +56,14 @@ class ArtifactGenerationTests(unittest.TestCase):
         cell = workbook["Table 1"]["A2"]
         self.assertEqual(cell.data_type, "s")
         self.assertTrue(cell.value.startswith("'="))
+
+    def test_avatar_is_cropped_and_normalized_to_webp(self):
+        source = io.BytesIO()
+        Image.new("RGB", (900, 450), "#7c3aed").save(source, format="PNG")
+        normalized = normalize_avatar(source.getvalue())
+        with Image.open(io.BytesIO(normalized)) as image:
+            self.assertEqual(image.format, "WEBP")
+            self.assertEqual(image.size, (512, 512))
 
 
 if __name__ == "__main__":

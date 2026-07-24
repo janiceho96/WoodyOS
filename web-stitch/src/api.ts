@@ -23,11 +23,23 @@ const errorMessages: Record<string, string> = {
   AI_PROVIDER_MODEL_OR_REQUEST_REJECTED: 'The AI provider rejected this request or model. Check the configured model name and provider compatibility.',
   AI_PROVIDER_RATE_LIMITED: 'The AI provider rate limit has been reached. Wait briefly or use a provider/model with available capacity.',
   AI_PROVIDER_REQUEST_FAILED: 'Woody could not reach the AI provider. Check the base URL, network connection, and provider status.',
+  AI_PROVIDER_API_KEY_REQUIRED: 'Enter a new API key when switching AI providers.',
+  AI_PROVIDER_ENDPOINT_INVALID: 'Enter a valid AI provider base URL.',
+  AI_PROVIDER_ENDPOINT_HTTPS_REQUIRED: 'AI provider endpoints must use HTTPS.',
+  AI_PROVIDER_ENDPOINT_CREDENTIALS_FORBIDDEN: 'Do not place credentials inside the provider URL.',
+  AI_PROVIDER_ENDPOINT_BLOCKED: 'Private, local, and reserved provider endpoints are not allowed.',
+  AI_PROVIDER_REDIRECT_BLOCKED: 'The provider redirected outside its configured origin, so Woody blocked the request.',
+  AI_PROVIDER_CHANGED_DURING_RUN: 'The AI provider changed while this run was paused. Start a new run with the current provider.',
   PROMPT_COMPILER_INVALID_RESPONSE: 'The AI provider returned a response Woody could not safely turn into an agent proposal. Try again or use a stronger JSON-capable model.',
   WORKFLOW_QUEUE_UNAVAILABLE: 'The workflow queue is unavailable. Ensure the Woody worker and Redis are running, then try the test again.',
   WORKFLOW_PUBLISH_REQUIRED: 'Save this workflow as a draft, test it successfully, then publish it.',
   WORKFLOW_SUCCESSFUL_TEST_REQUIRED: 'The current draft must complete a successful test before it can be published.',
   WORKFLOW_NOT_PUBLISHED: 'This workflow is not published yet. Test and publish it before running it.',
+  AGENT_AVATAR_UPLOAD_REQUIRED: 'Save the agent first, then upload its picture.',
+  AGENT_AVATAR_FILE_REQUIRED: 'Choose a PNG, JPEG, or WebP image.',
+  AGENT_AVATAR_TYPE_UNSUPPORTED: 'Use a PNG, JPEG, or WebP image for the agent picture.',
+  AGENT_AVATAR_TOO_LARGE: 'Agent pictures must be no larger than 2 MB.',
+  AGENT_AVATAR_PROCESSING_FAILED: 'Woody could not safely process this picture. Try another PNG, JPEG, or WebP image.',
 };
 export const auth = {
   get: () => token,
@@ -61,8 +73,23 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.status === 204 ? (undefined as T) : (response.json() as Promise<T>);
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const response = await fetch(`${API_URL}${path}`, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const error = typeof body.error === 'string' ? body.error : `Request failed (${response.status})`;
+    throw new Error(errorMessages[error] ?? error);
+  }
+  return response.blob();
+}
+
 export type AgentModelConfig = { temperature: number; maxTokens: number; topP: number };
 export type AgentCapabilities = { webBrowser: boolean; codeInterpreter: boolean; knowledgeBase: boolean };
+export type AgentAvatarIcon = 'network' | 'search' | 'route' | 'code' | 'pen' | 'megaphone' | 'chart' | 'check' | 'brain' | 'zap' | 'users' | 'coins' | 'palette' | 'shield' | 'sparkles';
+export type AgentAvatarConfig =
+  | { type: 'icon'; value: AgentAvatarIcon; backgroundColor?: string; accentColor?: string; alt?: string }
+  | { type: 'initials'; value: string; backgroundColor?: string; accentColor?: string; alt?: string }
+  | { type: 'image'; value: 'uploaded'; alt?: string };
 export type Agent = {
   id: string;
   name: string;
@@ -76,15 +103,21 @@ export type Agent = {
   capabilities: AgentCapabilities;
   tool_ids: string[];
   memory_config: Record<string, boolean>;
+  avatar_config?: AgentAvatarConfig | Record<string, never>;
   created_at: string;
   updated_at: string;
 };
 export type Task = {
   id: string;
   agent_id: string;
+  workflow_run_id?: string | null;
   title: string;
   status: 'queued' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
   agent_name?: string;
+  agent_role?: string;
+  agent_avatar?: AgentAvatarConfig | Record<string, never>;
+  workflow_name?: string | null;
+  artifact_summary?: Array<Pick<Artifact, 'format' | 'status'>>;
   created_at: string;
   updated_at: string;
   started_at?: string | null;
@@ -102,6 +135,22 @@ export type TaskEvent = {
   message: string;
   created_at: string;
   payload?: Record<string, unknown>;
+};
+export type ActionAuthorization = {
+  id: string;
+  adapter: 'api' | 'mcp' | 'browser';
+  resource_id: string;
+  operation: string;
+  target_summary?: string | null;
+  risk_level: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
+  arguments_summary: Record<string, unknown>;
+  arguments_hash: string;
+  status: 'awaiting_confirmation' | 'approved' | 'executing' | 'rejected' | 'expired' | 'consumed' | 'failed';
+  requested_at: string;
+  expires_at: string;
+  resolved_at?: string | null;
+  consumed_at?: string | null;
+  error_message?: string | null;
 };
 export type ArtifactFormat = 'pdf' | 'docx' | 'pptx' | 'xlsx';
 export type PresentationTheme = {
@@ -126,10 +175,10 @@ export type Artifact = {
   created_at: string;
   completed_at?: string | null;
 };
-export type TaskDetail = Task & { input?: Record<string, unknown>; events: TaskEvent[]; artifacts: Artifact[] };
+export type TaskDetail = Task & { input?: Record<string, unknown>; events: TaskEvent[]; artifacts: Artifact[]; actionAuthorizations?: ActionAuthorization[] };
 export type WorkflowNode = {
   id: string;
-  type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output' | 'api_action' | 'mcp_action' | 'knowledge_search';
+  type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output' | 'api_action' | 'mcp_action' | 'knowledge_search' | 'browser';
   config: Record<string, unknown>;
 };
 export type WorkflowDefinition = {
@@ -161,14 +210,16 @@ export type WorkflowRun = {
   workflow_version_id?: string | null;
   test_target_node_id?: string | null;
   input: Record<string, unknown>;
+  definition_snapshot?: WorkflowDefinition;
   output?: unknown;
   created_at: string;
   completed_at?: string | null;
   events?: Array<{ id: string; node_id: string | null; event_type: string; message: string; payload?: Record<string, unknown>; created_at: string }>;
   approvals?: Array<{ id: string; node_id: string; status: 'pending' | 'approved' | 'rejected'; comment?: string | null; requested_at: string; resolved_at?: string | null }>;
   actionAuthorizations?: Array<{ id: string; node_id: string; iteration_key: string; attempt: number; adapter: 'api' | 'mcp' | 'browser'; resource_id: string; operation: string; target_summary?: string | null; risk_level: string; arguments_summary: Record<string, unknown>; arguments_hash: string; status: 'awaiting_confirmation' | 'approved' | 'executing' | 'rejected' | 'expired' | 'consumed' | 'failed'; requested_at: string; expires_at: string; resolved_at?: string | null; consumed_at?: string | null; error_message?: string | null }>;
-  nodeStates?: Array<{ id: string; node_id: string; iteration_key: string; attempt: number; status: string; output?: unknown; error?: unknown; started_at: string; completed_at?: string | null }>;
+  nodeStates?: Array<{ id: string; node_id: string; iteration_key: string; attempt: number; status: string; input?: unknown; output?: unknown; error?: unknown; started_at: string; completed_at?: string | null }>;
   artifacts?: Artifact[];
+  usage?: { agentTasks: number; inputTokens: number; outputTokens: number; estimatedCostUsd: number };
 };
 export type WorkflowNodeCatalogEntry = {
   type: WorkflowNode['type'];
@@ -176,7 +227,7 @@ export type WorkflowNodeCatalogEntry = {
   title: string;
   description: string;
   icon: string;
-  adapter: 'logic' | 'agent' | 'legacy_tool' | 'api' | 'mcp' | 'knowledge' | 'file';
+  adapter: 'logic' | 'agent' | 'legacy_tool' | 'api' | 'mcp' | 'knowledge' | 'file' | 'browser';
   risk: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
   available: boolean;
   availabilityReason?: string;
@@ -187,9 +238,9 @@ export type WorkflowNodeCatalogEntry = {
 };
 export type WorkflowResources = {
   version: number;
-  agents: Array<Pick<Agent, 'id' | 'name' | 'role' | 'status'>>;
+  agents: Array<Pick<Agent, 'id' | 'name' | 'role' | 'status' | 'avatar_config' | 'updated_at'>>;
   apiTools: Array<Pick<Tool, 'id' | 'name' | 'kind' | 'description' | 'permissions'>>;
-  mcpTools: Array<{ id: string; connectionId: string; connectionName: string; remoteName: string; title?: string | null; description: string; inputSchema: Record<string, unknown>; riskLevel: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown'; agentId: string; connectionPermission: 'read' | 'read_write'; toolPermission: 'read' | 'read_write' }>;
+  mcpTools: Array<{ id: string; connectionId: string; connectionName: string; remoteName: string; title?: string | null; description: string; inputSchema: Record<string, unknown>; riskLevel: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown'; agentId: string; connectionPermission: 'read' | 'read_write'; toolPermission: 'read' | 'read_write'; appId?: string | null; appTitle?: string | null; brandColor?: string | null }>;
   knowledge: { scope: 'workspace'; total: number; ready: number; processing: number; failed: number };
 };
 export type WorkflowEditorLayout = {
@@ -209,6 +260,13 @@ export type AgentSolutionAgent = {
   model?: string;
   modelConfig: AgentModelConfig;
   capabilities: AgentCapabilities;
+  toolRequirements?: Array<{
+    key: string;
+    label: string;
+    purpose: string;
+    permissions: string[];
+    required: boolean;
+  }>;
 };
 export type AgentSolution = {
   slug: string;
@@ -297,6 +355,35 @@ export type Tool = {
   created_at: string;
   updated_at?: string;
 };
+export type DemoApi = {
+  slug: string;
+  name: string;
+  description: string;
+  provider: string;
+  documentationUrl: string;
+  examplePrompt: string;
+  permissions: string[];
+  installed: boolean;
+};
+export type WebResearchCatalogItem = {
+  id: 'tavily' | 'brave' | 'firecrawl-search' | 'firecrawl-extract' | 'searxng' | 'page-reader' | 'reddit';
+  title: string;
+  category: string;
+  description: string;
+  credential: string | null;
+  recommended: boolean;
+  installed: boolean;
+};
+export type JobToolCatalogItem = {
+  id: 'adzuna';
+  title: string;
+  category: string;
+  description: string;
+  credential: string;
+  documentationUrl: string;
+  termsUrl: string;
+  installed: boolean;
+};
 export type Analytics = {
   agents: { active_agents: string };
   tasks: {
@@ -308,12 +395,47 @@ export type Analytics = {
   };
   usage: { token_input: string; token_output: string; api_cost_usd: string };
   satisfaction: { average_rating: string; ratings_count: string };
-  activity: Array<{ created_at: string; event_type: string; message: string; title: string; agent_name: string }>;
+  activity: Array<{ created_at: string; event_type: string; message: string; title: string; agent_id: string; agent_name: string; agent_role: string; agent_avatar?: AgentAvatarConfig | Record<string, never> }>;
+  range?: { days: number; start: string; end: string; timezone: 'UTC' } | null;
+  daily?: Array<{
+    day: string;
+    task_count: string;
+    completed_tasks: string;
+    failed_tasks: string;
+    token_input: string;
+    token_output: string;
+    api_cost_usd: string;
+  }>;
+  agent_effectiveness?: Array<{
+    agent_id: string;
+    agent_name: string;
+    agent_role: string;
+    agent_avatar?: AgentAvatarConfig | Record<string, never>;
+    agent_status: string;
+    total_tasks: string;
+    completed_tasks: string;
+    failed_tasks: string;
+    success_rate: string;
+    average_duration_ms: string | null;
+    token_input: string;
+    token_output: string;
+    api_cost_usd: string;
+  }>;
 };
 export type RuntimeConfig = {
   provider: 'anthropic' | 'openai-compatible' | 'unknown';
   defaultModel: string;
+  source: 'workspace' | 'environment' | 'unconfigured';
+  configured: boolean;
+  baseUrl: string | null;
+  apiKeyHint: string | null;
+  status: 'untested' | 'healthy' | 'error' | 'environment';
+  lastTestedAt: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  updatedAt: string | null;
 };
+export type RuntimeConfigTest = { ok: true; status: 'healthy'; provider: RuntimeConfig['provider']; model: string; checkedAt: string };
 export type WoodyChatMessage = { role: 'user' | 'assistant'; content: string };
 export type WoodyChatResponse = {
   message: string;
@@ -432,7 +554,7 @@ export type McpTool = {
   enabled: boolean;
   discovered_at: string;
 };
-export type McpAgentAccess = Pick<Agent, 'id' | 'name' | 'role' | 'status'> & {
+export type McpAgentAccess = Pick<Agent, 'id' | 'name' | 'role' | 'status' | 'avatar_config' | 'updated_at'> & {
   permission_level?: 'read' | 'read_write' | null;
   enabled?: boolean | null;
   tools: Array<{ toolId: string; permissionLevel: 'read' | 'read_write'; enabled: boolean }>;
@@ -451,7 +573,10 @@ export type McpToolCall = {
   remote_name: string;
   tool_title?: string | null;
   connection_name: string;
+  agent_id?: string | null;
   agent_name?: string | null;
+  agent_role?: string | null;
+  agent_avatar?: AgentAvatarConfig | Record<string, never> | null;
   task_title?: string | null;
   confirmation_status?: string | null;
   action_summary?: string | null;
@@ -470,8 +595,11 @@ export const api = {
     request<Onboarding>('/v1/auth/onboarding', { method: 'PUT', body: JSON.stringify(body) }),
   restartOnboarding: () => request<Onboarding>('/v1/auth/onboarding/restart', { method: 'POST' }),
 
-  analytics: () => request<Analytics>('/v1/analytics/overview'),
+  analytics: (days?: 1 | 7 | 30) => request<Analytics>(`/v1/analytics/overview${days ? `?days=${days}` : ''}`),
   runtimeConfig: () => request<RuntimeConfig>('/v1/runtime/config'),
+  updateRuntimeConfig: (body: { provider: 'anthropic' | 'openai-compatible'; defaultModel: string; baseUrl?: string | null; apiKey?: string }) =>
+    request<RuntimeConfig>('/v1/runtime/config', { method: 'PUT', body: JSON.stringify(body) }),
+  testRuntimeConfig: () => request<RuntimeConfigTest>('/v1/runtime/config/test', { method: 'POST' }),
   woodyChat: (messages: WoodyChatMessage[]) => request<WoodyChatResponse>('/v1/copilot/chat', {
     method: 'POST',
     body: JSON.stringify({ messages }),
@@ -492,12 +620,24 @@ export const api = {
     request<Agent>('/v1/agents', { method: 'POST', body: JSON.stringify(body) }),
   updateAgent: (id: string, body: Record<string, unknown>) =>
     request<Agent>(`/v1/agents/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  uploadAgentAvatar: (id: string, file: File) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<Agent>(`/v1/agents/${id}/avatar/image`, { method: 'POST', body: form });
+  },
+  agentAvatarImage: (id: string) => requestBlob(`/v1/agents/${id}/avatar/image`),
+  resetAgentAvatar: (id: string) => request<void>(`/v1/agents/${id}/avatar`, { method: 'DELETE' }),
 
   tasks: () => request<{ data: Task[] }>('/v1/tasks'),
   task: (id: string) => request<TaskDetail>(`/v1/tasks/${id}`),
   createTask: (body: { agentId: string; title: string; input: Record<string, unknown>; artifactFormats?: ArtifactFormat[] }) =>
     request<Task>('/v1/tasks', { method: 'POST', body: JSON.stringify(body) }),
   cancelTask: (id: string) => request<Task>(`/v1/tasks/${id}/cancel`, { method: 'POST' }),
+  decideActionAuthorization: (id: string, decision: 'approved' | 'rejected', comment = '') =>
+    request<{ id: string; taskId: string; decision: string }>(`/v1/action-authorizations/${id}/decision`, {
+      method: 'POST',
+      body: JSON.stringify({ decision, comment }),
+    }),
   taskFeedback: (id: string, body: { rating: number; comment?: string }) =>
     request(`/v1/tasks/${id}/feedback`, { method: 'PUT', body: JSON.stringify(body) }),
   requestArtifacts: (body: { taskId?: string; workflowRunId?: string; formats: ArtifactFormat[] }) =>
@@ -542,10 +682,10 @@ export const api = {
 
   starterSolutions: () => request<{ data: AgentSolution[] }>('/v1/starter-solutions'),
   starterSolution: (slug: string) => request<AgentSolution>(`/v1/starter-solutions/${slug}`),
-  installStarterSolution: (slug: string, allowDuplicate = false) =>
+  installStarterSolution: (slug: string, allowDuplicate = false, toolIdsByAgentKey: Record<string, string[]> = {}) =>
     request<{ id: string; status: 'draft'; solution: AgentSolution; resources: AgentSolutionInstallation['resources'] }>(`/v1/starter-solutions/${slug}/install`, {
       method: 'POST',
-      body: JSON.stringify({ allowDuplicate }),
+      body: JSON.stringify({ allowDuplicate, toolIdsByAgentKey }),
     }),
   compileAgentSolution: (body: {
     prompt: string;
@@ -592,6 +732,12 @@ export const api = {
   deleteDocument: (id: string) => request<void>(`/v1/knowledge/documents/${id}`, { method: 'DELETE' }),
 
   tools: () => request<{ data: Tool[] }>('/v1/tools'),
+  demoApis: () => request<{ data: DemoApi[] }>('/v1/tools/demos'),
+  installDemoApi: (slug: string) => request<Tool & { alreadyInstalled: boolean }>(`/v1/tools/demos/${encodeURIComponent(slug)}/install`, { method: 'POST' }),
+  webResearchCatalog: () => request<{ data: WebResearchCatalogItem[] }>('/v1/tools/web/catalog'),
+  installWebResearchTool: (body: Record<string, unknown>) => request<Tool>('/v1/tools/web/install', { method: 'POST', body: JSON.stringify(body) }),
+  jobToolCatalog: () => request<{ data: JobToolCatalogItem[] }>('/v1/tools/jobs/catalog'),
+  installJobTool: (body: Record<string, unknown>) => request<Tool>('/v1/tools/jobs/install', { method: 'POST', body: JSON.stringify(body) }),
   createTool: (body: Record<string, unknown>) =>
     request<Tool>('/v1/tools', { method: 'POST', body: JSON.stringify(body) }),
   updateTool: (id: string, body: Record<string, unknown>) =>

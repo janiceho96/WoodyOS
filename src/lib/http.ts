@@ -16,7 +16,10 @@ export function asyncRoute<T extends FastifyRequest>(handler: (request: T, reply
       const statusCode = typeof (error as { statusCode?: unknown })?.statusCode === 'number'
         ? (error as { statusCode: number }).statusCode
         : 500;
-      return reply.code(statusCode).send({ error: statusCode === 500 ? 'INTERNAL_ERROR' : (error instanceof Error ? error.message : 'REQUEST_FAILED') });
+      return reply.code(statusCode).send({
+        error: statusCode === 500 ? 'INTERNAL_ERROR' : (error instanceof Error ? error.message : 'REQUEST_FAILED'),
+        ...(process.env.NODE_ENV === 'test' && statusCode >= 500 ? { detail: error instanceof Error ? error.message : String(error) } : {}),
+      });
     }
   };
 }

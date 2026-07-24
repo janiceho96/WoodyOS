@@ -10,10 +10,11 @@ import { workflowActionNeedsConfirmation } from '../src/policy/action-gateway.js
 describe('workflow definition validation', () => {
   it('publishes a sanitized registry backed by installed adapters', () => {
     const catalog = publicWorkflowNodeCatalog();
-    expect(catalog.map((entry) => entry.type)).toEqual(expect.arrayContaining(['trigger', 'agent', 'action', 'api_action', 'mcp_action', 'knowledge_search']));
+    expect(catalog.map((entry) => entry.type)).toEqual(expect.arrayContaining(['trigger', 'agent', 'action', 'api_action', 'mcp_action', 'knowledge_search', 'browser']));
     expect(catalog.find((entry) => entry.type === 'agent')).toMatchObject({ available: true, adapter: 'agent', risk: 'unknown' });
     expect(catalog.find((entry) => entry.type === 'mcp_action')).toMatchObject({ available: true, adapter: 'mcp', retryable: false });
     expect(catalog.find((entry) => entry.type === 'knowledge_search')).toMatchObject({ available: true, adapter: 'knowledge' });
+    expect(catalog.find((entry) => entry.type === 'browser')).toMatchObject({ available: false, adapter: 'browser', risk: 'unknown', availabilityReason: expect.stringContaining('isolated') });
     expect(catalog.every((entry) => !('configSchema' in entry))).toBe(true);
   });
 
@@ -146,6 +147,27 @@ describe('workflow definition validation', () => {
     expect(evaluateCondition({ path: 'input.approved', operator: 'equals', value: true }, state)).toBe(true);
     expect(evaluateCondition({ path: 'input.score', operator: 'greater_than', value: 10 }, state)).toBe(true);
     expect(evaluateCondition({ path: 'input.tags', operator: 'contains', value: 'safe' }, state)).toBe(true);
+  });
+
+  it('rejects unsafe, missing, and downstream data references', () => {
+    const base = {
+      nodes: [
+        { id: 'start', type: 'trigger' as const, config: {} },
+        { id: 'fetch', type: 'api_action' as const, config: { toolId: '00000000-0000-4000-8000-000000000001', input: { query: '{{ input.topic }}' } } },
+        { id: 'send', type: 'mcp_action' as const, config: { agentId: '00000000-0000-4000-8000-000000000002', mcpToolId: '00000000-0000-4000-8000-000000000003', input: { data: '{{ nodes.fetch }}' } } },
+        { id: 'finish', type: 'output' as const, config: {} },
+      ],
+      edges: [{ source: 'start', target: 'fetch' }, { source: 'fetch', target: 'send' }, { source: 'send', target: 'finish' }],
+    };
+    expect(workflowDefinitionErrors(base)).toEqual([]);
+    expect(workflowDefinitionErrors({
+      ...base,
+      nodes: base.nodes.map((node) => node.id === 'fetch' ? { ...node, config: { ...node.config, input: { query: '{{ nodes.send.text }}', expression: '{{ input.topic + 1 }}', missing: '{{ nodes.unknown }}' } } } : node),
+    })).toEqual(expect.arrayContaining([
+      'Node fetch can reference only upstream node outputs (send is not upstream)',
+      'Node fetch data reference input.topic + 1 is not a safe input, variables, or nodes path',
+      'Node fetch data reference points to missing node unknown',
+    ]));
   });
 
   it('executes for-each and while loop decisions within hard bounds', () => {

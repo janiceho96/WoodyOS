@@ -6,9 +6,9 @@ import { Redis } from 'ioredis';
 import { lookup } from 'node:dns/promises';
 import { query } from './db/client.js';
 import { ARTIFACT_QUEUE, TASK_QUEUE, WORKFLOW_QUEUE, KNOWLEDGE_QUEUE, enqueueWorkflowRun } from './queue/task-queue.js';
-import { definitionFor, invokeTool, type ToolRecord } from './tools/runtime.js';
+import { definitionFor, invokeTool, toolRiskLevel, type ToolRecord } from './tools/runtime.js';
 import { embeddingFor } from './lib/embeddings.js';
-import { configuredAiProvider } from './lib/ai-provider.js';
+import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from './lib/ai-provider.js';
 import { assertWorkspaceAiBudgetAvailable, estimatedWorkspaceAiCost, recordAiUsage } from './lib/ai-usage.js';
 import { isPublicIp } from './lib/network.js';
 import { resolveAgentRuntimePolicy, retrieveAgentKnowledge } from './lib/agent-runtime.js';
@@ -16,27 +16,19 @@ import {
   anthropicMcpDefinition,
   authorizedMcpTools,
   executeAuthorizedMcpTool,
-  mcpRequiresConfirmation,
   mcpToolRuntimeName,
+  assertMcpPermission,
   openAiMcpDefinition,
-  safeArgumentsSummary,
   type AuthorizedMcpTool,
 } from './mcp/runtime.js';
-import { loadMcpCheckpoint, pauseForMcpConfirmation, type McpCheckpointState } from './mcp/checkpoints.js';
+import { loadTaskActionCheckpoint, pauseForActionConfirmation, type TaskActionCheckpointState } from './mcp/checkpoints.js';
 import { startMcpMaintenance } from './mcp/maintenance.js';
 import { generateArtifact, releaseTaskArtifacts } from './artifacts/service.js';
 import { executeWorkflowStep } from './workflows/runtime.js';
+import { authorizeAction, beginAction, completeAction, failAction } from './policy/action-gateway.js';
+import { limitedActionResult, safeActionSummary } from './lib/action-safety.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
-const aiProvider = configuredAiProvider();
-const provider = aiProvider.provider;
-const anthropic = aiProvider.anthropic;
-const openAiCompatible = aiProvider.openAiCompatible;
-
-if (!anthropic && !openAiCompatible && process.env.NODE_ENV === 'production') {
-  throw new Error('Configure ANTHROPIC_API_KEY or LLM_PROVIDER=openai-compatible with LLM_API_KEY and LLM_BASE_URL before starting the production worker');
-}
-
 type Agent = {
   name: string;
   role: string;
@@ -101,6 +93,61 @@ async function workflowEvent(workspaceId: string, runId: string, nodeId: string 
   await query('INSERT INTO workflow_run_events(workspace_id,workflow_run_id,node_id,event_type,message,payload) VALUES($1,$2,$3,$4,$5,$6)', [workspaceId, runId, nodeId, type, message, JSON.stringify(payload)]);
 }
 
+type TaskToolAction =
+  | { adapter: 'api'; tool: ToolRecord }
+  | { adapter: 'mcp'; tool: AuthorizedMcpTool };
+
+function actionName(action: TaskToolAction) {
+  return action.adapter === 'api' ? action.tool.name : action.tool.title ?? action.tool.remote_name;
+}
+
+async function authorizeTaskToolAction(task: Task, providerCallId: string, action: TaskToolAction, arguments_: Record<string, unknown>) {
+  if (action.adapter === 'mcp') assertMcpPermission(action.tool);
+  return authorizeAction({
+    workspaceId: task.workspace_id,
+    subject: { type: 'task', taskId: task.id, agentId: task.agent_id },
+    actionKey: providerCallId,
+    adapter: action.adapter,
+    resourceId: action.tool.id,
+    operation: action.adapter === 'api' ? action.tool.name : action.tool.remote_name,
+    riskLevel: action.adapter === 'api' ? toolRiskLevel(action.tool) : action.tool.risk_level,
+    arguments: arguments_,
+    requestedBy: task.requested_by,
+    targetSummary: action.adapter === 'api' ? action.tool.name : `${actionName(action)} via ${action.tool.connection_name}`,
+  });
+}
+
+async function executeTaskToolAction(input: {
+  task: Task;
+  action: TaskToolAction;
+  arguments_: Record<string, unknown>;
+  authorizationId: string;
+  mcpToolCallId?: string | null;
+}) {
+  if (!(await beginAction(input.authorizationId))) throw new Error('External action execution could not be claimed safely');
+  try {
+    if (input.action.adapter === 'mcp') {
+      const executed = await executeAuthorizedMcpTool({
+        tool: input.action.tool,
+        arguments_: input.arguments_,
+        agentId: input.task.agent_id,
+        taskId: input.task.id,
+        workflowRunId: input.task.workflow_run_id,
+        actionAuthorizationId: input.authorizationId,
+        toolCallId: input.mcpToolCallId ?? undefined,
+      });
+      await completeAction(input.authorizationId, executed.result);
+      return { result: executed.result, toolCallId: executed.callId };
+    }
+    const result = limitedActionResult(await invokeTool(input.action.tool, input.arguments_));
+    await completeAction(input.authorizationId, result);
+    return { result, toolCallId: null };
+  } catch (error) {
+    await failAction(input.authorizationId, error);
+    throw error;
+  }
+}
+
 export async function executeAgentTask(taskId: string) {
   const task = (await query<Task>(
     `UPDATE tasks SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
@@ -110,11 +157,13 @@ export async function executeAgentTask(taskId: string) {
   if (!task) return null;
   const agent = (await query<Agent>('SELECT name,role,goal,instructions,model,model_config,capabilities,memory_config,tool_ids FROM agents WHERE id=$1', [task.agent_id])).rows[0];
   if (!agent) throw new Error('Agent is missing');
-  const checkpoint = await loadMcpCheckpoint(task.workspace_id, task.id);
-  await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after MCP confirmation` : `${agent.name} started execution`);
+  const checkpoint = await loadTaskActionCheckpoint(task.workspace_id, task.id);
+  await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`);
   try {
     await assertWorkspaceAiBudgetAvailable(task.workspace_id);
-    if (!anthropic && !openAiCompatible) throw Object.assign(new Error('No configured LLM provider is available'), { code: 'AI_NOT_CONFIGURED' });
+    const runtime = assertConfiguredAiProvider(await configuredAiProviderForWorkspace(task.workspace_id));
+    const { provider, anthropic, openAiCompatible } = runtime;
+    if (checkpoint && checkpoint.state.provider !== provider) throw Object.assign(new Error('The workspace AI provider changed while this task was waiting for confirmation. Start a new run so Woody can build a compatible request.'), { code: 'AI_PROVIDER_CHANGED_DURING_RUN' });
     await taskEvent(task.workspace_id, task.id, 'model.requested', `Sending task to ${agent.model}`);
     const toolIds = Array.isArray(agent.tool_ids) ? agent.tool_ids.filter((id): id is string => typeof id === 'string') : [];
     const assignedTools = toolIds.length ? (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE workspace_id=$1 AND enabled=true AND id = ANY($2::uuid[])', [task.workspace_id, toolIds])).rows : [];
@@ -127,6 +176,7 @@ export async function executeAgentTask(taskId: string) {
       });
     }
     const toolByName = new Map(configuredTools.map((tool) => [`tool_${tool.id.replaceAll('-', '_')}`, tool]));
+    const toolById = new Map(configuredTools.map((tool) => [tool.id, tool]));
     const mcpToolByName = new Map(configuredMcpTools.map((tool) => [mcpToolRuntimeName(tool.id), tool]));
     const mcpToolById = new Map(configuredMcpTools.map((tool) => [tool.id, tool]));
     const started = Date.now();
@@ -156,25 +206,23 @@ export async function executeAgentTask(taskId: string) {
       let firstTurn = checkpoint?.state.provider === 'anthropic' ? checkpoint.state.nextTurn : 0;
       if (checkpoint?.state.provider === 'anthropic') {
         const pending = checkpoint.state.pending;
-        const tool = mcpToolById.get(pending.toolId);
+        const adapter = pending.adapter ?? 'mcp';
+        const action: TaskToolAction | null = adapter === 'api'
+          ? (toolById.get(pending.toolId) ? { adapter: 'api', tool: toolById.get(pending.toolId)! } : null)
+          : (mcpToolById.get(pending.toolId) ? { adapter: 'mcp', tool: mcpToolById.get(pending.toolId)! } : null);
         let content: string;
         let isError = false;
         if (checkpoint.status === 'rejected') {
           content = 'The user rejected this external action. Do not retry it unless the user explicitly requests a new action.';
           isError = true;
-        } else if (!tool) {
-          content = 'MCP access was revoked before the approved action executed.';
+        } else if (!action) {
+          content = 'Tool access was revoked before the approved action executed.';
           isError = true;
-          await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
+          if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
         } else {
-          const executed = await executeAuthorizedMcpTool({
-            tool,
-            arguments_: pending.arguments,
-            agentId: task.agent_id,
-            taskId: task.id,
-            workflowRunId: task.workflow_run_id,
-            toolCallId: checkpoint.callId,
-          });
+          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments);
+          if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
+          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId });
           content = JSON.stringify(executed.result).slice(0, 50_000);
         }
         messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: pending.providerCallId, content, is_error: isError }] });
@@ -218,52 +266,48 @@ export async function executeAgentTask(taskId: string) {
             continue;
           }
           toolCallCount++;
-          if (mcpTool) {
-            const arguments_ = use.input as Record<string, unknown>;
-            await taskEvent(task.workspace_id, task.id, 'mcp.tool.requested', `Requesting ${mcpTool.title ?? mcpTool.remote_name}`, { toolId: mcpTool.id, input: safeArgumentsSummary(arguments_) });
-            if (mcpRequiresConfirmation(mcpTool)) {
-              const state: McpCheckpointState = {
-                provider: 'anthropic',
-                system,
-                messages,
-                finalText,
-                inputTokens,
-                outputTokens,
-                toolCallCount,
-                nextTurn: turn + 1,
-                pending: { toolId: mcpTool.id, providerCallId: use.id, arguments: arguments_ },
+          const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
+          const arguments_ = use.input as Record<string, unknown>;
+          try {
+            const authorization = await authorizeTaskToolAction(task, use.id, action, arguments_);
+            await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
+              authorizationId: authorization.authorizationId,
+              adapter: action.adapter,
+              toolId: action.tool.id,
+              input: safeActionSummary(arguments_),
+            });
+            if (authorization.status === 'awaiting_confirmation') {
+              const state: TaskActionCheckpointState = {
+                provider: 'anthropic', system, messages, finalText, inputTokens, outputTokens, toolCallCount, nextTurn: turn + 1,
+                pending: { adapter: action.adapter, toolId: action.tool.id, providerCallId: use.id, arguments: arguments_, authorizationId: authorization.authorizationId },
               };
-              const callId = await pauseForMcpConfirmation({
+              const paused = await pauseForActionConfirmation({
                 workspaceId: task.workspace_id,
                 taskId: task.id,
                 workflowRunId: task.workflow_run_id,
                 agentId: task.agent_id,
                 requestedBy: task.requested_by,
-                tool: mcpTool,
+                authorizationId: authorization.authorizationId,
                 state,
+                mcpTool: action.adapter === 'mcp' ? action.tool : undefined,
               });
-              await taskEvent(task.workspace_id, task.id, 'mcp.confirmation.requested', 'Human confirmation is required before this external action', { toolCallId: callId, toolId: mcpTool.id, riskLevel: mcpTool.risk_level });
-              return { awaitingApproval: true, toolCallId: callId };
+              await taskEvent(task.workspace_id, task.id, 'action.confirmation.requested', 'Human confirmation is required before this action', {
+                authorizationId: authorization.authorizationId,
+                toolCallId: paused.toolCallId,
+                toolId: action.tool.id,
+                riskLevel: action.adapter === 'api' ? toolRiskLevel(action.tool) : action.tool.risk_level,
+              });
+              return { awaitingApproval: true, authorizationId: authorization.authorizationId };
             }
-            try {
-              const executed = await executeAuthorizedMcpTool({ tool: mcpTool, arguments_, agentId: task.agent_id, taskId: task.id, workflowRunId: task.workflow_run_id });
-              results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
-              await taskEvent(task.workspace_id, task.id, 'mcp.tool.completed', `${mcpTool.title ?? mcpTool.remote_name} completed`, { toolCallId: executed.callId, toolId: mcpTool.id });
-            } catch (error) {
-              const message = error instanceof Error ? error.message : 'MCP tool invocation failed';
-              results.push({ type: 'tool_result', tool_use_id: use.id, is_error: true, content: message });
-              await taskEvent(task.workspace_id, task.id, 'mcp.tool.failed', message, { toolId: mcpTool.id });
-            }
-            continue;
-          }
-          await taskEvent(task.workspace_id, task.id, 'tool.called', `Calling ${tool!.name}`, { toolId: tool!.id, input: use.input });
-          try {
-            const result = await invokeTool(tool!, use.input as Record<string, unknown>);
-            await taskEvent(task.workspace_id, task.id, 'tool.completed', `${tool!.name} completed`, { toolId: tool!.id });
-            results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(result).slice(0, 50_000) });
+            if (authorization.status === 'denied') throw new Error(authorization.reason);
+            const executed = authorization.status === 'completed'
+              ? { result: authorization.result, toolCallId: null }
+              : await executeTaskToolAction({ task, action, arguments_, authorizationId: authorization.authorizationId });
+            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id });
+            results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
-            const message = error instanceof Error ? error.message : 'Tool invocation failed';
-            await taskEvent(task.workspace_id, task.id, 'tool.failed', `${tool!.name} failed`, { toolId: tool!.id, error: message });
+            const message = error instanceof Error ? error.message : 'Action failed';
+            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, { adapter: action.adapter, toolId: action.tool.id, error: message });
             results.push({ type: 'tool_result', tool_use_id: use.id, is_error: true, content: message });
           }
         }
@@ -277,15 +321,20 @@ export async function executeAgentTask(taskId: string) {
       let firstTurn = checkpoint?.state.provider === 'openai-compatible' ? checkpoint.state.nextTurn : 0;
       if (checkpoint?.state.provider === 'openai-compatible') {
         const pending = checkpoint.state.pending;
-        const tool = mcpToolById.get(pending.toolId);
+        const adapter = pending.adapter ?? 'mcp';
+        const action: TaskToolAction | null = adapter === 'api'
+          ? (toolById.get(pending.toolId) ? { adapter: 'api', tool: toolById.get(pending.toolId)! } : null)
+          : (mcpToolById.get(pending.toolId) ? { adapter: 'mcp', tool: mcpToolById.get(pending.toolId)! } : null);
         let content: string;
         if (checkpoint.status === 'rejected') {
           content = 'The user rejected this external action. Do not retry it unless the user explicitly requests a new action.';
-        } else if (!tool) {
-          content = 'MCP access was revoked before the approved action executed.';
-          await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
+        } else if (!action) {
+          content = 'Tool access was revoked before the approved action executed.';
+          if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
         } else {
-          const executed = await executeAuthorizedMcpTool({ tool, arguments_: pending.arguments, agentId: task.agent_id, taskId: task.id, workflowRunId: task.workflow_run_id, toolCallId: checkpoint.callId });
+          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments);
+          if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
+          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId });
           content = JSON.stringify(executed.result).slice(0, 50_000);
         }
         messages.push({ role: 'tool', tool_call_id: pending.providerCallId, content });
@@ -339,43 +388,47 @@ export async function executeAgentTask(taskId: string) {
             continue;
           }
           toolCallCount++;
-          if (mcpTool) {
-            await taskEvent(task.workspace_id, task.id, 'mcp.tool.requested', `Requesting ${mcpTool.title ?? mcpTool.remote_name}`, { toolId: mcpTool.id, input: safeArgumentsSummary(input) });
-            if (mcpRequiresConfirmation(mcpTool)) {
-              const state: McpCheckpointState = {
-                provider: 'openai-compatible',
-                system,
-                messages,
-                finalText,
-                inputTokens,
-                outputTokens,
-                toolCallCount,
-                nextTurn: turn + 1,
-                pending: { toolId: mcpTool.id, providerCallId: use.id, arguments: input },
-              };
-              const callId = await pauseForMcpConfirmation({ workspaceId: task.workspace_id, taskId: task.id, workflowRunId: task.workflow_run_id, agentId: task.agent_id, requestedBy: task.requested_by, tool: mcpTool, state });
-              await taskEvent(task.workspace_id, task.id, 'mcp.confirmation.requested', 'Human confirmation is required before this external action', { toolCallId: callId, toolId: mcpTool.id, riskLevel: mcpTool.risk_level });
-              return { awaitingApproval: true, toolCallId: callId };
-            }
-            try {
-              const executed = await executeAuthorizedMcpTool({ tool: mcpTool, arguments_: input, agentId: task.agent_id, taskId: task.id, workflowRunId: task.workflow_run_id });
-              results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
-              await taskEvent(task.workspace_id, task.id, 'mcp.tool.completed', `${mcpTool.title ?? mcpTool.remote_name} completed`, { toolCallId: executed.callId, toolId: mcpTool.id });
-            } catch (error) {
-              const detail = error instanceof Error ? error.message : 'MCP tool invocation failed';
-              results.push({ role: 'tool', tool_call_id: use.id, content: detail });
-              await taskEvent(task.workspace_id, task.id, 'mcp.tool.failed', detail, { toolId: mcpTool.id });
-            }
-            continue;
-          }
-          await taskEvent(task.workspace_id, task.id, 'tool.called', `Calling ${tool!.name}`, { toolId: tool!.id, input });
+          const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
           try {
-            const result = await invokeTool(tool!, input);
-            await taskEvent(task.workspace_id, task.id, 'tool.completed', `${tool!.name} completed`, { toolId: tool!.id });
-            results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(result).slice(0, 50_000) });
+            const authorization = await authorizeTaskToolAction(task, use.id, action, input);
+            await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
+              authorizationId: authorization.authorizationId,
+              adapter: action.adapter,
+              toolId: action.tool.id,
+              input: safeActionSummary(input),
+            });
+            if (authorization.status === 'awaiting_confirmation') {
+              const state: TaskActionCheckpointState = {
+                provider: 'openai-compatible', system, messages, finalText, inputTokens, outputTokens, toolCallCount, nextTurn: turn + 1,
+                pending: { adapter: action.adapter, toolId: action.tool.id, providerCallId: use.id, arguments: input, authorizationId: authorization.authorizationId },
+              };
+              const paused = await pauseForActionConfirmation({
+                workspaceId: task.workspace_id,
+                taskId: task.id,
+                workflowRunId: task.workflow_run_id,
+                agentId: task.agent_id,
+                requestedBy: task.requested_by,
+                authorizationId: authorization.authorizationId,
+                state,
+                mcpTool: action.adapter === 'mcp' ? action.tool : undefined,
+              });
+              await taskEvent(task.workspace_id, task.id, 'action.confirmation.requested', 'Human confirmation is required before this action', {
+                authorizationId: authorization.authorizationId,
+                toolCallId: paused.toolCallId,
+                toolId: action.tool.id,
+                riskLevel: action.adapter === 'api' ? toolRiskLevel(action.tool) : action.tool.risk_level,
+              });
+              return { awaitingApproval: true, authorizationId: authorization.authorizationId };
+            }
+            if (authorization.status === 'denied') throw new Error(authorization.reason);
+            const executed = authorization.status === 'completed'
+              ? { result: authorization.result, toolCallId: null }
+              : await executeTaskToolAction({ task, action, arguments_: input, authorizationId: authorization.authorizationId });
+            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id });
+            results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
-            const detail = error instanceof Error ? error.message : 'Tool invocation failed';
-            await taskEvent(task.workspace_id, task.id, 'tool.failed', `${tool!.name} failed`, { toolId: tool!.id, error: detail });
+            const detail = error instanceof Error ? error.message : 'Action failed';
+            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, { adapter: action.adapter, toolId: action.tool.id, error: detail });
             results.push({ role: 'tool', tool_call_id: use.id, content: detail });
           }
         }

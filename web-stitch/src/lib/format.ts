@@ -24,7 +24,7 @@ export function taskCost(records: CostRecord[], digits = 4) {
   return {
     amount,
     available,
-    label: available ? `$${amount.toFixed(digits)}` : 'Unavailable',
+    label: available ? `$${amount.toFixed(digits)}` : 'Pricing unavailable',
   };
 }
 

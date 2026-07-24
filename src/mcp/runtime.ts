@@ -83,9 +83,7 @@ export function openAiMcpDefinition(tool: AuthorizedMcpTool): ChatCompletionTool
 }
 
 export function mcpRequiresConfirmation(tool: AuthorizedMcpTool) {
-  return tool.risk_level === 'destructive'
-    || tool.risk_level === 'external_write'
-    || tool.risk_level === 'unknown';
+  return tool.risk_level !== 'read';
 }
 
 export function assertMcpPermission(tool: AuthorizedMcpTool) {
@@ -111,7 +109,7 @@ export async function executeAuthorizedMcpTool(input: {
   workflowNodeId?: string | null;
   workflowIterationKey?: string | null;
   workflowAttempt?: number | null;
-  workflowActionAuthorizationId?: string | null;
+  actionAuthorizationId?: string | null;
   toolCallId?: string;
 }) {
   assertMcpPermission(input.tool);
@@ -120,7 +118,7 @@ export async function executeAuthorizedMcpTool(input: {
     callId = (await query<{ id: string }>(
       `INSERT INTO mcp_tool_calls(
          workspace_id,connection_id,mcp_tool_id,agent_id,task_id,workflow_run_id,
-         workflow_node_id,workflow_iteration_key,workflow_attempt,workflow_action_authorization_id,
+         workflow_node_id,workflow_iteration_key,workflow_attempt,action_authorization_id,
          status,risk_level,arguments_summary,arguments_hash,started_at
        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',$11,$12,$13,now()) RETURNING id`,
       [
@@ -133,7 +131,7 @@ export async function executeAuthorizedMcpTool(input: {
         input.workflowNodeId ?? null,
         input.workflowIterationKey ?? null,
         input.workflowAttempt ?? null,
-        input.workflowActionAuthorizationId ?? null,
+        input.actionAuthorizationId ?? null,
         input.tool.risk_level,
         JSON.stringify(safeArgumentsSummary(input.arguments_)),
         argumentHash(input.arguments_),

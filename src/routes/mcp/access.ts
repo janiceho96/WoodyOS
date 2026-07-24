@@ -21,7 +21,7 @@ export async function mcpAccessRoutes(app: FastifyInstance) {
     );
     if (!connection.rowCount) return reply.code(404).send({ error: 'MCP_CONNECTION_NOT_FOUND' });
     const result = await query(
-      `SELECT a.id,a.name,a.role,a.status,access.permission_level,access.enabled,
+      `SELECT a.id,a.name,a.role,a.status,a.avatar_config,a.updated_at,access.permission_level,access.enabled,
        COALESCE(jsonb_agg(
          jsonb_build_object('toolId',tool_access.mcp_tool_id,'permissionLevel',tool_access.permission_level,'enabled',tool_access.enabled)
        ) FILTER (WHERE tool_access.mcp_tool_id IS NOT NULL),'[]'::jsonb) tools

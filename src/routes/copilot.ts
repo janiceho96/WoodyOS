@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { query } from '../db/client.js';
-import { assertConfiguredAiProvider, configuredAiProvider } from '../lib/ai-provider.js';
+import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from '../lib/ai-provider.js';
 import { assertWorkspaceAiBudgetAvailable, recordAiUsage } from '../lib/ai-usage.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { containsLikelySecret } from '../solutions/compiler.js';
@@ -91,7 +91,7 @@ export async function copilotRoutes(app: FastifyInstance) {
     await assertWorkspaceAiBudgetAvailable(request.user.workspaceId);
     const [summary, runtime] = await Promise.all([
       workspaceSummary(request.user.workspaceId),
-      Promise.resolve(assertConfiguredAiProvider(configuredAiProvider())),
+      configuredAiProviderForWorkspace(request.user.workspaceId).then(assertConfiguredAiProvider),
     ]);
     if (!summary) return reply.code(404).send({ error: 'WORKSPACE_NOT_FOUND' });
 

@@ -1,11 +1,13 @@
 import type { Connection } from '@xyflow/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Blocks, Bot, BrainCircuit, CheckCircle2, Download, Edit3, FileOutput, GitBranch, LoaderCircle, Play, Plus, RefreshCw, Rocket, Save, Search, ShieldCheck, TestTube2, Trash2, Wrench, X } from 'lucide-react';
+import { AlertTriangle, Blocks, Bot, BrainCircuit, CheckCircle2, Download, Edit3, Eye, FileOutput, GitBranch, Globe2, LoaderCircle, LockKeyhole, Play, Plus, RefreshCw, Rocket, Save, Search, ShieldCheck, TestTube2, Trash2, Wrench, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, type Artifact, type Workflow, type WorkflowDefinition, type WorkflowEditorLayout, type WorkflowNode, type WorkflowNodeCatalogEntry, type WorkflowResources } from '../../api';
 import { useWorkspace } from '../../app/workspace';
+import { OutputViewer } from '../../components/OutputViewer';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
-import { relative } from '../../lib/format';
+import { compact, duration, money, relative } from '../../lib/format';
+import { failureGuidance } from '../../lib/recovery';
 import { WorkflowCanvas } from './WorkflowCanvas';
 import { autoLayoutPositions } from './workflowLayout';
 
@@ -66,6 +68,7 @@ export function WorkflowsPage() {
   const [selectedNodeId, setSelectedNodeId] = useState('trigger-1');
   const [paletteSearch, setPaletteSearch] = useState('');
   const [simpleMode, setSimpleMode] = useState(true);
+  const [inspectorOpen, setInspectorOpen] = useState(() => typeof window === 'undefined' || window.innerWidth > 820);
   const [past, setPast] = useState<GraphSnapshot[]>([]);
   const [future, setFuture] = useState<GraphSnapshot[]>([]);
   const [canvasRevision, setCanvasRevision] = useState(0);
@@ -179,6 +182,7 @@ export function WorkflowsPage() {
     const nextPositions = [...positions, { nodeId: node.id, x: position?.x ?? 330, y: position?.y ?? 280 }];
     commit({ nodes: nextNodes, edges: nextEdges, positions: nextPositions });
     setSelectedNodeId(node.id);
+    setInspectorOpen(true);
   };
   const removeNodes = (ids: string[]) => {
     const removable = new Set(ids.filter((id) => !['trigger', 'output'].includes(nodes.find((node) => node.id === id)?.type ?? '')));
@@ -216,7 +220,7 @@ export function WorkflowsPage() {
     setLoadingWorkflowId(workflow.id);
     try {
       const layout = await api.workflowLayout(workflow.id);
-      setEditingId(workflow.id); setSavedWorkflow(workflow); setName(workflow.name); setDescription(workflow.description); setNodes(workflow.definition.nodes); setEdges(workflow.definition.edges); setPositions(layout.positions.length ? layout.positions : autoLayoutPositions(workflow.definition.nodes, workflow.definition.edges)); setViewport(layout.viewport); setSelectedNodeId(workflow.definition.nodes[0]?.id ?? ''); setPast([]); setFuture([]); setTestedRevision(workflow.latest_test_status === 'completed' && workflow.latest_test_revision === workflow.draft_revision ? workflow.draft_revision : null); setHasUnsavedChanges(false); setCanvasRevision((value) => value + 1); window.scrollTo({ top: 0, behavior: 'smooth' });
+      setEditingId(workflow.id); setSavedWorkflow(workflow); setName(workflow.name); setDescription(workflow.description); setNodes(workflow.definition.nodes); setEdges(workflow.definition.edges); setPositions(layout.positions.length ? layout.positions : autoLayoutPositions(workflow.definition.nodes, workflow.definition.edges)); setViewport(layout.viewport); setSelectedNodeId(workflow.definition.nodes[0]?.id ?? ''); setInspectorOpen(window.innerWidth > 820); setPast([]); setFuture([]); setTestedRevision(workflow.latest_test_status === 'completed' && workflow.latest_test_revision === workflow.draft_revision ? workflow.draft_revision : null); setHasUnsavedChanges(false); setCanvasRevision((value) => value + 1); window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (cause) { reportError(cause instanceof Error ? cause.message : 'Could not load workflow canvas'); }
     finally { setLoadingWorkflowId(null); }
   };
@@ -229,7 +233,19 @@ export function WorkflowsPage() {
   const validation = useMemo(() => clientValidation(nodes, edges, catalog), [nodes, edges, catalog]);
   const activeNodeIds = useMemo(() => new Set(runDetail.data?.workflow_id === editingId ? runDetail.data.nodeStates?.filter((state) => ['running', 'waiting'].includes(state.status)).map((state) => state.node_id) ?? [] : []), [editingId, runDetail.data]);
   const labelFor = useCallback((node: WorkflowNode) => nodeLabel(node, resources, data.agents, data.tools), [resources, data.agents, data.tools]);
+  const brandFor = useCallback((node: WorkflowNode) => {
+    if (node.type !== 'mcp_action') return null;
+    const tool = resources.mcpTools.find((item) => item.id === node.config.mcpToolId);
+    if (!tool) return null;
+    return { appId: tool.appId, title: tool.appTitle ?? tool.connectionName, color: tool.brandColor };
+  }, [resources.mcpTools]);
+  const agentFor = useCallback((node: WorkflowNode) => node.type === 'agent' ? resources.agents.find((agent) => agent.id === node.config.agentId) ?? null : null, [resources.agents]);
   const estimatedCalls = nodes.filter((node) => node.type === 'agent').length;
+  const testedUsage = runDetail.data?.run_mode === 'test' && runDetail.data.status === 'completed' && runDetail.data.draft_revision === savedWorkflow?.draft_revision
+    ? runDetail.data.usage
+    : undefined;
+  const selectedAgentNames = [...new Set(nodes.filter((node) => node.type === 'agent').map((node) => labelFor(node)))];
+  const selectedIntegrationNames = [...new Set(nodes.filter((node) => ['api_action', 'mcp_action', 'action'].includes(node.type)).map((node) => labelFor(node)))];
 
   if (catalogQuery.isLoading || resourcesQuery.isLoading) return <div className="workflow-page"><PageHeader eyebrow="Automation" title="Workflow Designer" description="Loading the safe node catalog and connected resources…"/><section className="panel workflow-loading"><LoaderCircle className="spin" size={22}/>Preparing workflow tools</section></div>;
   if (catalogQuery.isError || resourcesQuery.isError) return <div className="workflow-page"><PageHeader eyebrow="Automation" title="Workflow Designer" description="The workflow foundation could not be loaded."/><section className="panel workflow-load-error"><AlertTriangle size={22}/><div><strong>Rebuild the Woody backend</strong><p>{catalogQuery.error?.message ?? resourcesQuery.error?.message ?? 'Workflow catalogs are unavailable.'}</p></div><button className="button" onClick={() => { void catalogQuery.refetch(); void resourcesQuery.refetch(); }}><RefreshCw size={14}/>Try again</button></section></div>;
@@ -241,18 +257,19 @@ export function WorkflowsPage() {
     <div className="workflow-layout visual">
       <aside className="node-library panel">
         <span className="eyebrow">Node library</span><h2>Drag work onto the canvas</h2><p>{simpleMode ? 'Common building blocks only. Switch to Advanced for branches, loops and legacy tools.' : 'All installed node types, including advanced control flow.'}</p>
+        <div className="library-mode-switch" role="group" aria-label="Node library mode"><button type="button" className={simpleMode ? 'active' : ''} aria-pressed={simpleMode} onClick={() => setSimpleMode(true)}>Simple</button><button type="button" className={!simpleMode ? 'active' : ''} aria-pressed={!simpleMode} onClick={() => setSimpleMode(false)}>Advanced</button></div>
         <label className="palette-search"><Search size={14}/><input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Search nodes"/></label>
-        <div className="node-palette">{palette.map((entry) => <button key={entry.type} type="button" draggable={entry.available} disabled={!entry.available} onDragStart={(event) => { event.dataTransfer.setData('application/woody-node', entry.type); event.dataTransfer.effectAllowed = 'move'; }} onClick={() => addNode(entry.type)}><span>{paletteIcon(entry.type)}</span><span><strong>{entry.title}</strong><small>{entry.description}</small></span><Plus size={14}/></button>)}</div>
+        <div className="node-palette">{palette.map((entry) => <button key={entry.type} type="button" draggable={entry.available} disabled={!entry.available} title={entry.available ? `Add ${entry.title}` : entry.availabilityReason} onDragStart={(event) => { event.dataTransfer.setData('application/woody-node', entry.type); event.dataTransfer.effectAllowed = 'move'; }} onClick={() => addNode(entry.type)}><span>{paletteIcon(entry.type)}</span><span><strong>{entry.title}</strong><small>{entry.available ? entry.description : entry.availabilityReason ?? entry.description}</small></span>{entry.available ? <Plus size={14}/> : <LockKeyhole size={13}/>}</button>)}</div>
         <div className="resource-summary"><span><Bot size={14}/><strong>{resources.agents.length}</strong> agents</span><span><Blocks size={14}/><strong>{resources.mcpTools.length}</strong> app actions</span><span><BrainCircuit size={14}/><strong>{resources.knowledge.ready}</strong> ready documents</span></div>
       </aside>
       <section className="workflow-canvas visual panel">
-        <WorkflowCanvas key={`${editingId ?? 'new'}:${canvasRevision}`} nodes={nodes} edges={edges} positions={positions} viewport={viewport} catalog={catalog} selectedNodeId={selectedNodeId} activeNodeIds={activeNodeIds} simpleMode={simpleMode} canUndo={past.length > 0} canRedo={future.length > 0} labelFor={labelFor} onSelectNode={setSelectedNodeId} onMoveNode={moveNode} onViewportChange={(next) => { setViewport(next); }} onConnect={connect} onDeleteNodes={removeNodes} onDeleteEdges={deleteEdges} onDropNode={addNode} onAutoLayout={autoLayout} onUndo={undo} onRedo={redo} onToggleMode={() => setSimpleMode((value) => !value)}/>
+        <WorkflowCanvas key={`${editingId ?? 'new'}:${canvasRevision}`} nodes={nodes} edges={edges} positions={positions} viewport={viewport} catalog={catalog} selectedNodeId={selectedNodeId} activeNodeIds={activeNodeIds} simpleMode={simpleMode} canUndo={past.length > 0} canRedo={future.length > 0} inspectorOpen={inspectorOpen} labelFor={labelFor} brandFor={brandFor} agentFor={agentFor} onSelectNode={(id) => { setSelectedNodeId(id); setInspectorOpen(true); }} onMoveNode={moveNode} onViewportChange={(next) => { setViewport(next); }} onConnect={connect} onDeleteNodes={removeNodes} onDeleteEdges={deleteEdges} onDropNode={addNode} onAutoLayout={autoLayout} onUndo={undo} onRedo={redo} onSetMode={setSimpleMode} onToggleInspector={() => setInspectorOpen((open) => !open)}/>
       </section>
-      <aside className="workflow-inspector panel">
-        <span className="eyebrow">Inspector</span>
-        {selectedNode && selectedDefinition ? <SchemaNodeInspector node={selectedNode} definition={selectedDefinition} nodes={nodes} resources={resources} update={updateConfig} remove={() => removeNodes([selectedNode.id])}/> : <p>Select a node to configure it.</p>}
+      <aside className={`workflow-inspector panel ${inspectorOpen ? 'open' : ''}`} aria-label="Selected node inspector">
+        <div className="inspector-panel-head"><span className="eyebrow">Inspector</span><button type="button" className="icon-button inspector-close" onClick={() => setInspectorOpen(false)} aria-label="Close node inspector"><X size={16}/></button></div>
+        {selectedNode && selectedDefinition ? <SchemaNodeInspector node={selectedNode} definition={selectedDefinition} nodes={nodes} edges={edges} resources={resources} update={updateConfig} remove={() => removeNodes([selectedNode.id])}/> : <p>Select a node to configure it.</p>}
         {selectedNode && selectedNode.type !== 'trigger' && <button className="button node-test-button" disabled={!savedWorkflow || hasUnsavedChanges || run.isPending} onClick={() => { if (savedWorkflow) { setRunMode('test'); setTestTargetNodeId(selectedNode.id); setRunTarget(savedWorkflow); setRunInput('{}'); } }}><TestTube2 size={14}/>Test to this node</button>}
-        <div className="workflow-review-summary"><h3>Pre-save review</h3><ReviewLine label="Model calls" value={`${estimatedCalls} on a straight path`}/><ReviewLine label="Knowledge" value={nodes.some((node) => node.type === 'knowledge_search') ? 'Workspace Knowledge' : 'Not used'}/><ReviewLine label="External actions" value={`${nodes.filter((node) => ['api_action', 'mcp_action', 'action'].includes(node.type)).length}`}/><ReviewLine label="Confirmation" value={nodes.some((node) => ['api_action', 'mcp_action'].includes(node.type)) ? 'Risk checked at runtime' : 'No connected actions'}/>{validation.map((message) => <p className="inline-warning" key={message}>{message}</p>)}</div>
+        <div className="workflow-review-summary"><h3>Pre-publish review</h3><ReviewLine label="Agents" value={selectedAgentNames.length ? selectedAgentNames.join(', ') : 'No agent calls'}/><ReviewLine label="Knowledge" value={nodes.some((node) => node.type === 'knowledge_search') ? `Workspace Knowledge · ${resources.knowledge.ready} ready` : 'Not used'}/><ReviewLine label="Integrations" value={selectedIntegrationNames.length ? selectedIntegrationNames.join(', ') : 'None'}/><ReviewLine label="Usage" value={testedUsage ? `${compact(testedUsage.inputTokens + testedUsage.outputTokens)} tokens in latest test` : estimatedCalls ? `${estimatedCalls} model call${estimatedCalls === 1 ? '' : 's'} · test to measure tokens` : 'No model usage expected'}/><ReviewLine label="Cost" value={testedUsage ? testedUsage.estimatedCostUsd > 0 || testedUsage.inputTokens + testedUsage.outputTokens === 0 ? `$${money(testedUsage.estimatedCostUsd)} in latest test` : 'Pricing unavailable' : estimatedCalls ? 'Measured after a safe test' : '$0.0000 expected'}/><ReviewLine label="Confirmation" value={nodes.some((node) => ['api_action', 'mcp_action'].includes(node.type)) ? 'Risk checked for the final action' : 'No connected actions'}/>{validation.map((message) => <p className="inline-warning" key={message}>{message}</p>)}</div>
       </aside>
     </div>
     <section className="saved-workflows panel"><div className="panel-header"><div><span className="eyebrow">Saved automation</span><h2>Workflows</h2></div></div>{data.workflows.length ? <div className="workflow-list">{data.workflows.map((workflow) => <div key={workflow.id}><span className="workflow-list-icon"><GitBranch size={18}/></span><span><strong>{workflow.name}</strong><small>{workflow.description || `${workflow.definition?.nodes?.length ?? 0} nodes`} · draft r{workflow.draft_revision}{workflow.published_version ? ` · live v${workflow.published_version}` : ''} · updated {relative(workflow.updated_at)}</small></span><Status value={workflow.status}/><button className="button" disabled={loadingWorkflowId === workflow.id} onClick={() => void loadWorkflow(workflow)}>{loadingWorkflowId === workflow.id ? <LoaderCircle className="spin" size={13}/> : <Edit3 size={13}/>}Edit</button><button className="button primary" disabled={workflow.status !== 'published' || !workflow.enabled} onClick={() => { setRunMode('production'); setTestTargetNodeId(null); setRunTarget(workflow); setRunInput('{}'); }}><Play size={14}/>Prepare run</button></div>)}</div> : <EmptyState Icon={GitBranch} title="No saved workflows" text="Build your first process on the canvas and save it."/>}</section>
@@ -261,9 +278,10 @@ export function WorkflowsPage() {
   </div>;
 }
 
-function SchemaNodeInspector({ node, definition, nodes, resources, update, remove }: { node: WorkflowNode; definition: WorkflowNodeCatalogEntry; nodes: WorkflowNode[]; resources: WorkflowResources; update: (changes: Record<string, unknown>) => void; remove: () => void }) {
+function SchemaNodeInspector({ node, definition, nodes, edges, resources, update, remove }: { node: WorkflowNode; definition: WorkflowNodeCatalogEntry; nodes: WorkflowNode[]; edges: WorkflowDefinition['edges']; resources: WorkflowResources; update: (changes: Record<string, unknown>) => void; remove: () => void }) {
   const retry = node.config.retry && typeof node.config.retry === 'object' ? node.config.retry as Record<string, unknown> : {};
-  const previousNodes = nodes.filter((item) => item.id !== node.id && item.type !== 'output');
+  const upstreamIds = upstreamNodeIds(node.id, edges);
+  const previousNodes = nodes.filter((item) => upstreamIds.has(item.id) && item.type !== 'output');
   return <div className="node-config"><div className="inspector-title"><span>{paletteIcon(node.type)}</span><div><h2>{definition.title}</h2><code>{node.id}</code></div>{!['trigger', 'output'].includes(node.type) && <button className="icon-button danger" onClick={remove} aria-label={`Delete ${definition.title}`}><Trash2 size={14}/></button>}</div><p>{definition.description}</p>
     {definition.configFields.filter((field) => {
       if (node.type !== 'loop') return true;
@@ -271,9 +289,9 @@ function SchemaNodeInspector({ node, definition, nodes, resources, update, remov
       if (field.key === 'condition') return whileMode;
       if (['collectionPath', 'itemVariable', 'indexVariable'].includes(field.key)) return !whileMode;
       return true;
-    }).map((field) => <ConfigField key={field.key} field={field} node={node} nodes={nodes} resources={resources} update={update}/>) }
+    }).map((field) => <ConfigField key={field.key} field={field} node={node} nodes={previousNodes} resources={resources} update={update}/>) }
     {definition.retryable && <RetryEditor retry={retry} update={(value) => update({ retry: value })}/>}
-    {['api_action', 'mcp_action'].includes(node.type) && previousNodes.length > 0 && <label>Map a previous output<select value="" onChange={(event) => { if (!event.target.value) return; const current = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input as Record<string, unknown> : {}; update({ input: { ...current, data: `{{ nodes.${event.target.value} }}` } }); }}><option value="">Choose output to insert</option>{previousNodes.map((item) => <option value={item.id} key={item.id}>{item.id} → input.data</option>)}</select><small>Inserts a safe reference; no JavaScript is executed.</small></label>}
+    {['api_action', 'mcp_action', 'action'].includes(node.type) && previousNodes.length > 0 && <label>Map an upstream output<select value="" onChange={(event) => { if (!event.target.value) return; const current = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input as Record<string, unknown> : {}; update({ input: { ...current, data: `{{ ${event.target.value} }}` } }); }}><option value="">Choose safe data to insert</option>{previousNodes.map((item) => <option value={item.type === 'trigger' ? 'input' : `nodes.${item.id}`} key={item.id}>{item.type === 'trigger' ? 'Workflow input' : item.id} → input.data</option>)}</select><small>Only nodes connected before this action are available. Woody inserts a safe reference and never executes JavaScript.</small></label>}
     <div className="node-permission-summary"><ShieldCheck size={16}/><span><strong>{permissionTitle(node, resources)}</strong><small>{permissionDetail(node, resources)}</small></span></div>
   </div>;
 }
@@ -305,16 +323,26 @@ function RetryEditor({ retry, update }: { retry: Record<string, unknown>; update
 function WorkflowRunPanel({ detail, loading, refresh, decide, decideAction, deciding }: { detail: Awaited<ReturnType<typeof api.workflowRun>> | undefined; loading: boolean; refresh: () => void; decide: (id: string, decision: 'approved' | 'rejected') => void; decideAction: (id: string, decision: 'approved' | 'rejected') => void; deciding: boolean }) {
   if (loading) return <section className="workflow-run panel"><p>Loading workflow trace…</p></section>;
   if (!detail) return null;
-  return <section className="workflow-run panel"><div className="panel-header"><div><span className="eyebrow">Latest launched run</span><h2>Persisted run trace</h2></div><div><Status value={detail.status}/><button className="icon-button" onClick={refresh}><RefreshCw size={14}/></button></div></div>{detail.nodeStates?.length ? <div className="workflow-node-states">{detail.nodeStates.map((state) => <article key={state.id}><span>{nodeIconByStatus(state.status)}</span><span><strong>{state.node_id}</strong><small>{state.iteration_key} · attempt {state.attempt}</small></span><Status value={state.status}/></article>)}</div> : null}<div className="workflow-run-events">{detail.events?.map((event) => <div key={event.id}><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.message}</small></span></div>)}</div>{detail.approvals?.filter((approval) => approval.status === 'pending').map((approval) => <div className="workflow-approval" key={approval.id}><span><strong>Business approval required</strong><small>{approval.node_id}</small></span><button className="button danger" disabled={deciding} onClick={() => decide(approval.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decide(approval.id, 'approved')}>Approve</button></div>)}{detail.actionAuthorizations?.filter((authorization) => authorization.status === 'awaiting_confirmation').map((authorization) => <div className="workflow-approval action-bound" key={authorization.id}><span><strong>Confirm external action</strong><small>{authorization.target_summary ?? authorization.operation} · {authorization.risk_level.replaceAll('_', ' ')}</small><code>{JSON.stringify(authorization.arguments_summary)}</code></span><button className="button danger" disabled={deciding} onClick={() => decideAction(authorization.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decideAction(authorization.id, 'approved')}>Confirm action</button></div>)}{detail.artifacts?.length ? <WorkflowArtifacts artifacts={detail.artifacts}/> : null}{detail.output !== undefined && <pre className="json-output">{JSON.stringify(detail.output, null, 2)}</pre>}</section>;
+  const runDuration = detail.completed_at ? new Date(detail.completed_at).getTime() - new Date(detail.created_at).getTime() : null;
+  const usageTokens = (detail.usage?.inputTokens ?? 0) + (detail.usage?.outputTokens ?? 0);
+  const usageCost = detail.usage?.estimatedCostUsd ?? 0;
+  const usageCostLabel = usageCost > 0 || usageTokens === 0 ? `$${money(usageCost)}` : 'Pricing unavailable';
+  return <section className="workflow-run panel"><div className="panel-header"><div><span className="eyebrow">Latest launched run</span><h2>Persisted run trace</h2></div><div><Status value={detail.status}/><button className="icon-button" onClick={refresh} aria-label="Refresh workflow run"><RefreshCw size={14}/></button></div></div>{detail.status === 'failed' && <section className="run-status-guide failed"><AlertTriangle size={20}/><div><strong>This workflow test needs attention</strong><p>{failureGuidance(detail.output, 'workflow')}</p><span>Nothing destructive retries automatically. Correct the affected node, save the draft, and test again.</span></div></section>}<div className="workflow-run-usage"><span><small>Duration</small><strong>{runDuration !== null ? duration(Math.max(0, runDuration)) : 'In progress'}</strong></span><span><small>Agent tasks</small><strong>{detail.usage?.agentTasks ?? 0}</strong></span><span><small>Tokens</small><strong>{compact(usageTokens)}</strong></span><span><small>Cost</small><strong>{usageCostLabel}</strong></span></div>{detail.input && Object.keys(detail.input).length > 0 && <section className="run-input-section"><div className="section-title"><div><span className="eyebrow">Test data</span><h3>Workflow input</h3></div></div><OutputViewer value={detail.input}/></section>}{detail.nodeStates?.length ? <div className="workflow-node-states">{detail.nodeStates.map((state) => { const nodeDuration = state.completed_at ? new Date(state.completed_at).getTime() - new Date(state.started_at).getTime() : null; const hasData = state.input !== undefined || state.output !== undefined || state.error !== undefined; return <article key={state.id}><span>{nodeIconByStatus(state.status)}</span><span><strong>{state.node_id}</strong><small>{state.iteration_key} · attempt {state.attempt}{nodeDuration !== null ? ` · ${duration(Math.max(0, nodeDuration))}` : ''}</small></span><Status value={state.status}/>{hasData && <details className="workflow-node-data"><summary>Inspect node data</summary>{state.input !== undefined && <><h4>Input</h4><OutputViewer value={state.input}/></>}{state.output !== undefined && <><h4>Output</h4><OutputViewer value={state.output}/></>}{state.error !== undefined && <><h4>Error</h4><OutputViewer value={state.error} error/></>}</details>}</article>; })}</div> : null}<div className="workflow-run-events">{detail.events?.map((event) => <div key={event.id}><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><small>{event.message}</small></span></div>)}</div>{detail.approvals?.filter((approval) => approval.status === 'pending').map((approval) => <div className="workflow-approval" key={approval.id}><span><strong>Business approval required</strong><small>{approval.node_id}</small></span><button className="button danger" disabled={deciding} onClick={() => decide(approval.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decide(approval.id, 'approved')}>Approve</button></div>)}{detail.actionAuthorizations?.filter((authorization) => authorization.status === 'awaiting_confirmation').map((authorization) => <div className="workflow-approval action-bound" key={authorization.id}><span><strong>Confirm external action</strong><small>{authorization.target_summary ?? authorization.operation} · {authorization.risk_level.replaceAll('_', ' ')}</small><code>{JSON.stringify(authorization.arguments_summary)}</code></span><button className="button danger" disabled={deciding} onClick={() => decideAction(authorization.id, 'rejected')}>Reject</button><button className="button primary" disabled={deciding} onClick={() => decideAction(authorization.id, 'approved')}>Confirm action</button></div>)}{detail.artifacts?.length ? <WorkflowArtifacts artifacts={detail.artifacts}/> : null}{detail.output !== undefined && <section className="output-section"><h3>Workflow result</h3><OutputViewer value={detail.output} error={detail.status === 'failed'}/></section>}</section>;
 }
 
 function WorkflowArtifacts({ artifacts }: { artifacts: Artifact[] }) {
   const { reportError } = useWorkspace();
-  const open = async (artifact: Artifact) => {
-    try { const file = await api.artifactFile(artifact.id, false); const url = URL.createObjectURL(file.blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.filename; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 60000); }
-    catch (cause) { reportError(cause instanceof Error ? cause.message : 'Could not download artifact'); }
+  const open = async (artifact: Artifact, inline: boolean) => {
+    const pendingTab = inline ? window.open('', '_blank', 'noopener,noreferrer') : null;
+    try {
+      const file = await api.artifactFile(artifact.id, inline); const url = URL.createObjectURL(file.blob);
+      if (inline && pendingTab) pendingTab.location.href = url;
+      else { const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.filename; anchor.click(); }
+      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+    catch (cause) { pendingTab?.close(); reportError(cause instanceof Error ? cause.message : 'Could not open artifact'); }
   };
-  return <div className="workflow-artifacts"><h3>Generated files</h3>{artifacts.map((artifact) => <article key={artifact.id}><FileOutput size={16}/><span><strong>{artifact.filename}</strong><small>{artifact.status}</small></span><Status value={artifact.status}/>{artifact.status === 'ready' && <button className="icon-button" onClick={() => void open(artifact)}><Download size={14}/></button>}</article>)}</div>;
+  return <div className="workflow-artifacts"><h3>Generated files</h3>{artifacts.map((artifact) => <article key={artifact.id}><FileOutput size={16}/><span><strong>{artifact.filename}</strong><small>{artifact.status}</small></span><Status value={artifact.status}/>{artifact.status === 'ready' && artifact.format === 'pdf' && <button className="icon-button" aria-label={`Preview ${artifact.filename}`} onClick={() => void open(artifact, true)}><Eye size={14}/></button>}{artifact.status === 'ready' && <button className="icon-button" aria-label={`Download ${artifact.filename}`} onClick={() => void open(artifact, false)}><Download size={14}/></button>}</article>)}</div>;
 }
 
 function clientValidation(nodes: WorkflowNode[], edges: WorkflowDefinition['edges'], catalog: WorkflowNodeCatalogEntry[]) {
@@ -323,6 +351,7 @@ function clientValidation(nodes: WorkflowNode[], edges: WorkflowDefinition['edge
   if (!nodes.some((node) => node.type === 'output')) errors.push('Add an output node.');
   const known = new Set(nodes.map((node) => node.id));
   if (edges.some((edge) => !known.has(edge.source) || !known.has(edge.target))) errors.push('Remove connections to missing nodes.');
+  if (edges.some((edge) => edge.source === edge.target)) errors.push('Connect each node to a different node.');
   for (const node of nodes) {
     const definition = catalog.find((entry) => entry.type === node.type);
     for (const field of definition?.configFields.filter((item) => item.required) ?? []) if (!node.config[field.key]) errors.push(`${definition?.title ?? node.type}: choose ${field.label.toLowerCase()}.`);
@@ -331,7 +360,43 @@ function clientValidation(nodes: WorkflowNode[], edges: WorkflowDefinition['edge
     if (node.type === 'loop' && (!outgoing.some((edge) => edge.condition === 'body') || !outgoing.some((edge) => edge.condition === 'done'))) errors.push(`Loop ${node.id} needs Body and Done connections.`);
     if (!['condition', 'loop', 'output'].includes(node.type) && outgoing.length !== 1) errors.push(`${node.id} needs exactly one outgoing connection.`);
   }
+  const trigger = nodes.find((node) => node.type === 'trigger');
+  if (trigger && edges.every((edge) => known.has(edge.source) && known.has(edge.target))) {
+    const reachable = new Set([trigger.id]);
+    const pending = [trigger.id];
+    while (pending.length) {
+      const source = pending.pop()!;
+      for (const edge of edges.filter((candidate) => candidate.source === source)) if (!reachable.has(edge.target)) { reachable.add(edge.target); pending.push(edge.target); }
+    }
+    const unreachable = nodes.filter((node) => !reachable.has(node.id));
+    if (unreachable.length) errors.push(`Connect ${unreachable.map((node) => node.id).join(', ')} to the workflow path.`);
+
+    const outgoingWithoutLoopBack = new Map(nodes.map((node) => [node.id, edges.filter((edge) => edge.source === node.id && edge.condition !== 'continue')]));
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const hasCycle = (id: string): boolean => {
+      if (visiting.has(id)) return true;
+      if (visited.has(id)) return false;
+      visiting.add(id);
+      const cyclic = (outgoingWithoutLoopBack.get(id) ?? []).some((edge) => hasCycle(edge.target));
+      visiting.delete(id); visited.add(id);
+      return cyclic;
+    };
+    if (nodes.some((node) => hasCycle(node.id))) errors.push('Remove the cycle, or use a bounded Loop with a Continue connection.');
+  }
   return [...new Set(errors)];
+}
+
+function upstreamNodeIds(targetId: string, edges: WorkflowDefinition['edges']) {
+  const result = new Set<string>();
+  const pending = edges.filter((edge) => edge.target === targetId).map((edge) => edge.source);
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (result.has(id)) continue;
+    result.add(id);
+    for (const edge of edges) if (edge.target === id && !result.has(edge.source)) pending.push(edge.source);
+  }
+  return result;
 }
 
 function nodeLabel(node: WorkflowNode, resources: WorkflowResources, fallbackAgents: Array<{ id: string; name: string }>, fallbackTools: Array<{ id: string; name: string }>) {
@@ -368,6 +433,7 @@ function paletteIcon(type: WorkflowNode['type']) {
   if (type === 'knowledge_search') return <BrainCircuit size={16}/>;
   if (type === 'api_action' || type === 'action') return <Wrench size={16}/>;
   if (type === 'approval') return <ShieldCheck size={16}/>;
+  if (type === 'browser') return <Globe2 size={16}/>;
   return <GitBranch size={16}/>;
 }
 

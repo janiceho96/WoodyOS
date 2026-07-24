@@ -1,11 +1,24 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Bot, CircleHelp, Gauge, LoaderCircle, Moon, Palette, RefreshCw, Save, Sun, WalletCards } from 'lucide-react';
+import { AlertTriangle, Bot, BrainCircuit, Building2, CircleHelp, Code2, ExternalLink, Gauge, KeyRound, LoaderCircle, Moon, Palette, RefreshCw, Save, ShieldCheck, SlidersHorizontal, Sun, WalletCards } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api, type AiQuotaStatus, type Onboarding } from '../../api';
 import type { Theme } from '../../app/theme';
 import { useWorkspace } from '../../app/workspace';
 import { PageHeader, Status } from '../../components/ui';
 import { compact } from '../../lib/format';
+import { ProviderSettingsPanel } from './ProviderSettingsPanel';
+
+type SettingsSection = 'workspace' | 'providers' | 'budget' | 'security' | 'presentation' | 'appearance' | 'developer';
+
+const settingsSections: Array<{ id: SettingsSection; label: string; description: string; Icon: typeof Building2 }> = [
+  { id: 'workspace', label: 'Workspace', description: 'Identity and onboarding', Icon: Building2 },
+  { id: 'providers', label: 'AI Providers', description: 'Models and encrypted keys', Icon: BrainCircuit },
+  { id: 'budget', label: 'Budget', description: 'Usage and hard limits', Icon: Gauge },
+  { id: 'security', label: 'Security', description: 'Permissions and confirmation', Icon: ShieldCheck },
+  { id: 'presentation', label: 'Presentation', description: 'PowerPoint design system', Icon: Palette },
+  { id: 'appearance', label: 'Appearance', description: 'Theme and mascot', Icon: Sun },
+  { id: 'developer', label: 'Developer', description: 'API and runtime details', Icon: Code2 },
+];
 
 type BudgetForm = {
   monthlyRequestLimit: string;
@@ -73,6 +86,8 @@ export function SettingsPage({ theme, setTheme, onboarding, resume, restart }: {
   const [budget, setBudget] = useState<BudgetForm>(emptyBudget);
   const [themeName, setThemeName] = useState('Woody Dark Premium');
   const [designMarkdown, setDesignMarkdown] = useState(defaultDesignMarkdown);
+  const [section, setSection] = useState<SettingsSection>('workspace');
+  const [providerDirty, setProviderDirty] = useState(false);
   useEffect(() => { if (quota.data) setBudget(formFromStatus(quota.data)); }, [quota.data]);
   const canEdit = !session.workspace.role || session.workspace.role === 'owner' || session.workspace.role === 'admin';
   const save = useMutation({
@@ -105,20 +120,38 @@ export function SettingsPage({ theme, setTheme, onboarding, resume, restart }: {
   });
   const status = quota.data;
   const provider = status?.provider;
+  const budgetConfigured = Boolean(status && [status.budget.monthlyRequestLimit, status.budget.monthlyTokenLimit, status.budget.monthlyCostLimitUsd].some((value) => value !== null));
+  const pricingAvailable = Boolean(status && (
+    status.usage.tokensUsed === 0
+    || status.usage.costUsedUsd > 0
+    || (status.budget.inputCostPerMillionUsd !== null && status.budget.outputCostPerMillionUsd !== null)
+  ));
+  const changeSection = (next: SettingsSection) => {
+    if (section === 'providers' && providerDirty && !window.confirm('Discard unsaved AI provider changes?')) return;
+    setSection(next);
+  };
 
   return <div className="settings-page">
-    <PageHeader eyebrow="Workspace" title="Settings" description="Display preferences, onboarding, and enforceable AI usage limits."/>
-    <section className="panel settings-card"><div><span className="setting-icon"><Sun size={18}/></span><span><strong>Appearance</strong><small>Applied across every Woody screen.</small></span></div><div className="theme-switch"><button className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}><Moon size={15}/>Dark</button><button className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}><Sun size={15}/>Light</button></div></section>
+    <PageHeader eyebrow="Workspace" title="Settings" description="Manage workspace identity, AI providers, budget, security, output design, and developer access."/>
+    <div className="settings-layout">
+      <nav className="panel settings-nav" aria-label="Settings sections">{settingsSections.map(({ id, label, description, Icon }) => <button key={id} className={section === id ? 'active' : ''} aria-current={section === id ? 'page' : undefined} onClick={() => changeSection(id)}><Icon size={16}/><span><strong>{label}</strong><small>{description}</small></span>{id === 'providers' && providerDirty && <i aria-label="Unsaved changes"/>}</button>)}</nav>
+      <div className="settings-content">
+        <div className="settings-section" hidden={section !== 'workspace'}>
+          <section className="panel settings-section-card"><div className="panel-header"><div><span className="eyebrow">Workspace identity</span><h2>{session.workspace.name}</h2><p>Your account and role determine which settings you can change.</p></div><Status value={session.workspace.role ?? 'member'}/></div><div className="workspace-facts"><span><small>Signed in as</small><strong>{session.user.displayName}</strong><code>{session.user.email}</code></span><span><small>Workspace role</small><strong>{session.workspace.role ?? 'member'}</strong><code>{session.workspace.id}</code></span></div></section>
+          <section className="panel settings-card"><div><span className="setting-icon"><CircleHelp size={18}/></span><span><strong>Product onboarding</strong><small>Version {onboarding?.version ?? 1} · {onboarding?.completed ? 'completed' : `paused at step ${onboarding?.lastStep ?? 1}`}</small></span></div><div className="page-actions">{onboarding && !onboarding.completed && <button className="button" onClick={resume}>Resume onboarding</button>}<button className="button primary" onClick={restart}>Restart onboarding</button></div></section>
+        </div>
 
-    <section className="panel quota-settings">
+        <div className="settings-section" hidden={section !== 'providers'}><ProviderSettingsPanel canEdit={canEdit} onDirtyChange={setProviderDirty}/></div>
+
+        <div className="settings-section" hidden={section !== 'budget'}><section className="panel quota-settings">
       <div className="panel-header"><div><span className="eyebrow">Usage guardrail</span><h2>AI budget and provider limits</h2><p>Local limits are enforced by Woody. Provider values appear only when the API reports safe rate-limit headers.</p></div><div className="quota-header-actions"><Status value={status?.state ?? 'loading'}/><button className="icon-button" aria-label="Refresh AI quota" disabled={quota.isFetching} onClick={() => void quota.refetch()}><RefreshCw className={quota.isFetching ? 'spin' : ''} size={16}/></button></div></div>
       {quota.error ? <div className="inline-error"><AlertTriangle size={15}/>{quota.error instanceof Error ? quota.error.message : 'Could not load AI quota'}</div> : !status ? <div className="quota-loading"><LoaderCircle className="spin" size={18}/>Loading AI usage…</div> : <>
         <div className="quota-overview">
-          <article><span><Gauge size={15}/>This month</span><strong>{compact(status.usage.tokensUsed)} tokens</strong><small>{status.usage.requestsUsed.toLocaleString()} model calls · ${status.usage.costUsedUsd.toFixed(4)} estimated</small></article>
+          <article><span><Gauge size={15}/>This month</span><strong>{compact(status.usage.tokensUsed)} tokens</strong><small>{status.usage.requestsUsed.toLocaleString()} model calls · {pricingAvailable ? `$${status.usage.costUsedUsd.toFixed(4)} estimated` : 'pricing unavailable'}</small></article>
           <article><span><WalletCards size={15}/>Provider credit</span><strong>{provider?.creditRemainingUsd !== null && provider?.creditRemainingUsd !== undefined ? `$${provider.creditRemainingUsd.toFixed(2)} left` : 'Not reported'}</strong><small>{provider ? `Last checked ${new Date(provider.capturedAt).toLocaleString()}` : 'No rate-limit headers received yet'}</small></article>
           <article><span><Gauge size={15}/>Provider rate limit</span><strong>{provider?.requestsRemaining !== null && provider?.requestsRemaining !== undefined ? `${provider.requestsRemaining.toLocaleString()} requests left` : 'Not reported'}</strong><small>{provider?.tokensRemaining !== null && provider?.tokensRemaining !== undefined ? `${compact(provider.tokensRemaining)} tokens left in current window` : 'The compatible provider did not report token capacity'}</small></article>
         </div>
-        <div className="quota-progress"><div><span>Highest configured usage</span><strong>{status.budget.monthlyRequestLimit || status.budget.monthlyTokenLimit || status.budget.monthlyCostLimitUsd ? `${status.maximumPercent.toFixed(1)}%` : 'No local budget set'}</strong></div><span><i style={{ width: `${Math.min(100, status.maximumPercent)}%` }}/></span></div>
+        {budgetConfigured ? <div className="quota-progress"><div><span>Highest configured usage</span><strong>{status.maximumPercent.toFixed(1)}%</strong></div><span><i style={{ width: `${Math.min(100, status.maximumPercent)}%` }}/></span></div> : <div className="local-budget-empty"><Gauge size={16}/><span><strong>No local budget configured</strong><small>Add a request, token, or cost limit below to enable usage progress and warnings.</small></span></div>}
         <div className="budget-form">
           <label>Monthly model-call limit<input type="number" min="1" value={budget.monthlyRequestLimit} onChange={(event) => update('monthlyRequestLimit', event.target.value)} placeholder="Unlimited" disabled={!canEdit}/><small>Counts every provider request, including compiler calls.</small></label>
           <label>Monthly token limit<input type="number" min="1" value={budget.monthlyTokenLimit} onChange={(event) => update('monthlyTokenLimit', event.target.value)} placeholder="Unlimited" disabled={!canEdit}/><small>Combined input and output tokens.</small></label>
@@ -130,9 +163,11 @@ export function SettingsPage({ theme, setTheme, onboarding, resume, restart }: {
         <label className="hard-limit-control"><input type="checkbox" checked={budget.hardLimit} onChange={(event) => update('hardLimit', event.target.checked)} disabled={!canEdit}/><span><strong>Enforce a hard local limit</strong><small>When any configured monthly limit reaches 100%, new tasks, workflows, solution tests, and prompt compilation are blocked.</small></span></label>
         <div className="quota-footer"><p>Rate limits can reset within seconds or minutes. Account credit cannot be inferred when your provider does not expose it.</p>{canEdit ? <button className="button primary" disabled={save.isPending} onClick={() => save.mutate()}>{save.isPending ? <LoaderCircle className="spin" size={15}/> : <Save size={15}/>}Save AI budget</button> : <small>Only workspace owners and administrators can change limits.</small>}</div>
       </>}
-    </section>
+        </section></div>
 
-    <section className="panel quota-settings">
+        <div className="settings-section" hidden={section !== 'security'}><section className="panel settings-section-card"><div className="panel-header"><div><span className="eyebrow">Security model</span><h2>Least privilege by default</h2><p>These protections are enforced by the backend and cannot be bypassed by a workflow canvas or agent prompt.</p></div><ShieldCheck size={21}/></div><div className="security-settings-grid"><article><KeyRound size={17}/><span><strong>Encrypted credentials</strong><small>Provider, API, OAuth, and MCP credentials remain server-side and are never returned to agents or this browser.</small></span></article><article><ShieldCheck size={17}/><span><strong>Action-bound confirmation</strong><small>Every write-capable or uncertain action is confirmed against its final operation and argument hash. Changed actions must be approved again.</small></span></article><article><SlidersHorizontal size={17}/><span><strong>Per-agent permissions</strong><small>Assigned API tools and MCP allowlists determine what an agent can request before the shared policy gateway makes the final decision.</small></span></article></div><div className="settings-callout"><span>Review connected apps, health, tool access, and audit activity in Advanced MCP.</span><a className="button" href="/mcp">Review integration security <ExternalLink size={13}/></a></div></section></div>
+
+        <div className="settings-section" hidden={section !== 'presentation'}><section className="panel quota-settings">
       <div className="panel-header"><div><span className="eyebrow">Presentation output</span><h2>PowerPoint design theme</h2><p>Paste a <code>DESIGN.md</code> specification. Woody validates its safe visual tokens and applies the default theme to generated PPTX files.</p></div><Palette size={20}/></div>
       {!canEdit ? <p className="inline-warning">Only workspace owners and administrators can change the default presentation theme.</p> : <div className="budget-form"><label>Theme name<input value={themeName} onChange={(event) => setThemeName(event.target.value)} maxLength={120}/></label><label className="theme-markdown-field">DESIGN.md<textarea value={designMarkdown} onChange={(event) => setDesignMarkdown(event.target.value)} maxLength={30000} spellCheck={false}/><small>Colours, fonts, visual direction, and maximum words per slide are applied deterministically. The generator does not execute Markdown.</small></label></div>}
       {canEdit && <div className="quota-footer"><p>Saving a theme makes it the default for all newly generated PowerPoint files in this workspace.</p><button className="button primary" disabled={saveTheme.isPending || designMarkdown.trim().length < 20 || themeName.trim().length < 2} onClick={() => saveTheme.mutate()}>{saveTheme.isPending ? <LoaderCircle className="spin" size={15}/> : <Save size={15}/>}Save as default theme</button></div>}
@@ -140,9 +175,12 @@ export function SettingsPage({ theme, setTheme, onboarding, resume, restart }: {
         const style = item.theme?.style ?? 'premium-dark';
         return <article key={item.id}><Palette size={16}/><span><strong>{item.name}</strong><small>Style: {style.replaceAll('-', ' ')} · {item.theme?.headingFont ?? 'Aptos Display'} · {item.theme?.primary ?? '#7C5CFF'} · {item.theme?.maxWordsPerSlide ?? 35} words per slide</small></span><Status value={item.is_default ? 'active' : 'draft'}/>{canEdit && !item.is_default && <button className="button" disabled={makeDefault.isPending} onClick={() => makeDefault.mutate(item.id)}>Make default</button>}</article>;
       })}</div> : null}
-    </section>
+        </section></div>
 
-    <section className="panel settings-card"><div><span className="setting-icon"><CircleHelp size={18}/></span><span><strong>Product onboarding</strong><small>Version {onboarding?.version ?? 1} · {onboarding?.completed ? 'completed' : `paused at step ${onboarding?.lastStep ?? 1}`}</small></span></div><div className="page-actions">{onboarding && !onboarding.completed && <button className="button" onClick={resume}>Resume onboarding</button>}<button className="button primary" onClick={restart}>Restart onboarding</button></div></section>
-    <section className="panel settings-card"><div><span className="setting-icon"><Bot size={18}/></span><span><strong>Woody mascot system</strong><small>Inspect expressions, animation flags, skins, and vector sizes.</small></span></div><a className="button" href="/mascot-lab">Open mascot lab</a></section>
+        <div className="settings-section" hidden={section !== 'appearance'}><section className="panel settings-card"><div><span className="setting-icon"><Sun size={18}/></span><span><strong>Appearance</strong><small>Applied immediately across every Woody screen.</small></span></div><div className="theme-switch"><button className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}><Moon size={15}/>Dark</button><button className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}><Sun size={15}/>Light</button></div></section><section className="panel settings-card"><div><span className="setting-icon"><Bot size={18}/></span><span><strong>Woody mascot system</strong><small>Inspect expressions, animation flags, skins, and vector sizes.</small></span></div><a className="button" href="/mascot-lab">Open mascot lab</a></section></div>
+
+        <div className="settings-section" hidden={section !== 'developer'}><section className="panel settings-section-card"><div className="panel-header"><div><span className="eyebrow">Developer access</span><h2>API and runtime</h2><p>Use the authenticated API documentation for integration and troubleshooting. Secrets are intentionally excluded.</p></div><Code2 size={21}/></div><div className="workspace-facts"><span><small>API proxy</small><strong>Same-origin /v1</strong><code>http://localhost:3002/v1</code></span><span><small>Health check</small><strong>Backend health</strong><code>http://localhost:3002/health</code></span></div><div className="settings-callout"><span>The OpenAPI page documents the real backend routes available to this workspace.</span><a className="button primary" href="/docs">Open API documentation <ExternalLink size={13}/></a></div></section></div>
+      </div>
+    </div>
   </div>;
 }

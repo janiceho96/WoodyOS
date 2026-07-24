@@ -18,14 +18,14 @@ export async function workflowActionRoutes(app: FastifyInstance) {
     try {
       await client.query('BEGIN');
       const pending = await client.query<{ workflow_run_id: string }>(
-        `SELECT workflow_run_id FROM workflow_action_authorizations
+        `SELECT workflow_run_id FROM action_authorizations
          WHERE id=$1 AND workspace_id=$2 AND status='awaiting_confirmation' AND expires_at>now()
          FOR UPDATE`,
         [params.id, request.user.workspaceId],
       );
       if (!pending.rowCount) {
         await client.query(
-          `UPDATE workflow_action_authorizations SET status='expired',resolved_at=now()
+          `UPDATE action_authorizations SET status='expired',resolved_at=now()
            WHERE id=$1 AND workspace_id=$2 AND status='awaiting_confirmation' AND expires_at<=now()`,
           [params.id, request.user.workspaceId],
         );
@@ -34,7 +34,7 @@ export async function workflowActionRoutes(app: FastifyInstance) {
       }
       workflowRunId = pending.rows[0].workflow_run_id;
       await client.query(
-        `UPDATE workflow_action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
+        `UPDATE action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
          WHERE id=$4`,
         [input.decision, request.user.sub, input.comment ?? null, params.id],
       );

@@ -38,8 +38,23 @@ describe('API input validation', () => {
     const token = app.jwt.sign({ sub: '11111111-1111-1111-1111-111111111111', workspaceId: '22222222-2222-2222-2222-222222222222', role: 'member' });
     const response = await app.inject({ method: 'GET', url: '/v1/runtime/config', headers: { authorization: `Bearer ${token}` } });
     expect(response.statusCode, response.body).toBe(200);
-    expect(Object.keys(response.json()).sort()).toEqual(['defaultModel', 'provider']);
-    expect(response.json()).toMatchObject({ defaultModel: expect.any(String), provider: expect.any(String) });
-    expect(response.body).not.toMatch(/api.?key|base.?url|secret|token/i);
+    expect(response.json()).toMatchObject({
+      defaultModel: expect.any(String),
+      provider: expect.any(String),
+      source: expect.stringMatching(/^(workspace|environment|unconfigured)$/),
+      configured: expect.any(Boolean),
+      apiKeyHint: expect.toSatisfy((value: unknown) => value === null || /^•••• .{4}$/.test(String(value))),
+    });
+    expect(response.json()).not.toHaveProperty('apiKey');
+    expect(response.json()).not.toHaveProperty('encryptedApiKey');
+    expect(response.json()).not.toHaveProperty('encrypted_api_key');
+    expect(response.body).not.toMatch(/"(?:secret|token|credential)"\s*:/i);
+  });
+
+  it('rejects unsupported analytics ranges before database queries', async () => {
+    const token = app.jwt.sign({ sub: '11111111-1111-1111-1111-111111111111', workspaceId: '22222222-2222-2222-2222-222222222222', role: 'member' });
+    const response = await app.inject({ method: 'GET', url: '/v1/analytics/overview?days=365', headers: { authorization: `Bearer ${token}` } });
+    expect(response.statusCode, response.body).toBe(400);
+    expect(response.json().error).toBe('VALIDATION_ERROR');
   });
 });

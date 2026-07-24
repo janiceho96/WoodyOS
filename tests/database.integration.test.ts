@@ -12,6 +12,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
   let agentId = '';
   let mcpConnectionId = '';
   let starterInstallationId = '';
+  let jobToolId = '';
 
   async function waitFor<T>(action: () => Promise<T>, predicate: (value: T) => boolean) {
     for (let attempt = 0; attempt < 75; attempt++) {
@@ -41,12 +42,21 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(registration.json().user.onboarding).toMatchObject({ version: 1, completed: false, lastStep: 1 });
     const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email, password } });
     expect(login.statusCode, login.body).toBe(200);
-    const agent = await app.inject({ method: 'POST', url: '/v1/agents', headers: { authorization: `Bearer ${token}` }, payload: { name: 'Research Agent', role: 'Researcher', goal: 'Find relevant information', instructions: 'Be concise.', status: 'active', modelConfig: { temperature: 0.4, maxTokens: 8192, topP: 0.9 }, capabilities: { webBrowser: true, codeInterpreter: false, knowledgeBase: true } } });
+    const agent = await app.inject({ method: 'POST', url: '/v1/agents', headers: { authorization: `Bearer ${token}` }, payload: { name: 'Research Agent', role: 'Researcher', goal: 'Find relevant information', instructions: 'Be concise.', status: 'active', modelConfig: { temperature: 0.4, maxTokens: 8192, topP: 0.9 }, capabilities: { webBrowser: true, codeInterpreter: false, knowledgeBase: true }, avatar: { type: 'icon', value: 'search', backgroundColor: '#312e81', accentColor: '#a5b4fc' } } });
     expect(agent.statusCode, agent.body).toBe(201);
     expect(agent.json()).toMatchObject({ name: 'Research Agent', status: 'active' });
     expect(agent.json().model_config).toEqual({ temperature: 0.4, maxTokens: 8192, topP: 0.9 });
     expect(agent.json().capabilities).toEqual({ webBrowser: true, codeInterpreter: false, knowledgeBase: true });
+    expect(agent.json().avatar_config).toEqual({ type: 'icon', value: 'search', backgroundColor: '#312e81', accentColor: '#a5b4fc' });
     agentId = agent.json().id;
+    const customized = await app.inject({ method: 'PATCH', url: `/v1/agents/${agentId}`, headers: { authorization: `Bearer ${token}` }, payload: { avatar: { type: 'initials', value: 'RA', backgroundColor: '#164e63', accentColor: '#67e8f9' } } });
+    expect(customized.statusCode, customized.body).toBe(200);
+    expect(customized.json().avatar_config).toMatchObject({ type: 'initials', value: 'RA' });
+    const reset = await app.inject({ method: 'DELETE', url: `/v1/agents/${agentId}/avatar`, headers: { authorization: `Bearer ${token}` } });
+    expect(reset.statusCode, reset.body).toBe(204);
+    const restored = await app.inject({ method: 'GET', url: `/v1/agents/${agentId}`, headers: { authorization: `Bearer ${token}` } });
+    expect(restored.statusCode, restored.body).toBe(200);
+    expect(restored.json().avatar_config).toEqual({});
   });
 
   it('persists, skips, and restarts versioned onboarding', async () => {
@@ -73,6 +83,155 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const updatedVersion = await app.inject({ method: 'GET', url: '/v1/auth/onboarding', headers });
     expect(updatedVersion.statusCode, updatedVersion.body).toBe(200);
     expect(updatedVersion.json()).toMatchObject({ version: 1, completed: false, lastStep: 1 });
+  });
+
+  it('stores a workspace AI provider without exposing its key', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/v1/runtime/config',
+      headers,
+      payload: {
+        provider: 'openai-compatible',
+        baseUrl: 'https://api.example.com/v1/chat/completions',
+        defaultModel: 'integration-model',
+        apiKey: 'integration-provider-secret-key',
+      },
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(saved.json()).toMatchObject({
+      provider: 'openai-compatible',
+      baseUrl: 'https://api.example.com/v1',
+      defaultModel: 'integration-model',
+      source: 'workspace',
+      configured: true,
+      apiKeyHint: '•••• -key',
+      status: 'untested',
+    });
+    expect(JSON.stringify(saved.json())).not.toContain('integration-provider-secret-key');
+    expect(JSON.stringify(saved.json())).not.toMatch(/encrypted_api_key|encryptedApiKey/);
+
+    const updated = await app.inject({
+      method: 'PUT',
+      url: '/v1/runtime/config',
+      headers,
+      payload: { provider: 'openai-compatible', baseUrl: 'https://api.example.com/v1', defaultModel: 'integration-model-2' },
+    });
+    expect(updated.statusCode, updated.body).toBe(200);
+    expect(updated.json()).toMatchObject({ defaultModel: 'integration-model-2', apiKeyHint: '•••• -key' });
+
+    const missingReplacementKey = await app.inject({
+      method: 'PUT',
+      url: '/v1/runtime/config',
+      headers,
+      payload: { provider: 'anthropic', defaultModel: 'claude-test' },
+    });
+    expect(missingReplacementKey.statusCode, missingReplacementKey.body).toBe(400);
+    expect(missingReplacementKey.json()).toMatchObject({ error: 'AI_PROVIDER_API_KEY_REQUIRED' });
+  });
+
+  it('installs a curated read-only demo API idempotently without exposing its endpoint configuration', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const catalog = await app.inject({ method: 'GET', url: '/v1/tools/demos', headers });
+    expect(catalog.statusCode, catalog.body).toBe(200);
+    expect(catalog.json().data).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slug: 'book-search', installed: false }),
+    ]));
+    expect(catalog.body).not.toContain('openlibrary.org/search.json');
+    const installed = await app.inject({ method: 'POST', url: '/v1/tools/demos/book-search/install', headers });
+    expect(installed.statusCode, installed.body).toBe(201);
+    expect(installed.json()).toMatchObject({ name: 'Demo · Book Search', kind: 'api', enabled: true, alreadyInstalled: false });
+    expect(installed.json()).not.toHaveProperty('config');
+    const repeated = await app.inject({ method: 'POST', url: '/v1/tools/demos/book-search/install', headers });
+    expect(repeated.statusCode, repeated.body).toBe(200);
+    expect(repeated.json()).toMatchObject({ id: installed.json().id, alreadyInstalled: true });
+    const { query } = await import('../src/db/client.js');
+    const stored = await query<{ config: unknown }>('SELECT config FROM tools WHERE id=$1', [installed.json().id]);
+    expect(JSON.stringify(stored.rows[0].config)).not.toContain('openlibrary.org');
+  });
+
+  it('installs isolated web research tools and assigns them through explicit agent access', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const catalog = await app.inject({ method: 'GET', url: '/v1/tools/web/catalog', headers });
+    expect(catalog.statusCode, catalog.body).toBe(200);
+    expect(catalog.json().data).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'tavily', installed: false }),
+      expect.objectContaining({ id: 'firecrawl-search', installed: false }),
+      expect.objectContaining({ id: 'firecrawl-extract', installed: false }),
+      expect.objectContaining({ id: 'page-reader', installed: false }),
+      expect.objectContaining({ id: 'reddit', installed: false }),
+    ]));
+    expect(JSON.stringify(catalog.json())).not.toMatch(/clientSecret|encrypted|tvly-/i);
+
+    const search = await app.inject({
+      method: 'POST', url: '/v1/tools/web/install', headers,
+      payload: { provider: 'searxng', endpoint: 'https://search.example.com/search', safeSearch: 'strict', maxResults: 6, allowedDomains: ['zhihu.com', 'reddit.com'] },
+    });
+    expect(search.statusCode, search.body).toBe(201);
+    expect(search.json()).toMatchObject({ name: 'Web Search · SearXNG', kind: 'internal', permissions: ['web.read', 'web.search'], enabled: true });
+    expect(search.json()).not.toHaveProperty('config');
+
+    const reader = await app.inject({
+      method: 'POST', url: '/v1/tools/web/install', headers,
+      payload: { provider: 'page-reader', maxCharacters: 12_000, blockedDomains: ['example.com'] },
+    });
+    expect(reader.statusCode, reader.body).toBe(201);
+    expect(reader.json()).toMatchObject({ name: 'Web · Safe Page Reader', kind: 'internal', permissions: ['web.read', 'web.page.read'], enabled: true });
+    expect(reader.json()).not.toHaveProperty('config');
+    const readerHealth = await app.inject({ method: 'POST', url: `/v1/tools/${reader.json().id}/test`, headers });
+    expect(readerHealth.statusCode, readerHealth.body).toBe(200);
+    expect(readerHealth.json()).toMatchObject({ status: 'healthy' });
+
+    const reddit = await app.inject({
+      method: 'POST', url: '/v1/tools/web/install', headers,
+      payload: { provider: 'reddit', clientId: 'integration-client', clientSecret: 'integration-reddit-secret', userAgent: 'macos:woody-integration:v0.1 (by /u/integration)', maxResults: 5 },
+    });
+    expect(reddit.statusCode, reddit.body).toBe(201);
+    expect(reddit.json()).toMatchObject({ name: 'Web · Reddit Search', permissions: ['web.read', 'reddit.read'] });
+    expect(JSON.stringify(reddit.json())).not.toContain('integration-reddit-secret');
+
+    const assigned = await app.inject({
+      method: 'PATCH', url: `/v1/agents/${agentId}`, headers,
+      payload: { capabilities: { webBrowser: true, codeInterpreter: false, knowledgeBase: true }, toolIds: [search.json().id, reader.json().id, reddit.json().id] },
+    });
+    expect(assigned.statusCode, assigned.body).toBe(200);
+    expect(assigned.json()).toMatchObject({ capabilities: { webBrowser: true }, tool_ids: [search.json().id, reader.json().id, reddit.json().id] });
+
+    const reconfiguredSearch = await app.inject({
+      method: 'POST', url: '/v1/tools/web/install', headers,
+      payload: { provider: 'searxng', endpoint: 'https://search2.example.com/search', safeSearch: 'moderate', maxResults: 4, blockedDomains: ['example.net'] },
+    });
+    expect(reconfiguredSearch.statusCode, reconfiguredSearch.body).toBe(200);
+    expect(reconfiguredSearch.json()).toMatchObject({ id: search.json().id, name: 'Web Search · SearXNG', enabled: true });
+    const assignedAfterRotation = await app.inject({ method: 'GET', url: `/v1/agents/${agentId}`, headers });
+    expect(assignedAfterRotation.statusCode, assignedAfterRotation.body).toBe(200);
+    expect(assignedAfterRotation.json().tool_ids).toContain(search.json().id);
+
+    const updatedCatalog = await app.inject({ method: 'GET', url: '/v1/tools/web/catalog', headers });
+    expect(updatedCatalog.statusCode, updatedCatalog.body).toBe(200);
+    expect(updatedCatalog.json().data).toContainEqual(expect.objectContaining({ id: 'searxng', installed: true }));
+
+    const { query } = await import('../src/db/client.js');
+    const stored = await query<{ config: unknown }>('SELECT config FROM tools WHERE id = ANY($1::uuid[]) ORDER BY id', [[search.json().id, reddit.json().id]]);
+    const encryptedConfigs = JSON.stringify(stored.rows.map((row) => row.config));
+    expect(encryptedConfigs).not.toContain('integration-reddit-secret');
+    expect(encryptedConfigs).not.toContain('search2.example.com');
+  });
+
+  it('installs a read-only job provider without exposing its credentials', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const catalog = await app.inject({ method: 'GET', url: '/v1/tools/jobs/catalog', headers });
+    expect(catalog.statusCode, catalog.body).toBe(200);
+    expect(catalog.json().data).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'adzuna', installed: false })]));
+    expect(catalog.body).not.toMatch(/appKey|appId|secret/i);
+    const installed = await app.inject({
+      method: 'POST', url: '/v1/tools/jobs/install', headers,
+      payload: { provider: 'adzuna', appId: 'woody-integration', appKey: 'adzuna-integration-secret', country: 'sg', maxResults: 5 },
+    });
+    expect(installed.statusCode, installed.body).toBe(201);
+    expect(installed.json()).toMatchObject({ name: 'Jobs · Adzuna Search', kind: 'internal', permissions: ['web.read', 'jobs.read'], enabled: true });
+    expect(JSON.stringify(installed.json())).not.toMatch(/woody-integration|adzuna-integration-secret/);
+    jobToolId = installed.json().id;
   });
 
   it('configures and reports a workspace AI budget without exposing credentials', async () => {
@@ -107,9 +266,30 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const headers = { authorization: `Bearer ${token}` };
     const catalog = await app.inject({ method: 'GET', url: '/v1/starter-solutions', headers });
     expect(catalog.statusCode, catalog.body).toBe(200);
-    expect(catalog.json().data).toHaveLength(10);
+    expect(catalog.json().data).toHaveLength(14);
     const starter = catalog.json().data.find((item: { slug: string }) => item.slug === 'deep-research-report');
     expect(starter).toBeTruthy();
+    const jobStarter = catalog.json().data.find((item: { slug: string }) => item.slug === 'job-opportunity-researcher');
+    expect(jobStarter).toMatchObject({ category: 'Tool-ready Agents', agents: [{ toolRequirements: [expect.objectContaining({ key: 'job_search' })] }] });
+
+    const missingJobTool = await app.inject({
+      method: 'POST',
+      url: '/v1/starter-solutions/job-opportunity-researcher/install',
+      headers,
+      payload: { allowDuplicate: false, toolIdsByAgentKey: {} },
+    });
+    expect(missingJobTool.statusCode, missingJobTool.body).toBe(400);
+    const installedJobStarter = await app.inject({
+      method: 'POST',
+      url: '/v1/starter-solutions/job-opportunity-researcher/install',
+      headers,
+      payload: { allowDuplicate: false, toolIdsByAgentKey: { agent_1: [jobToolId] } },
+    });
+    expect(installedJobStarter.statusCode, installedJobStarter.body).toBe(201);
+    const jobAgentId = installedJobStarter.json().resources.agentIds.agent_1;
+    const jobAgent = await app.inject({ method: 'GET', url: `/v1/agents/${jobAgentId}`, headers });
+    expect(jobAgent.statusCode, jobAgent.body).toBe(200);
+    expect(jobAgent.json()).toMatchObject({ status: 'draft', capabilities: { webBrowser: true }, tool_ids: [jobToolId] });
 
     const installed = await app.inject({
       method: 'POST',
@@ -360,7 +540,11 @@ describe.runIf(enabled)('database-backed API flow', () => {
       };
       throw new Error(`Workflow artifact generation did not finish: ${JSON.stringify({ run: body.status, output: body.output, artifacts: body.artifacts?.map(({ format, status, error_message }) => ({ format, status, error: error_message ?? null })), recentEvents: body.events?.slice(-4) })}`, { cause: error });
     }
-    expect(completedWorkflow.json()).toMatchObject({ run_mode: 'production', workflow_version_id: published.json().published_version_id });
+    expect(completedWorkflow.json()).toMatchObject({
+      run_mode: 'production',
+      workflow_version_id: published.json().published_version_id,
+      usage: { agentTasks: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+    });
     expect(completedWorkflow.json().output).toMatchObject({ topic: 'agents', done: true });
     expect(completedWorkflow.json().artifacts.map((item: { format: string }) => item.format).sort()).toEqual(['docx', 'pdf', 'pptx', 'xlsx']);
     const integrationApiUrl = (process.env.INTEGRATION_API_URL ?? 'http://localhost:3001').replace(/\/$/, '');
@@ -468,6 +652,15 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const taskWithArtifact = await app.inject({ method: 'GET', url: `/v1/tasks/${task.json().id}`, headers });
     expect(taskWithArtifact.statusCode, taskWithArtifact.body).toBe(200);
     expect(taskWithArtifact.json().artifacts).toEqual(expect.arrayContaining([expect.objectContaining({ format: 'pdf', status: 'pending' })]));
+    const taskIndex = await app.inject({ method: 'GET', url: '/v1/tasks', headers });
+    expect(taskIndex.statusCode, taskIndex.body).toBe(200);
+    expect(taskIndex.json().data).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: task.json().id,
+        workflow_name: null,
+        artifact_summary: expect.arrayContaining([expect.objectContaining({ format: 'pdf', status: 'pending' })]),
+      }),
+    ]));
     const memory = await app.inject({ method: 'POST', url: '/v1/memories', headers, payload: { agentId, kind: 'knowledge', content: 'Focus on credible sources.', importance: 0.8 } });
     expect(memory.statusCode, memory.body).toBe(201);
     const document = await app.inject({ method: 'POST', url: '/v1/knowledge/documents', headers, payload: { name: 'Notes', sourceType: 'text', content: 'AI agents can use tools and workflows.' } });
@@ -485,6 +678,11 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const analytics = await app.inject({ method: 'GET', url: '/v1/analytics/overview', headers });
     expect(analytics.statusCode, analytics.body).toBe(200);
     expect(analytics.json()).toHaveProperty('agents');
+    const rangedAnalytics = await app.inject({ method: 'GET', url: '/v1/analytics/overview?days=7', headers });
+    expect(rangedAnalytics.statusCode, rangedAnalytics.body).toBe(200);
+    expect(rangedAnalytics.json()).toMatchObject({ range: { days: 7, timezone: 'UTC' } });
+    expect(rangedAnalytics.json().daily).toEqual(expect.any(Array));
+    expect(rangedAnalytics.json().agent_effectiveness).toEqual(expect.arrayContaining([expect.objectContaining({ agent_id: agentId })]));
   }, 30_000);
 
   it('blocks new AI work after an enforced local budget is exhausted', async () => {

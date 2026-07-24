@@ -17,6 +17,9 @@ export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema>;
 export type ConditionOperator = 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal' | 'contains' | 'exists' | 'not_exists';
 const conditionOperators = new Set<ConditionOperator>(['equals', 'not_equals', 'greater_than', 'greater_or_equal', 'less_than', 'less_or_equal', 'contains', 'exists', 'not_exists']);
 const artifactFormats = new Set(['pdf', 'docx', 'pptx', 'xlsx']);
+const safePathPattern = /^(?:input|variables)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+])*$/;
+const safeNodePathPattern = /^nodes\.([A-Za-z][A-Za-z0-9_-]*)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+])*$/;
+const safeLegacyPathPattern = /^([A-Za-z_][A-Za-z0-9_-]*)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+])*$/;
 
 export function valueAtPath(root: unknown, path: string): unknown {
   if (!path.trim()) return undefined;
@@ -48,6 +51,50 @@ export function evaluateCondition(config: Record<string, unknown>, state: Record
   if (operator === 'greater_or_equal') return actual >= expected;
   if (operator === 'less_than') return actual < expected;
   return actual <= expected;
+}
+
+function templatePaths(value: unknown, paths: string[] = []): { paths: string[]; malformed: boolean } {
+  let malformed = false;
+  if (typeof value === 'string') {
+    const matched: string[] = [];
+    const remainder = value.replace(/\{\{\s*([^{}]+?)\s*}}/g, (_, path: string) => { matched.push(path.trim()); return ''; });
+    paths.push(...matched);
+    malformed ||= remainder.includes('{{') || remainder.includes('}}');
+  } else if (Array.isArray(value)) {
+    for (const item of value) malformed ||= templatePaths(item, paths).malformed;
+  } else if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>)) malformed ||= templatePaths(item, paths).malformed;
+  }
+  return { paths, malformed };
+}
+
+function dataReferenceErrors(node: WorkflowNode, ancestors: Set<string>, known: Set<string>) {
+  const errors: string[] = [];
+  const values: unknown[] = [];
+  if (['action', 'api_action', 'mcp_action'].includes(node.type)) values.push(node.config.input);
+  if (node.type === 'knowledge_search') values.push(node.config.query);
+  if (node.type === 'condition') values.push(`{{ ${String(node.config.path ?? '')} }}`);
+  if (node.type === 'loop') {
+    if (String(node.config.mode ?? 'forEach') === 'forEach') values.push(`{{ ${String(node.config.collectionPath ?? '')} }}`);
+    else if (node.config.condition && typeof node.config.condition === 'object' && !Array.isArray(node.config.condition)) values.push(`{{ ${String((node.config.condition as Record<string, unknown>).path ?? '')} }}`);
+  }
+  for (const value of values) {
+    const references = templatePaths(value);
+    if (references.malformed) errors.push(`Node ${node.id} contains malformed safe data reference syntax`);
+    for (const path of references.paths) {
+      const nodeMatch = path.match(safeNodePathPattern);
+      const legacyMatch = path.match(safeLegacyPathPattern);
+      if (!safePathPattern.test(path) && !nodeMatch && !legacyMatch) {
+        errors.push(`Node ${node.id} data reference ${path || '(empty)'} is not a safe input, variables, or nodes path`);
+        continue;
+      }
+      const referencedNodeId = nodeMatch?.[1] ?? (legacyMatch && known.has(legacyMatch[1]) ? legacyMatch[1] : null);
+      if (!referencedNodeId) continue;
+      if (!known.has(referencedNodeId)) errors.push(`Node ${node.id} data reference points to missing node ${referencedNodeId}`);
+      else if (!ancestors.has(referencedNodeId)) errors.push(`Node ${node.id} can reference only upstream node outputs (${referencedNodeId} is not upstream)`);
+    }
+  }
+  return errors;
 }
 
 function conditionConfigErrors(node: WorkflowNode) {
@@ -135,6 +182,20 @@ export function workflowDefinitionErrors(definition: WorkflowDefinition) {
     }
     errors.push(...workflowNodeConfigErrors(node));
     errors.push(...retryConfigErrors(node));
+  }
+
+  if (known.size === ids.length && definition.edges.every((edge) => known.has(edge.source) && known.has(edge.target))) {
+    for (const node of definition.nodes) {
+      const ancestors = new Set<string>();
+      const pending = definition.edges.filter((edge) => edge.target === node.id).map((edge) => edge.source);
+      while (pending.length) {
+        const id = pending.pop()!;
+        if (ancestors.has(id)) continue;
+        ancestors.add(id);
+        for (const edge of definition.edges) if (edge.target === id && !ancestors.has(edge.source)) pending.push(edge.source);
+      }
+      errors.push(...dataReferenceErrors(node, ancestors, known));
+    }
   }
 
   for (const edge of definition.edges) {

@@ -2,6 +2,8 @@ import { lookup } from 'node:dns/promises';
 import { decryptJson } from '../lib/crypto.js';
 import { isPublicIp } from '../lib/network.js';
 import type { Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
+import { invokeJobTool, isJobToolConfig } from './jobs/index.js';
+import { invokeWebTool, isWebToolConfig } from './web/index.js';
 
 export type StoredConfig = { version: 1; iv: string; tag: string; data: string };
 export type ToolRecord = { id: string; name: string; kind: 'mcp' | 'api' | 'plugin' | 'internal'; config: StoredConfig; permissions: string[] };
@@ -55,6 +57,8 @@ export function definitionFor(tool: ToolRecord): Tool {
 
 export async function invokeTool(tool: ToolRecord, input: Record<string, unknown>, healthCheck = false) {
   const config = decryptJson(tool.config);
+  if (isWebToolConfig(config)) return invokeWebTool(config, input, healthCheck);
+  if (isJobToolConfig(config)) return invokeJobTool(config, input, healthCheck);
   const healthUrl = config.healthCheckUrl;
   if (healthCheck && typeof healthUrl !== 'string') throw new Error('A healthCheckUrl is required to test this tool safely');
   const endpoint = await safeEndpoint(String(healthCheck ? healthUrl : config.endpoint ?? ''));

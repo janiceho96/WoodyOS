@@ -1,4 +1,4 @@
-import { workflowNodeDefinition } from '../registry.js';
+import { workflowNodeDefinition, type WorkflowNodeAdapter } from '../registry.js';
 import { executeAgentNode } from './agent.js';
 import { executeApiActionNode } from './api.js';
 import { executeFileNode } from './file.js';
@@ -8,7 +8,7 @@ import { executeLogicNode } from './logic.js';
 import { executeMcpActionNode } from './mcp.js';
 import type { WorkflowAdapterContext, WorkflowAdapterExecution, WorkflowNodeExecutor } from './types.js';
 
-const executors = {
+const executors: Partial<Record<WorkflowNodeAdapter, WorkflowNodeExecutor>> = {
   logic: executeLogicNode,
   agent: executeAgentNode,
   legacy_tool: executeLegacyToolNode,
@@ -16,7 +16,7 @@ const executors = {
   mcp: executeMcpActionNode,
   knowledge: executeKnowledgeSearchNode,
   file: executeFileNode,
-} satisfies Record<string, WorkflowNodeExecutor>;
+};
 
 export async function executeRegisteredWorkflowNode(context: WorkflowAdapterContext): Promise<WorkflowAdapterExecution> {
   const definition = workflowNodeDefinition(context.node.type);

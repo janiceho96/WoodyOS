@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, BookOpen, CheckCircle2, Database, Eye, FileCode2, FileText, HardDriveUpload, Info, LoaderCircle, Search, Sparkles, Trash2, Upload } from 'lucide-react';
 import { type DragEvent, type FormEvent, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api, type Document, type KnowledgeDocumentDetail, type KnowledgeResult } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState, Modal, PageHeader, Status } from '../../components/ui';
@@ -46,7 +47,7 @@ export function KnowledgePage({ openText }: { openText: () => void }) {
 
   return <div className="knowledge-page knowledge-redesign">
     <PageHeader eyebrow="Resources" title="Knowledge" description="Trusted workspace context your enabled agents can retrieve when it is relevant." actions={<button className="button" onClick={openText}><FileText size={15}/>Add text</button>}/>
-    <section className="knowledge-overview"><article className="panel"><Database size={19}/><span><small>Ready to retrieve</small><strong>{ready}</strong><em>indexed documents</em></span></article><article className="panel"><LoaderCircle size={19} className={processing ? 'spin' : ''}/><span><small>Processing</small><strong>{processing}</strong><em>upload or indexing jobs</em></span></article><article className="panel knowledge-scope"><Info size={19}/><span><strong>Workspace-wide access</strong><em>Agents with Knowledge enabled may search this workspace’s indexed documents.</em></span></article></section>
+    <section className="knowledge-overview"><article className="panel"><Database size={19}/><span><small>Ready for agents</small><strong>{ready}</strong><em>indexed documents</em></span></article><article className="panel"><LoaderCircle size={19} className={processing ? 'spin' : ''}/><span><small>Processing</small><strong>{processing}</strong><em>upload or indexing jobs</em></span></article><article className="panel knowledge-scope"><Info size={19}/><span><strong>Workspace-wide library</strong><em>Only agents with Knowledge enabled can retrieve these documents.</em><Link to="/agents">Review agent access</Link></span></article></section>
     <section className={`upload-zone ${upload.isPending ? 'busy' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={drop}>
       <input ref={fileRef} type="file" accept={accepted} onChange={(event) => receiveFile(event.target.files?.[0])}/>
       <span>{upload.isPending ? <LoaderCircle className="spin" size={28}/> : <HardDriveUpload size={28}/>}</span><h2>{upload.isPending ? 'Uploading and preparing your document…' : 'Drop a file to add trusted context'}</h2><p>Woody extracts text, creates chunks, and indexes them for retrieval. PDF, DOCX, Excel, CSV, TXT, Markdown, and images up to 25 MB.</p><div><button className="button primary" onClick={() => fileRef.current?.click()} disabled={upload.isPending}><Upload size={15}/>Choose file</button><button className="text-button" onClick={openText}>Paste text instead</button></div>

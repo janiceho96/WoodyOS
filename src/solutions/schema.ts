@@ -12,6 +12,13 @@ const capabilities = z.object({
   codeInterpreter: z.boolean().default(false),
   knowledgeBase: z.boolean().default(true),
 });
+const toolRequirement = z.object({
+  key,
+  label: z.string().min(2).max(120),
+  purpose: z.string().min(2).max(500),
+  permissions: z.array(z.string().min(2).max(160)).min(1).max(10),
+  required: z.boolean().default(true),
+});
 
 export const solutionAgentSchema = z.object({
   key,
@@ -23,6 +30,7 @@ export const solutionAgentSchema = z.object({
   model: z.string().min(2).max(160).optional(),
   modelConfig: modelConfig.default({ temperature: 0.2, maxTokens: 4096, topP: 1 }),
   capabilities: capabilities.default({ webBrowser: false, codeInterpreter: false, knowledgeBase: true }),
+  toolRequirements: z.array(toolRequirement).max(10).default([]),
 });
 
 export const solutionWorkflowNodeSchema = z.object({

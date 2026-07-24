@@ -4,6 +4,10 @@ import { useNavigate } from 'react-router-dom';
 import { EmptyState, Status } from '../../components/ui';
 import { compact, duration, relative, taskCost } from '../../lib/format';
 import { useWorkspace } from '../../app/workspace';
+import { AgentAvatar } from '../../components/agents/AgentAvatar';
+import type { Task } from '../../api';
+
+const taskAgent = (task: Task) => ({ id: task.agent_id, name: task.agent_name ?? 'AI agent', role: task.agent_role ?? 'AI agent', avatar_config: task.agent_avatar ?? {}, updated_at: task.updated_at });
 
 const goalExamples = [
   'Build a research team',
@@ -27,7 +31,7 @@ export function DashboardPage({ openTask, openAgent }: { openTask: () => void; o
     event.preventDefault();
     const clean = goal.trim();
     if (!clean) return;
-    navigate(`/solutions?tab=generate&prompt=${encodeURIComponent(clean)}`);
+    navigate(`/agents/library?tab=generate&prompt=${encodeURIComponent(clean)}`);
   };
   const metrics = [
     { label: 'Active agents', value: analytics?.agents.active_agents ?? '0', Icon: Bot, tone: 'indigo' },
@@ -49,7 +53,7 @@ export function DashboardPage({ openTask, openAgent }: { openTask: () => void; o
     <section className="home-focus-grid">
       <article className="panel attention-card">
         <div className="panel-header"><div><span className="eyebrow">Your workspace</span><h2>{failed.length ? 'Work needs attention' : active.length ? 'Work in progress' : 'Ready for your next goal'}</h2></div>{failed.length ? <CircleAlert className="danger-text" size={20}/> : <Activity className="primary-text" size={20}/>}</div>
-        {failed.length ? <div className="focus-list">{failed.slice(0, 3).map((task) => <button key={task.id} onClick={() => navigate(`/executions?task=${task.id}`)}><Status value={task.status}/><span><strong>{task.title}</strong><small>{task.agent_name ?? 'AI agent'} · {relative(task.updated_at)}</small></span><ChevronRight size={16}/></button>)}</div> : active.length ? <div className="focus-list">{active.slice(0, 3).map((task) => <button key={task.id} onClick={() => navigate(`/executions?task=${task.id}`)}><Status value={task.status}/><span><strong>{task.title}</strong><small>{task.agent_name ?? 'AI agent'} · started {relative(task.created_at)}</small></span><ChevronRight size={16}/></button>)}</div> : <div className="focus-empty"><p>Create from a goal, run an existing agent, or start with a proven template.</p><div><button className="button primary" onClick={openTask}><Play size={15}/>Run a task</button><button className="button" onClick={() => navigate('/solutions')}><Sparkles size={15}/>Browse templates</button></div></div>}
+        {failed.length ? <div className="focus-list">{failed.slice(0, 3).map((task) => <button key={task.id} onClick={() => navigate(`/agents/${task.agent_id}?section=workspace&task=${task.id}`)}><AgentAvatar agent={taskAgent(task)} size="sm" status="error" decorative/><span><strong>{task.title}</strong><small>{task.agent_name ?? 'AI agent'} · {relative(task.updated_at)}</small></span><ChevronRight size={16}/></button>)}</div> : active.length ? <div className="focus-list">{active.slice(0, 3).map((task) => <button key={task.id} onClick={() => navigate(`/agents/${task.agent_id}?section=workspace&task=${task.id}`)}><AgentAvatar agent={taskAgent(task)} size="sm" status="busy" decorative/><span><strong>{task.title}</strong><small>{task.agent_name ?? 'AI agent'} · started {relative(task.created_at)}</small></span><ChevronRight size={16}/></button>)}</div> : <div className="focus-empty"><p>Create from a goal, run an existing agent, or start with a proven template.</p><div><button className="button primary" onClick={openTask}><Play size={15}/>Run a task</button><button className="button" onClick={() => navigate('/agents/library')}><Sparkles size={15}/>Browse Agent Library</button></div></div>}
       </article>
       <article className="panel workspace-summary">
         <div className="panel-header"><div><span className="eyebrow">System summary</span><h2>Healthy and ready</h2></div><Status value={failed.length ? 'monitoring' : 'active'}/></div>
@@ -60,12 +64,16 @@ export function DashboardPage({ openTask, openAgent }: { openTask: () => void; o
 
     <section className="dashboard-lower home-lower">
       <article className="panel activity-panel">
-        <div className="panel-header"><div><span className="eyebrow">Recent work</span><h2>Runs and outputs</h2></div><button className="text-button" onClick={() => navigate('/executions')}>View all <ArrowRight size={14}/></button></div>
-        {data.tasks.length ? <div className="activity-list">{data.tasks.slice(0, 6).map((task) => <button key={task.id} onClick={() => navigate(`/executions?task=${task.id}`)}><Status value={task.status}/><span><strong>{task.title}</strong><small>{task.agent_name ?? 'AI agent'} · {relative(task.created_at)}</small></span><span className="mono">{task.duration_ms ? duration(task.duration_ms) : task.status}</span><ChevronRight size={16}/></button>)}</div> : <EmptyState Icon={Activity} title="No runs yet" text="Give an agent its first focused task." action={<button className="button primary" onClick={openTask}>Run first task</button>}/>} 
+        <div className="panel-header"><div><span className="eyebrow">Recent work</span><h2>Outputs</h2></div><button className="text-button" onClick={() => navigate('/executions')}>View all <ArrowRight size={14}/></button></div>
+        {data.tasks.length ? <div className="activity-list">{data.tasks.slice(0, 6).map((task) => <button key={task.id} onClick={() => navigate(`/executions?task=${task.id}`)}>
+          <AgentAvatar agent={taskAgent(task)} size="sm" status={task.status === 'failed' ? 'error' : task.status === 'running' ? 'busy' : undefined} decorative/>
+          <span><strong>{task.title}</strong><small>{task.agent_name ?? 'AI agent'} · {relative(task.created_at)}</small></span>
+          <span className="mono">{task.duration_ms ? duration(task.duration_ms) : task.status}</span><ChevronRight size={16}/>
+        </button>)}</div> : <EmptyState Icon={Activity} title="No outputs yet" text="Give an agent its first focused task." action={<button className="button primary" onClick={openTask}>Run first task</button>}/>}
       </article>
       <article className="panel next-actions">
         <div className="panel-header"><div><span className="eyebrow">Next steps</span><h2>Build with context</h2></div></div>
-        {[{ title: 'Create an agent', text: 'Define one specialist', Icon: Bot, action: openAgent }, { title: 'Add knowledge', text: 'Ground work in trusted context', Icon: Database, action: () => navigate('/knowledge') }, { title: 'Design a workflow', text: 'Connect repeatable steps', Icon: GitBranch, action: () => navigate('/workflows') }, { title: 'Review outputs', text: `${completed.length} completed runs`, Icon: FileOutput, action: () => navigate('/executions') }].map(({ title, text, Icon, action }) => <button key={title} onClick={action}><span><Icon size={17}/></span><div><strong>{title}</strong><small>{text}</small></div><ChevronRight size={15}/></button>)}
+        {[{ title: 'Create an agent', text: 'Define one specialist', Icon: Bot, action: openAgent }, { title: 'Add knowledge', text: 'Ground work in trusted context', Icon: Database, action: () => navigate('/knowledge') }, { title: 'Design a workflow', text: 'Connect repeatable steps', Icon: GitBranch, action: () => navigate('/workflows') }, { title: 'Review outputs', text: `${completed.length} completed outputs`, Icon: FileOutput, action: () => navigate('/executions') }].map(({ title, text, Icon, action }) => <button key={title} onClick={action}><span><Icon size={17}/></span><div><strong>{title}</strong><small>{text}</small></div><ChevronRight size={15}/></button>)}
       </article>
     </section>
   </div>;

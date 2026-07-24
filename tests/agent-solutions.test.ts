@@ -5,14 +5,48 @@ import { materializeWorkflowDefinition } from '../src/solutions/installer.js';
 import { parseAgentSolution, solutionValidationErrors } from '../src/solutions/schema.js';
 
 describe('AgentSolution contract', () => {
-  it('validates all ten production starter solutions', () => {
-    expect(starterSolutions).toHaveLength(10);
-    expect(new Set(starterSolutions.map((solution) => solution.slug)).size).toBe(10);
+  it('validates all production starter solutions', () => {
+    expect(starterSolutions).toHaveLength(14);
+    expect(new Set(starterSolutions.map((solution) => solution.slug)).size).toBe(14);
     for (const solution of starterSolutions) {
       expect(() => parseAgentSolution(solution)).not.toThrow();
-      expect(solution.agents).toHaveLength(4);
-      expect(solution.workflow.nodes.filter((node) => node.type === 'agent')).toHaveLength(4);
+      expect(solution.agents.length).toBeGreaterThanOrEqual(1);
+      expect(solution.workflow.nodes.filter((node) => node.type === 'agent')).toHaveLength(solution.agents.length);
       expect(solution.requiredPermissions.every((permission) => permission.level === 'read')).toBe(true);
+    }
+  });
+
+  it('provides four least-privilege, single-agent tool-ready templates', () => {
+    const templates = starterSolutions.filter((solution) => solution.category === 'Tool-ready Agents');
+    expect(templates).toHaveLength(4);
+    for (const solution of templates) {
+      expect(solution.agents).toHaveLength(1);
+      expect(solution.estimatedModelCalls).toBe(1);
+      expect(solution.agents[0].capabilities.webBrowser).toBe(true);
+      expect(solution.agents[0].toolRequirements.length).toBeGreaterThan(0);
+      expect(solution.agents[0].toolRequirements.every((requirement) => requirement.required)).toBe(true);
+      expect(solution.recommendedIntegrations.every((integration) => integration.permission === 'read')).toBe(true);
+    }
+    expect(templates.find((solution) => solution.slug === 'job-opportunity-researcher')?.agents[0].toolRequirements)
+      .toContainEqual(expect.objectContaining({ permissions: ['jobs.read'] }));
+    expect(templates.find((solution) => solution.slug === 'community-insights-researcher')?.agents[0].toolRequirements)
+      .toContainEqual(expect.objectContaining({ permissions: ['reddit.read'] }));
+  });
+
+  it('declares web research as an optional, read-only dependency for internet research starters', () => {
+    for (const slug of ['deep-research-report', 'competitor-intelligence', 'content-campaign-studio']) {
+      const solution = starterSolutions.find((item) => item.slug === slug);
+      expect(solution?.recommendedIntegrations).toContainEqual(expect.objectContaining({
+        id: 'web-search',
+        name: 'Web Research',
+        permission: 'read',
+        required: false,
+      }));
+      expect(solution?.requiredPermissions).toContainEqual(expect.objectContaining({
+        resource: 'Web Research',
+        level: 'read',
+        requiresConfirmation: false,
+      }));
     }
   });
 
@@ -51,6 +85,15 @@ describe('AgentSolution contract', () => {
     });
     expect(solution.agents).toHaveLength(4);
     expect(solution.agents.every((agent) => agent.model === undefined)).toBe(true);
+  });
+
+  it('extracts a complete proposal after provider reasoning and unwraps common response envelopes', () => {
+    const generated = structuredClone(starterSolutions[2]) as unknown as Record<string, unknown>;
+    generated.name = 'Wrapped Research System';
+    const response = `<think>{"draft":true}</think>\n${JSON.stringify({ solution: generated })}`;
+    const solution = parseCompilerOutput(response, 'multi');
+    expect(solution).toMatchObject({ name: 'Wrapped Research System', slug: 'wrapped-research-system', source: 'generated' });
+    expect(solution.agents).toHaveLength(4);
   });
 
   it('enforces requested single-versus-multi compiler mode', () => {

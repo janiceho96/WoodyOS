@@ -34,9 +34,9 @@ describe('MCP agent permissions', () => {
     expect(() => assertMcpPermission(tool({ risk_level: 'write' }))).toThrowError(/read-only access/);
   });
 
-  it('requires confirmation for destructive, external-write and unknown tools', () => {
+  it('requires confirmation for every non-read tool', () => {
     expect(mcpRequiresConfirmation(tool({ risk_level: 'read' }))).toBe(false);
-    expect(mcpRequiresConfirmation(tool({ risk_level: 'write' }))).toBe(false);
+    expect(mcpRequiresConfirmation(tool({ risk_level: 'write', connection_permission: 'read_write', tool_permission: 'read_write' }))).toBe(true);
     expect(mcpRequiresConfirmation(tool({ risk_level: 'external_write', connection_permission: 'read_write', tool_permission: 'read_write' }))).toBe(true);
     expect(mcpRequiresConfirmation(tool({ risk_level: 'destructive', connection_permission: 'read_write', tool_permission: 'read_write' }))).toBe(true);
     expect(mcpRequiresConfirmation(tool({ risk_level: 'unknown', connection_permission: 'read_write', tool_permission: 'read_write' }))).toBe(true);

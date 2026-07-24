@@ -12,6 +12,7 @@ import { ToolsPage } from './features/tools/ToolsPage';
 const McpMarketplacePage = lazy(() => import('./features/mcp/McpMarketplacePage').then((module) => ({ default: module.McpMarketplacePage })));
 const AgentBuilderPage = lazy(() => import('./features/agents/AgentBuilderPage').then((module) => ({ default: module.AgentBuilderPage })));
 const AgentsPage = lazy(() => import('./features/agents/AgentsPage').then((module) => ({ default: module.AgentsPage })));
+const AgentWorkspacePage = lazy(() => import('./features/agents/AgentWorkspacePage').then((module) => ({ default: module.AgentWorkspacePage })));
 const AnalyticsPage = lazy(() => import('./features/analytics/AnalyticsPage').then((module) => ({ default: module.AnalyticsPage })));
 const DashboardPage = lazy(() => import('./features/dashboard/DashboardPage').then((module) => ({ default: module.DashboardPage })));
 const SettingsPage = lazy(() => import('./features/settings/SettingsPage').then((module) => ({ default: module.SettingsPage })));
@@ -35,8 +36,10 @@ function RoutedApp() {
     <Route index element={<Navigate to="/dashboard" replace/>}/>
     <Route path="/dashboard" element={<DashboardRoute/>}/>
     <Route path="/agents" element={<AgentsPage/>}/>
+    <Route path="/agents/library" element={<StarterSolutionsPage/>}/>
     <Route path="/agents/new" element={<AgentBuilderPage/>}/>
     <Route path="/agents/:agentId/edit" element={<AgentBuilderPage/>}/>
+    <Route path="/agents/:agentId" element={<AgentWorkspacePage/>}/>
     <Route path="/executions" element={<ExecutionRoute/>}/>
     <Route path="/workflows" element={<WorkflowsPage/>}/>
     <Route path="/solutions" element={<StarterSolutionsPage/>}/>

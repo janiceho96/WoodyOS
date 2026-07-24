@@ -37,11 +37,16 @@ export type WorkspaceContextValue = {
   refresh: () => Promise<unknown>;
   notice: string;
   error: string;
-  report: (message: string) => void;
+  report: (message: string, action?: NoticeAction) => void;
   reportError: (message: string) => void;
   clearMessage: () => void;
   signOut: () => void;
   openOnboarding: () => void;
+};
+
+export type NoticeAction = {
+  label: string;
+  onClick: () => void;
 };
 
 export const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);

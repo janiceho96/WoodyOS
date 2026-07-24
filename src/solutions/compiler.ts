@@ -1,4 +1,4 @@
-import { assertConfiguredAiProvider, configuredAiProvider } from '../lib/ai-provider.js';
+import { assertConfiguredAiProvider, configuredAiProvider, configuredAiProviderForWorkspace } from '../lib/ai-provider.js';
 import { assertWorkspaceAiBudgetAvailable, recordAiUsage } from '../lib/ai-usage.js';
 import type { AgentSolution } from './schema.js';
 import { parseAgentSolution } from './schema.js';
@@ -32,16 +32,57 @@ function providerError(cause: unknown) {
 
 function jsonFromText(text: string) {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
-  const candidate = fenced ?? trimmed.slice(trimmed.indexOf('{'), trimmed.lastIndexOf('}') + 1);
-  if (!candidate.startsWith('{') || !candidate.endsWith('}')) {
-    throw Object.assign(new Error('PROMPT_COMPILER_INVALID_RESPONSE'), { statusCode: 502 });
+  const candidates: string[] = [];
+  const fenced = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1].trim());
+  candidates.push(...fenced.reverse(), trimmed);
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  const balanced: string[] = [];
+  for (let index = 0; index < trimmed.length; index++) {
+    const character = trimmed[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') { inString = true; continue; }
+    if (character === '{') {
+      if (depth === 0) start = index;
+      depth++;
+    } else if (character === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        balanced.push(trimmed.slice(start, index + 1));
+        start = -1;
+      }
+    }
   }
-  try {
-    return JSON.parse(candidate) as unknown;
-  } catch {
-    throw Object.assign(new Error('PROMPT_COMPILER_INVALID_JSON'), { statusCode: 502 });
+  candidates.push(...balanced.reverse());
+  for (const candidate of [...new Set(candidates)]) {
+    if (!candidate.startsWith('{') || !candidate.endsWith('}')) continue;
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // Try the next complete object. Some compatible providers prepend reasoning containing JSON fragments.
+    }
   }
+  const error = balanced.length || fenced.length ? 'PROMPT_COMPILER_INVALID_JSON' : 'PROMPT_COMPILER_INVALID_RESPONSE';
+  throw Object.assign(new Error(error), { statusCode: 502 });
+}
+
+function unwrapCompilerObject(raw: Record<string, unknown>) {
+  for (const key of ['solution', 'agentSolution', 'agent_solution', 'result', 'data']) {
+    const nested = raw[key];
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+      const candidate = nested as Record<string, unknown>;
+      if (Array.isArray(candidate.agents) || (candidate.workflow && typeof candidate.workflow === 'object')) return candidate;
+    }
+  }
+  return raw;
 }
 
 export function parseCompilerOutput(text: string, mode: CompileMode): AgentSolution {
@@ -49,7 +90,7 @@ export function parseCompilerOutput(text: string, mode: CompileMode): AgentSolut
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw Object.assign(new Error('PROMPT_COMPILER_INVALID_RESPONSE'), { statusCode: 502 });
   }
-  const candidate = { ...(raw as Record<string, unknown>) };
+  const candidate = { ...unwrapCompilerObject(raw as Record<string, unknown>) };
   candidate.source = 'generated';
   candidate.version = 1;
   if (typeof candidate.name === 'string') candidate.slug = slugifySolutionName(candidate.name);
@@ -148,68 +189,72 @@ export async function compileAgentSolution(prompt: string, mode: CompileMode, wo
     throw Object.assign(new Error('PROMPT_CONTAINS_POSSIBLE_SECRET'), { statusCode: 400 });
   }
   if (workspaceId) await assertWorkspaceAiBudgetAvailable(workspaceId);
-  const runtime = assertConfiguredAiProvider(configuredAiProvider());
+  const runtime = assertConfiguredAiProvider(workspaceId ? await configuredAiProviderForWorkspace(workspaceId) : configuredAiProvider());
   const provider = runtime.provider;
   const model = runtime.defaultModel;
   const system = compilerSystemPrompt(mode);
   const input = `<untrusted_user_prompt>\n${prompt}\n</untrusted_user_prompt>`;
-  let text = '';
-
-  if (runtime.anthropic) {
-    let result;
-    try {
-      result = await runtime.anthropic.messages.create({
-        model,
-        max_tokens: 8_000,
-        temperature: 0.1,
-        system,
-        messages: [{ role: 'user', content: input }],
-      }).withResponse();
-    } catch (cause) {
-      throw providerError(cause);
+  const requestText = async (userContent: string) => {
+    if (runtime.anthropic) {
+      let result;
+      try {
+        result = await runtime.anthropic.messages.create({
+          model,
+          max_tokens: 8_000,
+          temperature: 0.1,
+          system,
+          messages: [{ role: 'user', content: userContent }],
+        }).withResponse();
+      } catch (cause) {
+        throw providerError(cause);
+      }
+      const response = result.data;
+      if (workspaceId) await recordAiUsage({
+        workspaceId, source: 'prompt_compiler', provider, model, requestId: result.request_id,
+        inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens, headers: result.response.headers,
+      });
+      return response.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
     }
-    const response = result.data;
-    text = response.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
-    if (workspaceId) await recordAiUsage({
-      workspaceId,
-      source: 'prompt_compiler',
-      provider,
-      model,
-      requestId: result.request_id,
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
-      headers: result.response.headers,
-    });
-  } else if (runtime.openAiCompatible) {
-    let result;
-    try {
-      result = await runtime.openAiCompatible.chat.completions.create({
+    if (runtime.openAiCompatible) {
+      const create = (jsonMode: boolean) => runtime.openAiCompatible!.chat.completions.create({
         model,
         temperature: 0.1,
         max_tokens: 8_000,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: input }],
+        messages: [{ role: 'system', content: system }, { role: 'user', content: userContent }],
+        response_format: jsonMode ? { type: 'json_object' } : undefined,
       }).withResponse();
-    } catch (cause) {
-      throw providerError(cause);
+      let result;
+      try {
+        result = await create(true);
+      } catch (cause) {
+        const status = typeof cause === 'object' && cause && 'status' in cause ? Number((cause as { status?: unknown }).status) : 0;
+        if (status !== 400 && status !== 422) throw providerError(cause);
+        try { result = await create(false); } catch (fallbackCause) { throw providerError(fallbackCause); }
+      }
+      const response = result.data;
+      if (workspaceId) await recordAiUsage({
+        workspaceId, source: 'prompt_compiler', provider, model, requestId: result.request_id,
+        inputTokens: response.usage?.prompt_tokens ?? 0, outputTokens: response.usage?.completion_tokens ?? 0, headers: result.response.headers,
+      });
+      return response.choices[0]?.message?.content ?? '';
     }
-    const response = result.data;
-    text = response.choices[0]?.message?.content ?? '';
-    if (workspaceId) await recordAiUsage({
-      workspaceId,
-      source: 'prompt_compiler',
-      provider,
-      model,
-      requestId: result.request_id,
-      inputTokens: response.usage?.prompt_tokens ?? 0,
-      outputTokens: response.usage?.completion_tokens ?? 0,
-      headers: result.response.headers,
-    });
-  }
+    return '';
+  };
 
+  const firstText = await requestText(input);
   try {
-    return parseCompilerOutput(text, mode);
-  } catch (cause) {
-    if (cause && typeof cause === 'object' && 'statusCode' in cause) throw cause;
-    throw Object.assign(new Error('PROMPT_COMPILER_INVALID_RESPONSE'), { statusCode: 502 });
+    return parseCompilerOutput(firstText, mode);
+  } catch (firstCause) {
+    if (containsLikelySecret(firstText)) throw Object.assign(new Error('PROMPT_COMPILER_RETURNED_SECRET'), { statusCode: 502 });
+    if (workspaceId) await assertWorkspaceAiBudgetAvailable(workspaceId);
+    const repair = `${input}\n\nYour previous response was rejected because it was not one complete AgentSolution matching the required JSON contract. Regenerate it from scratch. Return one JSON object only. Do not add reasoning, markdown fences, wrapper keys, unsupported action nodes, or model names. For any integration that creates or changes external data, declare read_write permission, add a reachable approval node immediately before output, and add a precise human approval requirement.`;
+    const repairedText = await requestText(repair);
+    try {
+      return parseCompilerOutput(repairedText, mode);
+    } catch (repairCause) {
+      if (repairCause && typeof repairCause === 'object' && 'statusCode' in repairCause) throw repairCause;
+      if (firstCause && typeof firstCause === 'object' && 'statusCode' in firstCause) throw firstCause;
+      throw Object.assign(new Error('PROMPT_COMPILER_INVALID_RESPONSE'), { statusCode: 502 });
+    }
   }
 }

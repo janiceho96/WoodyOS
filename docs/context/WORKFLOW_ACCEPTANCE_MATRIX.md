@@ -5,10 +5,10 @@ Use this matrix to verify the production workflow objective. A checked box needs
 ## Foundation and safety
 
 - [x] Server-side registry owns every supported node type, metadata, schema, ports, risk, and adapter selection.
-- [ ] Graph-level validation rejects invalid topology, unsafe cycles, missing resources, and invalid data references.
+- [x] Graph-level validation rejects invalid topology, unsafe cycles, missing resources, and invalid data references.
 - [x] Node-specific configuration and inspector fields come from the sanitized server registry; the client retains only immediate graph feedback.
 - [x] Agent, API, MCP, Knowledge, Logic, and File adapters exist behind a common contract.
-- [x] Browser is intentionally absent until an isolated policy-enforced runtime exists; there is no fake runnable browser node.
+- [x] Browser is visible in Advanced mode but intentionally locked until an isolated policy-enforced runtime exists; there is no fake runnable browser node.
 - [x] Workflows store resource references only; credentials and encrypted configuration remain backend-only.
 - [x] Loops have hard iteration limits; model work honors workspace budget controls.
 - [ ] External/destructive/unknown writes pass through one action gateway and require confirmation bound to the run, node, iteration, attempt, operation, argument hash, and expiry; they do not auto-retry.
@@ -43,7 +43,7 @@ Use this matrix to verify the production workflow objective. A checked box needs
 - [x] Root TypeScript build passes.
 - [x] Focused workflow unit tests pass.
 - [ ] Database-backed workflow integration tests pass.
-- [x] Stitch frontend build and lint pass (four pre-existing hook-dependency warnings remain outside the workflow implementation).
+- [x] Stitch frontend build and lint pass without warnings.
 - [ ] Docker rebuild succeeds.
 - [ ] Changed workflow UI has been visually checked at `http://localhost:3002` in desktop, tablet, mobile, light, and dark modes.
 - [ ] Keyboard and screen-reader states are checked.
@@ -51,6 +51,6 @@ Use this matrix to verify the production workflow objective. A checked box needs
 
 ## Current evidence snapshot — 2026-07-20
 
-New source and local-test evidence: shared registry, sanitized node/resource catalogs, modular adapters, separate bounded layout schema, React Flow editor source, action-hash/redaction helpers, draft/test/publish routes, immutable production version selection, and node-path test stopping. Root build, 16 focused workflow/runtime tests, all 68 non-Docker tests, Stitch production build, and Stitch lint complete successfully.
+New source and local-test evidence: shared registry, sanitized node/resource catalogs, modular adapters, separate bounded layout schema, React Flow editor source, action-hash/redaction helpers, draft/test/publish routes, immutable production version selection, node-path test stopping, upstream-only mapping options, server-enforced safe-reference validation, client reachability/cycle feedback, real workflow usage/cost aggregation, shared Markdown output rendering, node data inspection, PDF preview, and a visible safely locked Browser capability in Advanced mode. Root build, focused workflow/runtime/API validation tests, all 73 non-Docker tests, Stitch production build, and warning-free Stitch lint complete successfully after the latest workflow repair.
 
-Still unproven in this environment: migrations 019–022 against PostgreSQL, the expanded database integration suite, Docker rebuild, action-confirmation resume with Redis, artifact generation through the lifecycle, and the running canvas in desktop/mobile/light/dark states. Still absent: controlled Browser adapter, historical-run replay, exact known-app logos on canvas nodes, and the unified execution index.
+Still unproven in this environment: the expanded database integration suite could not connect to the Docker PostgreSQL/Redis ports because local socket/network access is denied to Codex; Docker rebuild, action-confirmation resume with Redis, artifact generation through the lifecycle, and the corrected running canvas in desktop/mobile/light/dark states therefore remain pending. The live page inspected on 2026-07-20 still served obsolete bundles `index-Ciddktwo.js` and `index-DzjeG0fC.css`; the verified local build now emits `index-B6ZLNXv0.js`, `WorkflowsPage-DB2VwBE2.js`, and `index-eo9eCrIF.css`. Still absent: the controlled Browser runtime adapter, historical-run replay, and the unified execution index.

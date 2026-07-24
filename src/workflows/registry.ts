@@ -11,6 +11,7 @@ export const workflowNodeTypes = [
   'api_action',
   'mcp_action',
   'knowledge_search',
+  'browser',
 ] as const;
 
 export const workflowNodeTypeSchema = z.enum(workflowNodeTypes);
@@ -18,7 +19,7 @@ export type WorkflowNodeType = z.infer<typeof workflowNodeTypeSchema>;
 
 export type WorkflowNodeCategory = 'trigger' | 'ai' | 'integration' | 'knowledge' | 'logic' | 'human' | 'output';
 export type WorkflowNodeRisk = 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
-export type WorkflowNodeAdapter = 'logic' | 'agent' | 'legacy_tool' | 'api' | 'mcp' | 'knowledge' | 'file';
+export type WorkflowNodeAdapter = 'logic' | 'agent' | 'legacy_tool' | 'api' | 'mcp' | 'knowledge' | 'file' | 'browser';
 export type WorkflowPort = {
   id: string;
   label: string;
@@ -149,6 +150,11 @@ const entries = [
     inputPorts: normalInput, outputPorts: [{ id: 'results', label: 'Search results', dataType: 'collection', required: true }],
     configFields: [{ key: 'query', label: 'Query mapping', control: 'text', required: true }, { key: 'limit', label: 'Maximum results', control: 'number' }],
     configSchema: z.object({ query: z.string().min(1).max(5_000), limit: z.number().int().min(1).max(20).optional() }).passthrough(),
+  },
+  {
+    type: 'browser', category: 'integration', title: 'Browser', description: 'Open pages and interact with websites in a controlled browser session.', icon: 'globe-2', adapter: 'browser', risk: 'unknown', available: false,
+    availabilityReason: 'Browser automation needs an isolated, policy-enforced runtime before it can be enabled safely.',
+    retryable: false, inputPorts: normalInput, outputPorts: normalOutput, configFields: [], configSchema: z.object({}).passthrough(),
   },
 ] satisfies RegistryEntry[];
 

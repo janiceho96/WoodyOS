@@ -25,6 +25,7 @@ from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.dml.color import RGBColor
 from pptx.util import Inches as PptxInches, Pt as PptxPt
 from pydantic import BaseModel, Field
+from PIL import Image, ImageOps, UnidentifiedImageError
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
@@ -33,6 +34,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import ListFlowable, ListItem, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 
 app = FastAPI(title="Woody document extractor", version="0.1.0")
+Image.MAX_IMAGE_PIXELS = 25_000_000
 
 
 class GenerateRequest(BaseModel):
@@ -476,6 +478,25 @@ def extract_image(data: bytes, suffix: str) -> str:
         Path(path).unlink(missing_ok=True)
 
 
+def normalize_avatar(data: bytes) -> bytes:
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            source.load()
+            image = ImageOps.exif_transpose(source)
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA")
+            image = ImageOps.fit(image, (512, 512), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            if image.mode == "RGBA":
+                background = Image.new("RGBA", image.size, (0, 0, 0, 0))
+                background.alpha_composite(image)
+                image = background
+            target = io.BytesIO()
+            image.save(target, format="WEBP", quality=88, method=6)
+            return target.getvalue()
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as error:
+        raise ValueError("The uploaded file is not a valid supported image") from error
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -504,6 +525,25 @@ async def extract(file: UploadFile = File(...), authorization: str | None = Head
     if not content:
         raise HTTPException(status_code=422, detail="No text could be extracted from this file")
     return {"name": name, "content": content, "characters": len(content)}
+
+
+@app.post("/avatar")
+async def avatar(file: UploadFile = File(...), authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    if file.content_type not in {"image/png", "image/jpeg", "image/webp"}:
+        raise HTTPException(status_code=415, detail="Use a PNG, JPEG, or WebP image")
+    data = await file.read()
+    if not data or len(data) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Avatar images are limited to 2 MB")
+    try:
+        normalized = normalize_avatar(data)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return Response(
+        content=normalized,
+        media_type="image/webp",
+        headers={"X-Avatar-Bytes": str(len(normalized)), "Cache-Control": "no-store"},
+    )
 
 
 @app.post("/generate")

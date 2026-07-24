@@ -1,5 +1,5 @@
 import { Activity, ArrowRight, BookOpen, Bot, Check, CheckCircle2, ChevronLeft, ChevronRight, Command, Database, LayoutDashboard, Lightbulb, Network, Rocket, Sparkles, Workflow } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api, type Agent, type Onboarding, type Task } from '../../api';
 
 export function OnboardingFlow({ state, storageKey, agents, tasks, onUpdate, onPage, onPause, onCreateAgent }: {
@@ -8,15 +8,15 @@ export function OnboardingFlow({ state, storageKey, agents, tasks, onUpdate, onP
 }) {
   const [step, setStep] = useState(() => Math.max(state.lastStep, Number(localStorage.getItem(storageKey)) || 1));
   const [error, setError] = useState('');
-  const save = async (action: 'progress' | 'complete' | 'skip', next = step) => {
+  const save = useCallback(async (action: 'progress' | 'complete' | 'skip', next: number) => {
     try { const updated = await api.onboarding({ lastStep: next, action }); localStorage.removeItem(storageKey); onUpdate(updated); setError(''); return updated; }
     catch { localStorage.setItem(storageKey, String(next)); setError('Your place is saved on this device. Reconnect to sync progress.'); return null; }
-  };
-  const move = (next: number) => { setStep(next); void save('progress', next); };
+  }, [onUpdate, storageKey]);
+  const move = useCallback((next: number) => { setStep(next); void save('progress', next); }, [save]);
   useEffect(() => {
     const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onPause(); if (event.key === 'ArrowRight' && step < 6) move(step + 1); if (event.key === 'ArrowLeft' && step > 1) move(step - 1); };
     window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler);
-  }, [step]);
+  }, [move, onPause, step]);
   const completed = { agent: agents.some((agent) => agent.status === 'active'), task: tasks.length > 0 };
   const content = [
     { Icon: Network, title: 'Welcome to Woody', text: 'One command center for agents, knowledge, tools, workflows, and auditable execution.', body: <div className="onboarding-signals"><span><Bot size={17}/>Agent operations</span><span><Database size={17}/>Trusted knowledge</span><span><Activity size={17}/>Live observability</span></div> },

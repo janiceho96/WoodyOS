@@ -1,0 +1,32 @@
+import { z } from 'zod';
+
+export const agentAvatarIconSchema = z.enum([
+  'network', 'search', 'route', 'code', 'pen', 'megaphone', 'chart', 'check',
+  'brain', 'zap', 'users', 'coins', 'palette', 'shield', 'sparkles',
+]);
+
+const colorSchema = z.string().regex(/^#[0-9a-f]{6}$/i, 'Use a six-digit hex color');
+
+export const agentAvatarSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('icon'),
+    value: agentAvatarIconSchema,
+    backgroundColor: colorSchema.optional(),
+    accentColor: colorSchema.optional(),
+    alt: z.string().trim().max(160).optional(),
+  }),
+  z.object({
+    type: z.literal('initials'),
+    value: z.string().trim().min(1).max(3),
+    backgroundColor: colorSchema.optional(),
+    accentColor: colorSchema.optional(),
+    alt: z.string().trim().max(160).optional(),
+  }),
+  z.object({
+    type: z.literal('image'),
+    value: z.literal('uploaded'),
+    alt: z.string().trim().max(160).optional(),
+  }),
+]);
+
+export type AgentAvatarConfig = z.infer<typeof agentAvatarSchema>;

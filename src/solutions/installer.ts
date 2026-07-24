@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { db } from '../db/client.js';
 import { encryptJsonWithContext } from '../lib/crypto.js';
+import { toolRiskLevel, type ToolRecord } from '../tools/runtime.js';
 import type { AgentSolution } from './schema.js';
 import { parseAgentSolution } from './schema.js';
 
@@ -12,6 +13,7 @@ type InstallInput = {
   allowDuplicate?: boolean;
   sourcePrompt?: string;
   persistPrompt?: boolean;
+  toolIdsByAgentKey?: Record<string, string[]>;
 };
 
 export function materializeWorkflowDefinition(solution: AgentSolution, agentIds: Map<string, string>) {
@@ -29,6 +31,45 @@ export function materializeWorkflowDefinition(solution: AgentSolution, agentIds:
 
 async function installWithClient(client: PoolClient, input: InstallInput) {
   const solution = parseAgentSolution(input.solution);
+  const knownAgentKeys = new Set(solution.agents.map((agent) => agent.key));
+  const assignments = input.toolIdsByAgentKey ?? {};
+  if (Object.keys(assignments).some((agentKey) => !knownAgentKeys.has(agentKey))) {
+    throw Object.assign(new Error('UNKNOWN_SOLUTION_AGENT_TOOL_ASSIGNMENT'), { statusCode: 400 });
+  }
+  const selectedToolIds = [...new Set(Object.values(assignments).flat())];
+  if (selectedToolIds.length > 40) {
+    throw Object.assign(new Error('TOO_MANY_SOLUTION_TOOL_ASSIGNMENTS'), { statusCode: 400 });
+  }
+  const toolRows = selectedToolIds.length
+    ? (await client.query<ToolRecord>(
+      `SELECT id,name,kind,config,permissions
+       FROM tools WHERE workspace_id=$1 AND enabled=true AND id = ANY($2::uuid[])`,
+      [input.workspaceId, selectedToolIds],
+    )).rows
+    : [];
+  const toolById = new Map(toolRows.map((tool) => [tool.id, tool]));
+  if (toolById.size !== selectedToolIds.length) {
+    throw Object.assign(new Error('INVALID_OR_DISABLED_SOLUTION_TOOL'), { statusCode: 400 });
+  }
+  for (const agent of solution.agents) {
+    const toolIds = [...new Set(assignments[agent.key] ?? [])];
+    if (toolIds.length > 10) throw Object.assign(new Error('TOO_MANY_AGENT_TOOL_ASSIGNMENTS'), { statusCode: 400 });
+    const assignedTools = toolIds.map((id) => toolById.get(id)!);
+    for (const tool of assignedTools) {
+      const compatible = agent.toolRequirements.some((requirement) =>
+        requirement.permissions.some((permission) => tool.permissions.includes(permission)));
+      if (!compatible || toolRiskLevel(tool) !== 'read') {
+        throw Object.assign(new Error('INCOMPATIBLE_OR_NON_READ_ONLY_SOLUTION_TOOL'), { statusCode: 400 });
+      }
+    }
+    for (const requirement of agent.toolRequirements.filter((item) => item.required)) {
+      const satisfied = assignedTools.some((tool) =>
+        requirement.permissions.some((permission) => tool.permissions.includes(permission)));
+      if (!satisfied) {
+        throw Object.assign(new Error(`MISSING_REQUIRED_SOLUTION_TOOL:${agent.key}:${requirement.key}`), { statusCode: 400 });
+      }
+    }
+  }
   const existing = await client.query<{ id: string }>(
     `SELECT id FROM agent_solution_installations
       WHERE workspace_id=$1 AND source_type=$2 AND solution_slug=$3 AND solution_version=$4
@@ -62,14 +103,16 @@ async function installWithClient(client: PoolClient, input: InstallInput) {
   const defaultModel = process.env.LLM_DEFAULT_MODEL ?? 'claude-sonnet-4-20250514';
   const agentIds = new Map<string, string>();
   for (const agent of solution.agents) {
+    const toolIds = [...new Set(assignments[agent.key] ?? [])];
     const created = await client.query<{ id: string }>(
       `INSERT INTO agents(
          workspace_id,name,role,goal,instructions,personality,model,model_config,capabilities,
          status,tool_ids,memory_config,created_by
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'draft','[]'::jsonb,$10,$11) RETURNING id`,
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'draft',$10,$11,$12) RETURNING id`,
       [
         input.workspaceId, agent.name, agent.role, agent.goal, agent.instructions, agent.personality,
         agent.model ?? defaultModel, JSON.stringify(agent.modelConfig), JSON.stringify(agent.capabilities),
+        JSON.stringify(toolIds),
         JSON.stringify({ shortTerm: true, longTerm: true, knowledgeBase: agent.capabilities.knowledgeBase }),
         input.userId,
       ],

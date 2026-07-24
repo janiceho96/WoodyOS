@@ -7,10 +7,13 @@ services:
       REDIS_URL: redis://redis:6379
       EXTRACTOR_URL: http://extractor:8000
       ARTIFACT_STORAGE_DIR: /data/artifacts
+      AGENT_AVATAR_STORAGE_DIR: /data/agent-avatars
       MCP_OAUTH_CALLBACK_URL: ${MCP_OAUTH_CALLBACK_URL:-http://localhost:3002/v1/mcp/oauth/callback}
       MCP_APP_URL: ${MCP_APP_URL:-http://localhost:3002}
     ports: ["3001:3001"]
-    volumes: ["artifact_data:/data/artifacts"]
+    volumes:
+      - artifact_data:/data/artifacts
+      - agent_avatar_data:/data/agent-avatars
     depends_on:
       migrate: { condition: service_completed_successfully }
       db: { condition: service_healthy }
@@ -83,3 +86,4 @@ services:
 volumes:
   postgres_data:
   artifact_data:
+  agent_avatar_data:

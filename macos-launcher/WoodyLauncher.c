@@ -6,10 +6,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int launch_with_open(const char *command_path) {
+static int launch_in_terminal(const char *command_path) {
   pid_t child = fork();
   if (child == 0) {
-    execl("/usr/bin/open", "open", command_path, (char *)NULL);
+    execl("/usr/bin/open", "open", "-a", "Terminal", command_path, (char *)NULL);
     _exit(127);
   }
   if (child < 0) return 1;
@@ -36,7 +36,7 @@ int main(void) {
   int length = snprintf(start_command, sizeof(start_command), "%s/../Resources/Start Woody.command", resolved);
   if (length < 0 || (size_t)length >= sizeof(start_command) || access(start_command, X_OK) != 0) return 3;
 
-  if (launch_with_open(start_command) == 0) return 0;
+  if (launch_in_terminal(start_command) == 0) return 0;
 
   /* Fallback for Macs whose .command file association is unavailable. */
   execl("/bin/zsh", "zsh", start_command, (char *)NULL);

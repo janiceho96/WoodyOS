@@ -2,16 +2,19 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, type Agent } from '../../api';
+import { api, type Agent, type AgentAvatarConfig } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { Status } from '../../components/ui';
 import { humanize } from '../../lib/format';
+import { AgentAvatar } from '../../components/agents/AgentAvatar';
+import { AgentAvatarPicker } from '../../components/agents/AgentAvatarPicker';
 
 type Draft = {
   name: string; role: string; goal: string; personality: string; instructions: string; model: string;
   temperature: number; maxTokens: number; topP: number; status: Agent['status'];
   capabilities: { webBrowser: boolean; codeInterpreter: boolean; knowledgeBase: boolean };
   toolIds: string[];
+  avatar: AgentAvatarConfig | null;
 };
 type BuilderStep = 'purpose' | 'instructions' | 'resources' | 'model' | 'review';
 
@@ -31,6 +34,7 @@ function fromAgent(agent?: Agent, defaultModel = ''): Draft {
     topP: agent?.model_config?.topP ?? 1, status: agent?.status === 'archived' ? 'draft' : agent?.status ?? 'draft',
     capabilities: agent?.capabilities ?? { webBrowser: false, codeInterpreter: false, knowledgeBase: true },
     toolIds: agent?.tool_ids ?? [],
+    avatar: agent?.avatar_config && 'type' in agent.avatar_config ? agent.avatar_config as AgentAvatarConfig : null,
   };
 }
 
@@ -60,6 +64,8 @@ export function AgentBuilderPage() {
   };
   const ready = validation.purpose && validation.model;
   const activeTools = data.tools.filter((tool) => draft.toolIds.includes(tool.id));
+  const activeWebTools = activeTools.filter((tool) => tool.permissions.includes('web.read'));
+  const webReady = !draft.capabilities.webBrowser || activeWebTools.length > 0;
   const currentIndex = steps.findIndex((item) => item.id === step);
 
   const mutation = useMutation({
@@ -72,6 +78,7 @@ export function AgentBuilderPage() {
         modelConfig: { temperature: Number(draft.temperature), maxTokens: Number(draft.maxTokens), topP: Number(draft.topP) },
         capabilities: draft.capabilities, toolIds: draft.toolIds,
         memoryConfig: { shortTerm: true, longTerm: true, knowledgeBase: draft.capabilities.knowledgeBase },
+        ...(draft.avatar ? { avatar: draft.avatar } : {}),
       };
       return agent ? api.updateAgent(agent.id, body) : api.createAgent(body);
     },
@@ -94,7 +101,7 @@ export function AgentBuilderPage() {
   return <div className="builder-page guided-builder">
     <div className="builder-toolbar">
       <div><span className="eyebrow">Agents <ChevronRight size={12}/></span><strong>{agent ? agent.name : 'New agent draft'}</strong><Status value={agent?.status ?? 'draft'}/></div>
-      <div>{!agent && <button className="button" onClick={() => navigate('/solutions?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => navigate('/agents')}>Close</button><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Publish agent</button></div>
+      <div>{!agent && <button className="button" onClick={() => navigate('/agents/library?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => navigate(agent ? `/agents/${agent.id}?section=configure` : '/agents')}>Close</button><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Publish agent</button></div>
     </div>
     {formError && <div className="inline-error builder-error"><AlertTriangle size={15}/><span><strong>Agent was not saved.</strong>{formError}</span></div>}
     <div className="guided-builder-layout">
@@ -106,6 +113,7 @@ export function AgentBuilderPage() {
 
       <main className="builder-step-content">
         {step === 'purpose' && <BuilderSection Icon={Bot} eyebrow="Step 1" title="Give this agent one clear responsibility" description="A focused agent is easier to test, safer to operate, and produces more consistent work.">
+          <AgentAvatarPicker agent={agent} name={draft.name} role={draft.role} value={draft.avatar} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))}/>
           <label>Agent name <span>*</span><input value={draft.name} maxLength={120} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="Research Analyst"/></label>
           <label>Role <span>*</span><input value={draft.role} maxLength={240} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="Senior market researcher"/><small>Describe what kind of specialist this is.</small></label>
           <label>Outcome this agent owns <span>*</span><textarea className="builder-large-field" value={draft.goal} maxLength={5000} onChange={(event) => setDraft({ ...draft, goal: event.target.value })} placeholder="Research a market and return a cited comparison of the strongest competitors."/><small>Write an observable result rather than a broad topic.</small></label>
@@ -126,6 +134,8 @@ export function AgentBuilderPage() {
             ['knowledgeBase', 'Workspace knowledge', 'Search indexed workspace documents. Per-document assignment is not available yet.', Database],
           ] as const).map(([key, label, text, Icon]) => <button className={`permission-card ${draft.capabilities[key] ? 'active' : ''}`} key={key} onClick={() => toggleCapability(key)} type="button"><span><Icon size={18}/></span><div><strong>{label}</strong><small>{text}</small></div><i>{draft.capabilities[key] ? <Check size={13}/> : <X size={13}/>}</i></button>)}</div>
           <div className="resource-group"><div><h3>Connected integrations</h3><p>Only enabled API tools appear here. MCP access remains controlled by its agent allowlist.</p></div>{data.tools.filter((tool) => tool.enabled).length ? <div className="permission-list">{data.tools.filter((tool) => tool.enabled).map((tool) => <label key={tool.id}><input type="checkbox" checked={draft.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><b>{draft.toolIds.includes(tool.id) ? 'Allowed' : 'No access'}</b></label>)}</div> : <div className="resource-empty"><Wrench size={18}/><span><strong>No enabled integrations</strong><small>Connect an API or MCP application from Integrations first.</small></span><button className="button" onClick={() => navigate('/tools')}>Open Integrations</button></div>}</div>
+          {draft.capabilities.webBrowser && !activeWebTools.length && <div className="inline-warning"><AlertTriangle size={16}/><span>Web access is enabled, but no Web Research tool is assigned. The agent still cannot search the internet. <button type="button" className="text-button" onClick={() => navigate('/tools')}>Configure Web Research</button></span></div>}
+          {!draft.capabilities.webBrowser && activeWebTools.length > 0 && <div className="inline-warning"><AlertTriangle size={16}/>Assigned web tools will remain unavailable until Web access is enabled above.</div>}
         </BuilderSection>}
 
         {step === 'model' && <BuilderSection Icon={BrainCircuit} eyebrow="Step 4" title="Choose quality and usage limits" description="The workspace default is usually the safest starting point. Advanced controls are available when the task requires them.">
@@ -135,16 +145,16 @@ export function AgentBuilderPage() {
         </BuilderSection>}
 
         {step === 'review' && <BuilderSection Icon={ShieldCheck} eyebrow="Step 5" title="Review before publishing" description="Publishing makes this agent available for tasks. It does not automatically run work or grant new permissions.">
-          <div className="agent-review-card"><div className="review-identity"><span className="agent-glyph large"><Sparkles size={28}/></span><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="Integrations" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API tool access'} good={!activeTools.length}/><ReviewRow label="Web and code" value={[draft.capabilities.webBrowser && 'Web-capable tools', draft.capabilities.codeInterpreter && 'Code-oriented tools'].filter(Boolean).join(', ') || 'Not enabled'} good={!draft.capabilities.webBrowser && !draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
+          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="Integrations" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API tool access'} good={!activeTools.length}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
           <div className="publish-boundary"><ShieldCheck size={19}/><div><strong>What happens when you publish</strong><p>The configuration is saved and the agent becomes selectable for tasks. No task starts automatically, no external action is performed, and MCP permissions remain separately enforced.</p></div></div>
-          <div className="review-actions"><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save as draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}><Rocket size={15}/>{agent?.status === 'active' ? 'Update published agent' : 'Publish agent'}</button>{agent && <button className="button" onClick={() => navigate(`/executions?agent=${agent.id}`)}><Play size={15}/>Open test runs</button>}</div>
+          <div className="review-actions"><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save as draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}><Rocket size={15}/>{agent?.status === 'active' ? 'Update published agent' : 'Publish agent'}</button>{agent && <button className="button" onClick={() => navigate(`/agents/${agent.id}?section=history`)}><Play size={15}/>Open task history</button>}</div>
         </BuilderSection>}
 
         <footer className="builder-step-footer"><button className="button" disabled={currentIndex === 0} onClick={() => move(-1)}><ChevronLeft size={15}/>Previous</button><span>Step {currentIndex + 1} of {steps.length}</span>{currentIndex < steps.length - 1 ? <button className="button primary" onClick={() => move(1)}>Continue<ChevronRight size={15}/></button> : <button className="button" onClick={() => setStep('purpose')}>Review from start</button>}</footer>
       </main>
 
       <aside className="builder-live-summary">
-        <span className="eyebrow">Live summary</span><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.role || 'Add a role to define this specialist.'}</p>
+        <span className="eyebrow">Live summary</span><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.role || 'Add a role to define this specialist.'}</p>
         <div><small>Outcome</small><strong>{draft.goal || 'Not defined yet'}</strong></div>
         <div><small>Access</small><span>{Object.entries(draft.capabilities).map(([key, enabled]) => <i className={enabled ? 'enabled' : ''} key={key}>{enabled ? <Check size={11}/> : <X size={11}/>} {humanize(key)}</i>)}</span></div>
         <div><small>Integrations</small><strong>{activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'None assigned'}</strong></div>

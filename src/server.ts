@@ -30,6 +30,7 @@ import { presentationThemeRoutes } from './routes/presentation-themes.js';
 import { workflowNodeRoutes } from './routes/workflow-nodes.js';
 import { workflowResourceRoutes } from './routes/workflow-resources.js';
 import { workflowActionRoutes } from './routes/workflow-actions.js';
+import { actionAuthorizationRoutes } from './routes/action-authorizations.js';
 
 export async function buildApp() {
   if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) throw new Error('JWT_SECRET must be configured in production');
@@ -43,7 +44,10 @@ export async function buildApp() {
     request.log.error(error);
     const statusCode = (error as { statusCode?: number }).statusCode ?? 500;
     const errorCode = statusCode === 500 ? 'INTERNAL_ERROR' : statusCode === 401 ? 'UNAUTHORIZED' : statusCode === 403 ? 'FORBIDDEN' : (error as Error).message;
-    reply.code(statusCode).send({ error: errorCode });
+    reply.code(statusCode).send({
+      error: errorCode,
+      ...(process.env.NODE_ENV === 'test' && statusCode >= 500 ? { detail: error instanceof Error ? error.message : String(error) } : {}),
+    });
   });
   await authPlugin(app);
   await registerOidc(app);
@@ -70,6 +74,7 @@ export async function buildApp() {
   await app.register(workflowNodeRoutes, { prefix: '/v1/workflow-nodes' });
   await app.register(workflowResourceRoutes, { prefix: '/v1/workflow-resources' });
   await app.register(workflowActionRoutes, { prefix: '/v1/workflow-actions' });
+  await app.register(actionAuthorizationRoutes, { prefix: '/v1/action-authorizations' });
   return app;
 }
 
