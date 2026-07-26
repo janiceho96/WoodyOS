@@ -71,13 +71,14 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
     let taskId = '';
     let workflowRunId: string | null = null;
     let traceId = '';
+    let linkedAuthorizationId: string | null = null;
     try {
       await client.query('BEGIN');
       const linkedAuthorization = await client.query<{ action_authorization_id: string | null }>(
         `SELECT action_authorization_id FROM mcp_tool_calls WHERE id=$1 AND workspace_id=$2`,
         [params.id, request.user.workspaceId],
       );
-      const linkedAuthorizationId = linkedAuthorization.rows[0]?.action_authorization_id ?? null;
+      linkedAuthorizationId = linkedAuthorization.rows[0]?.action_authorization_id ?? null;
       if (linkedAuthorizationId) {
         const locked = await client.query(
           `SELECT id FROM action_authorizations
@@ -113,9 +114,10 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
          JOIN tasks ON tasks.id=calls.task_id
          LEFT JOIN workflow_runs run ON run.id=tasks.workflow_run_id
          WHERE calls.id=$1 AND calls.workspace_id=$2 AND calls.status='awaiting_confirmation'
+         AND calls.action_authorization_id IS NOT DISTINCT FROM $3::uuid
          AND confirmation.status='pending' AND confirmation.expires_at > now()
          FOR UPDATE OF calls,confirmation,tasks`,
-        [params.id, request.user.workspaceId],
+        [params.id, request.user.workspaceId, linkedAuthorizationId],
       );
       if (!pending.rowCount || !pending.rows[0].task_id) {
         await client.query('ROLLBACK');
@@ -142,28 +144,39 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
           }, client);
         }
       }
+      if (actionAuthorizationId) {
+        const authorizationUpdated = await client.query(
+          `UPDATE action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
+           WHERE id=$4 AND workspace_id=$5 AND status='awaiting_confirmation' AND expires_at>now()
+           RETURNING id`,
+          [
+            input.decision,
+            request.user.sub,
+            input.comment ?? null,
+            actionAuthorizationId,
+            request.user.workspaceId,
+          ],
+        );
+        if (authorizationUpdated.rowCount !== 1) {
+          await client.query('ROLLBACK');
+          return reply.code(409).send({ error: 'MCP_CONFIRMATION_NOT_PENDING' });
+        }
+      }
       await client.query(
         `UPDATE mcp_tool_confirmations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
-         WHERE tool_call_id=$4`,
+         WHERE tool_call_id=$4 AND status='pending'`,
         [input.decision, request.user.sub, input.comment ?? null, params.id],
       );
       await client.query(
         `UPDATE mcp_tool_calls SET status=$1,completed_at=CASE WHEN $1='rejected' THEN now() ELSE NULL END
-         WHERE id=$2`,
-        [input.decision === 'approved' ? 'pending' : 'rejected', params.id],
+         WHERE id=$2 AND workspace_id=$3 AND status='awaiting_confirmation'`,
+        [input.decision === 'approved' ? 'pending' : 'rejected', params.id, request.user.workspaceId],
       );
       await client.query(
         `UPDATE task_runtime_checkpoints SET status=$1,updated_at=now()
-         WHERE task_id=$2 AND pending_tool_call_id=$3`,
+         WHERE task_id=$2 AND pending_tool_call_id=$3 AND status='awaiting_confirmation'`,
         [input.decision, taskId, params.id],
       );
-      if (actionAuthorizationId) {
-        await client.query(
-          `UPDATE action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
-           WHERE id=$4 AND status='awaiting_confirmation'`,
-          [input.decision, request.user.sub, input.comment ?? null, actionAuthorizationId],
-        );
-      }
       await client.query(
         `UPDATE tasks SET status='queued',updated_at=now() WHERE id=$1 AND workspace_id=$2 AND status='awaiting_approval'`,
         [taskId, request.user.workspaceId],
@@ -181,6 +194,18 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
       const recovery = await db.connect();
       try {
         await recovery.query('BEGIN');
+        if (linkedAuthorizationId) {
+          const authorizationRestored = await recovery.query(
+            `UPDATE action_authorizations SET status='awaiting_confirmation',
+                    resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+              WHERE id=$1 AND workspace_id=$2 AND status=$3
+              RETURNING id`,
+            [linkedAuthorizationId, request.user.workspaceId, input.decision],
+          );
+          if (authorizationRestored.rowCount !== 1) {
+            throw new Error('Unable to restore linked action authorization after enqueue failure');
+          }
+        }
         await recovery.query(
           `UPDATE mcp_tool_confirmations SET status='pending',
                   resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
@@ -196,13 +221,6 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
           `UPDATE task_runtime_checkpoints SET status='awaiting_confirmation',updated_at=now()
             WHERE task_id=$1 AND pending_tool_call_id=$2 AND status=$3`,
           [taskId, params.id, input.decision],
-        );
-        await recovery.query(
-          `UPDATE action_authorizations SET status='awaiting_confirmation',
-                  resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
-            WHERE id=(SELECT action_authorization_id FROM mcp_tool_calls WHERE id=$1)
-              AND status=$2`,
-          [params.id, input.decision],
         );
         await recovery.query(
           `UPDATE tasks SET status='awaiting_approval',updated_at=now()

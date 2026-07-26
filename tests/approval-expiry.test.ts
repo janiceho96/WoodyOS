@@ -14,6 +14,9 @@ type Authorization = {
   span_id: string;
   parent_span_id: string | null;
   runtime_error?: unknown;
+  node_id?: string | null;
+  iteration_key?: string | null;
+  attempt?: number | null;
 };
 
 const ids = {
@@ -35,6 +38,14 @@ const state = vi.hoisted(() => ({
   confirmations: new Map<string, { status: string }>(),
   artifacts: [] as Array<{ taskId: string | null; workflowRunId: string | null; status: string; error: string | null }>,
   events: [] as Array<{ authorizationId: string; type: string; payload: unknown }>,
+  nodeStates: [] as Array<{
+    workflowRunId: string;
+    nodeId: string;
+    iterationKey: string;
+    attempt: number;
+    status: string;
+    error: unknown;
+  }>,
   locked: new Set<string>(),
   statements: [] as string[],
   failMarker: null as string | null,
@@ -50,6 +61,7 @@ function cloneStore() {
     confirmations: structuredClone(state.confirmations),
     artifacts: structuredClone(state.artifacts),
     events: structuredClone(state.events),
+    nodeStates: structuredClone(state.nodeStates),
   };
 }
 
@@ -62,6 +74,7 @@ function restoreStore(snapshot: ReturnType<typeof cloneStore>) {
   state.confirmations = snapshot.confirmations;
   state.artifacts = snapshot.artifacts;
   state.events = snapshot.events;
+  state.nodeStates = snapshot.nodeStates;
 }
 
 vi.mock('../src/db/client.js', () => ({
@@ -182,6 +195,19 @@ vi.mock('../src/db/client.js', () => ({
             }
             return { rowCount: 1, rows: [] };
           }
+          if (sql.includes('approval-expiry:node')) {
+            const node = state.nodeStates.find((candidate) => (
+              candidate.workflowRunId === authorization?.workflow_run_id
+              && candidate.nodeId === authorization?.node_id
+              && candidate.iterationKey === authorization?.iteration_key
+              && candidate.attempt === authorization?.attempt
+            ));
+            if (node?.status === 'waiting') {
+              node.status = String(values[1]);
+              node.error = JSON.parse(String(values[2]));
+            }
+            return { rowCount: node ? 1 : 0, rows: [] };
+          }
           if (sql.includes('approval-expiry:event')) {
             state.events.push({
               authorizationId,
@@ -225,6 +251,9 @@ function seed(input: {
     trace_id: ids.trace,
     span_id: ids.span,
     parent_span_id: null,
+    node_id: subject === 'workflow_run' ? 'action-node' : null,
+    iteration_key: subject === 'workflow_run' ? 'root' : null,
+    attempt: subject === 'workflow_run' ? 1 : null,
   });
   state.tasks.set(ids.task, {
     status: input.taskStatus ?? 'awaiting_approval',
@@ -254,6 +283,24 @@ function seed(input: {
     status: 'pending',
     error: null,
   });
+  if (subject === 'workflow_run') {
+    state.nodeStates.push({
+      workflowRunId: ids.workflow,
+      nodeId: 'action-node',
+      iterationKey: 'root',
+      attempt: 1,
+      status: 'waiting',
+      error: null,
+    });
+    state.nodeStates.push({
+      workflowRunId: ids.workflow,
+      nodeId: 'other-node',
+      iterationKey: 'root',
+      attempt: 1,
+      status: 'waiting',
+      error: null,
+    });
+  }
 }
 
 describe('approval expiration processing', () => {
@@ -266,6 +313,7 @@ describe('approval expiration processing', () => {
     state.confirmations = new Map();
     state.artifacts = [];
     state.events = [];
+    state.nodeStates = [];
     state.locked = new Set();
     state.statements = [];
     state.failMarker = null;
@@ -346,6 +394,7 @@ describe('approval expiration processing', () => {
       authorizationId: ids.authorization,
       type: 'action.authorization.escalated',
       payload: expect.objectContaining({
+        authorizationId: ids.authorization,
         attentionRoles: ['owner', 'admin'],
         traceId: ids.trace,
       }),
@@ -361,6 +410,41 @@ describe('approval expiration processing', () => {
     expect(result.autoRejectedIds).toEqual([ids.authorization]);
     expect(result.escalatedIds).toEqual([]);
     expect(state.authorizations.get(ids.authorization)?.status).toBe('expired');
+  });
+
+  it.each([
+    { policy: 'auto_reject' as const, status: 'skipped' },
+    { policy: 'fail' as const, status: 'failed' },
+  ])('terminalizes only the matching waiting workflow node for $policy', async ({ policy, status }) => {
+    seed({ policy, subject: 'workflow_run' });
+
+    await expireDueAuthorizations(100);
+
+    expect(state.nodeStates[0]).toMatchObject({
+      nodeId: 'action-node',
+      status,
+      error: {
+        code: 'APPROVAL_EXPIRED',
+        retryable: false,
+      },
+    });
+    expect(state.nodeStates[1]).toMatchObject({
+      nodeId: 'other-node',
+      status: 'waiting',
+      error: null,
+    });
+  });
+
+  it('leaves the matching workflow node waiting on first escalation', async () => {
+    seed({ policy: 'escalate', subject: 'workflow_run' });
+
+    await expireDueAuthorizations(100);
+
+    expect(state.nodeStates[0]).toMatchObject({
+      nodeId: 'action-node',
+      status: 'waiting',
+      error: null,
+    });
   });
 
   it('preserves cancellation and terminal subject states', async () => {

@@ -2,7 +2,14 @@ import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
-  mode: 'task-action' as 'task-action' | 'task-action-missing-trace' | 'task-action-queue-failure' | 'workflow-action' | 'mcp-call',
+  mode: 'task-action' as
+    | 'task-action'
+    | 'task-action-missing-trace'
+    | 'task-action-queue-failure'
+    | 'workflow-action'
+    | 'mcp-call'
+    | 'mcp-linked-expiry-wins'
+    | 'mcp-linked-route-wins',
   statements: [] as string[],
   enqueued: [] as string[],
   queueFailure: false,
@@ -50,17 +57,32 @@ const client = {
         }],
       };
     }
-    if (state.mode === 'mcp-call' && sql.includes('SELECT action_authorization_id FROM mcp_tool_calls')) {
-      return { rowCount: 1, rows: [{ action_authorization_id: null }] };
+    if (state.mode.startsWith('mcp-') && sql.includes('SELECT action_authorization_id FROM mcp_tool_calls')) {
+      return {
+        rowCount: 1,
+        rows: [{
+          action_authorization_id: state.mode === 'mcp-call'
+            ? null
+            : '00000000-0000-4000-8000-000000000060',
+        }],
+      };
     }
-    if (state.mode === 'mcp-call' && sql.includes('FROM mcp_tool_calls calls')) {
+    if (state.mode.startsWith('mcp-linked') && sql.includes('FROM action_authorizations') && sql.includes('FOR UPDATE')) {
+      return state.mode === 'mcp-linked-expiry-wins'
+        ? { rowCount: 0, rows: [] }
+        : { rowCount: 1, rows: [{ id: '00000000-0000-4000-8000-000000000060' }] };
+    }
+    if (state.mode.startsWith('mcp-') && sql.includes('FROM mcp_tool_calls calls')) {
       return {
         rowCount: 1,
         rows: [{
           task_id: '00000000-0000-4000-8000-000000000020',
           agent_id: '00000000-0000-4000-8000-000000000010',
           workflow_run_id: null,
-          action_authorization_id: null,
+          action_authorization_id: state.mode === 'mcp-call'
+            ? null
+            : '00000000-0000-4000-8000-000000000060',
+          run_mode: state.mode === 'mcp-linked-route-wins' ? 'test' : null,
           execution_manifest: incompatibleManifest,
           trace_id: '00000000-0000-4000-8000-000000000050',
           span_id: '00000000-0000-4000-8000-000000000051',
@@ -158,6 +180,51 @@ describe('production resume manifest gates', () => {
     expect(response.json()).toMatchObject({ error: 'RUN_MANIFEST_INCOMPATIBLE' });
     expect(state.statements.filter((sql) => sql.trimStart().startsWith('UPDATE'))).toEqual([]);
     expect(state.enqueued).toEqual([]);
+  });
+
+  it('returns 409 without partial mutation when expiration owns the authorization lock', async () => {
+    state.mode = 'mcp-linked-expiry-wins';
+    const app = await routeApp(mcpToolCallRoutes);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/00000000-0000-4000-8000-000000000040/decision',
+      payload: { decision: 'approved' },
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(409);
+    expect(state.statements.filter((sql) => sql.trimStart().startsWith('UPDATE'))).toEqual([]);
+    expect(state.enqueued).toEqual([]);
+    const locks = state.statements.filter((sql) => sql.includes('FOR UPDATE'));
+    expect(locks[0]).toContain('FROM action_authorizations');
+  });
+
+  it('locks and resolves a live linked authorization before MCP surfaces', async () => {
+    state.mode = 'mcp-linked-route-wins';
+    const app = await routeApp(mcpToolCallRoutes);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/00000000-0000-4000-8000-000000000040/decision',
+      payload: { decision: 'rejected' },
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(200);
+    expect(state.enqueued).toEqual(['00000000-0000-4000-8000-000000000020']);
+    const locks = state.statements.filter((sql) => sql.includes('FOR UPDATE'));
+    expect(locks[0]).toContain('FROM action_authorizations');
+    expect(locks[1]).toContain('FROM mcp_tool_calls calls');
+    const authorizationUpdateIndex = state.statements.findIndex((sql) => (
+      sql.includes('UPDATE action_authorizations SET status=')
+      && sql.includes("status='awaiting_confirmation'")
+      && sql.includes('expires_at>now()')
+      && sql.includes('workspace_id=')
+    ));
+    const confirmationUpdateIndex = state.statements.findIndex((sql) => (
+      sql.includes('UPDATE mcp_tool_confirmations SET status=')
+    ));
+    expect(authorizationUpdateIndex).toBeGreaterThan(-1);
+    expect(authorizationUpdateIndex).toBeLessThan(confirmationUpdateIndex);
   });
 
   it('fails closed on a missing trace before consuming task approval state', async () => {

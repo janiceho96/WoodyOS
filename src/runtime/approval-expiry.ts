@@ -28,6 +28,9 @@ type DueAuthorization = {
   subject_type: 'task' | 'workflow_run';
   task_id: string | null;
   workflow_run_id: string | null;
+  node_id: string | null;
+  iteration_key: string | null;
+  attempt: number | null;
   on_expiration: ExpirationPolicy;
   escalation_level: number;
   expires_at: string;
@@ -144,6 +147,21 @@ async function expireAuthorization(
     [authorization.id, subjectStatus, errorJson, JSON.stringify({ error })],
   );
   await client.query(
+    `/* approval-expiry:node */
+     UPDATE workflow_run_node_states state
+        SET status=$2,error=$3,completed_at=now(),updated_at=now()
+       FROM action_authorizations authorization
+      WHERE authorization.id=$1
+        AND authorization.subject_type='workflow_run'
+        AND state.workspace_id=authorization.workspace_id
+        AND state.workflow_run_id=authorization.workflow_run_id
+        AND state.node_id=authorization.node_id
+        AND state.iteration_key=authorization.iteration_key
+        AND state.attempt=authorization.attempt
+        AND state.status='waiting'`,
+    [authorization.id, policy === 'auto_reject' ? 'skipped' : 'failed', errorJson],
+  );
+  await client.query(
     `/* approval-expiry:artifacts */
      UPDATE artifacts artifact
         SET status=$2,error_message=$3,updated_at=now()
@@ -243,7 +261,8 @@ export async function expireDueAuthorizations(
     const due = await client.query<DueAuthorization>(
       `/* approval-expiry:claim */
        SELECT authorization.id,authorization.workspace_id,authorization.subject_type,
-              authorization.task_id,authorization.workflow_run_id,
+              authorization.task_id,authorization.workflow_run_id,authorization.node_id,
+              authorization.iteration_key,authorization.attempt,
               authorization.on_expiration,authorization.escalation_level,
               authorization.expires_at,authorization.trace_id,
               authorization.span_id,authorization.parent_span_id

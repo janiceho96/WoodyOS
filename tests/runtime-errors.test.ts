@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   retryDecision,
+  redactRuntimeValue,
   runtimeError,
   serializeRuntimeError,
   uncertainActionOutcome,
@@ -86,6 +87,22 @@ describe('structured runtime errors', () => {
     });
     expect(JSON.stringify(serialized)).not.toContain('do-not-show');
     expect(JSON.stringify(serialized)).not.toContain('hidden');
+  });
+
+  it('preserves only a valid authorizationId UUID while redacting credentials', () => {
+    const authorizationId = '00000000-0000-4000-8000-000000000042';
+
+    expect(redactRuntimeValue({
+      authorizationId,
+      authorization: 'Bearer secret-token',
+      token: 'secret-token',
+      nested: { authorizationId: 'not-a-uuid' },
+    })).toEqual({
+      authorizationId,
+      authorization: '[REDACTED]',
+      token: '[REDACTED]',
+      nested: { authorizationId: '[REDACTED]' },
+    });
   });
 });
 
