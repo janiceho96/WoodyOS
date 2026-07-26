@@ -3,7 +3,9 @@ import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
+import type { NodeProps } from '@xyflow/react';
 import { DepartmentHierarchyList, DepartmentOrgNode } from './DepartmentGraph';
+import type { DepartmentGraphNode } from './departmentLayout';
 import { organizationFixture } from './departmentTestFixture';
 
 afterEach(cleanup);
@@ -80,13 +82,23 @@ it('uses the graph classification so filtered shared and executive agents render
 });
 
 it('renders workspace and shared rail nodes as non-interactive containers', () => {
-  const node = (id: string, kind: 'workspace' | 'shared-rail', name: string) => ({
+  const node = (id: string, kind: 'workspace' | 'shared-rail', name: string): NodeProps<DepartmentGraphNode> => ({
     id,
     data: { kind, name },
+    type: 'departmentOrg',
+    dragging: false,
+    zIndex: 0,
+    selectable: false,
+    deletable: false,
+    selected: false,
+    draggable: false,
+    isConnectable: false,
+    positionAbsoluteX: 0,
+    positionAbsoluteY: 0,
   });
   render(<>
-    <DepartmentOrgNode {...node('workspace', 'workspace', 'Acme') as never}/>
-    <DepartmentOrgNode {...node('shared-rail', 'shared-rail', 'Shared specialists') as never}/>
+    <DepartmentOrgNode {...node('workspace', 'workspace', 'Acme')}/>
+    <DepartmentOrgNode {...node('shared-rail', 'shared-rail', 'Shared specialists')}/>
   </>);
 
   expect(screen.queryByRole('button', { name: /Acme|Shared specialists/ })).toBeNull();

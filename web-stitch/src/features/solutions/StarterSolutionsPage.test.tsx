@@ -31,6 +31,7 @@ function renderPage(role: NonNullable<Session['workspace']['role']>, path = '/so
 const installedDraft: AgentSolutionInstallation = {
   id: 'installed-draft', source_type: 'starter', solution_slug: solution.slug, solution_version: 1,
   solution_name: solution.name, status: 'draft', solution, resources: { agentIds: {} }, last_test_status: 'completed',
+  created_at: '2026-07-26T00:00:00.000Z', updated_at: '2026-07-26T00:00:00.000Z',
 };
 
 beforeEach(() => {
