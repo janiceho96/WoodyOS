@@ -20,7 +20,8 @@ const inputSchema = z.object({
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
-async function accessToken(config: RedditConfig) {
+async function accessToken(config: RedditConfig, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   if (!config.clientId || !config.clientSecret) throw Object.assign(new Error('Reddit OAuth credentials are not configured'), { statusCode: 400 });
   const cacheKey = createHash('sha256').update(`${config.clientId}\0${config.clientSecret}`).digest('hex');
   const cached = tokenCache.get(cacheKey);
@@ -34,6 +35,7 @@ async function accessToken(config: RedditConfig) {
     },
     body: 'grant_type=client_credentials',
     maxBytes: 200_000,
+    signal,
   });
   const body = jsonBody<{ access_token?: string; expires_in?: number; error?: string }>(response);
   if (!body.access_token) throw Object.assign(new Error(`Reddit OAuth did not return an access token${body.error ? `: ${body.error}` : ''}`), { statusCode: 502 });
@@ -41,9 +43,9 @@ async function accessToken(config: RedditConfig) {
   return body.access_token;
 }
 
-export async function searchReddit(config: RedditConfig, value: Record<string, unknown>) {
+export async function searchReddit(config: RedditConfig, value: Record<string, unknown>, signal?: AbortSignal) {
   const input = inputSchema.parse(value);
-  const token = await accessToken(config);
+  const token = await accessToken(config, signal);
   const limit = Math.min(input.maxResults ?? config.maxResults ?? 5, config.maxResults ?? 10, 10);
   const url = new URL(input.subreddit ? `https://oauth.reddit.com/r/${input.subreddit}/search` : 'https://oauth.reddit.com/search');
   url.searchParams.set('q', input.query);
@@ -52,7 +54,7 @@ export async function searchReddit(config: RedditConfig, value: Record<string, u
   url.searchParams.set('t', input.timeRange);
   url.searchParams.set('restrict_sr', input.subreddit ? 'true' : 'false');
   url.searchParams.set('raw_json', '1');
-  const response = await safeHttpRequest(url.toString(), { headers: { authorization: `Bearer ${token}`, 'user-agent': config.userAgent }, maxBytes: 1_500_000 });
+  const response = await safeHttpRequest(url.toString(), { headers: { authorization: `Bearer ${token}`, 'user-agent': config.userAgent }, maxBytes: 1_500_000, signal });
   const body = jsonBody<{ data?: { children?: Array<{ data?: Record<string, unknown> }> } }>(response);
   const results = (body.data?.children ?? []).map((child) => child.data ?? {}).map((post) => ({
     id: String(post.id ?? ''),
@@ -71,7 +73,7 @@ export async function searchReddit(config: RedditConfig, value: Record<string, u
   };
 }
 
-export async function testReddit(config: RedditConfig) {
-  await accessToken(config);
+export async function testReddit(config: RedditConfig, signal?: AbortSignal) {
+  await accessToken(config, signal);
   return { status: 'healthy', provider: 'reddit-data-api', authentication: 'oauth' };
 }

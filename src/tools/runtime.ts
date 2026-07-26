@@ -63,8 +63,8 @@ export async function invokeTool(
   callerSignal?: AbortSignal,
 ) {
   const config = decryptJson(tool.config);
-  if (isWebToolConfig(config)) return invokeWebTool(config, input, healthCheck);
-  if (isJobToolConfig(config)) return invokeJobTool(config, input, healthCheck);
+  if (isWebToolConfig(config)) return invokeWebTool(config, input, healthCheck, callerSignal);
+  if (isJobToolConfig(config)) return invokeJobTool(config, input, healthCheck, callerSignal);
   const healthUrl = config.healthCheckUrl;
   if (healthCheck && typeof healthUrl !== 'string') throw new Error('A healthCheckUrl is required to test this tool safely');
   const endpoint = await safeEndpoint(String(healthCheck ? healthUrl : config.endpoint ?? ''));

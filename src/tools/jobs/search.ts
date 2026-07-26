@@ -23,7 +23,7 @@ function text(value: unknown, limit = 500) {
   return typeof value === 'string' ? value.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit) : '';
 }
 
-export async function searchJobs(config: JobSearchConfig, value: Record<string, unknown>) {
+export async function searchJobs(config: JobSearchConfig, value: Record<string, unknown>, signal?: AbortSignal) {
   if (!config.appId || !config.appKey) throw Object.assign(new Error('Adzuna credentials are not configured'), { statusCode: 400 });
   const input = jobSearchInput.parse(value);
   const limit = Math.min(input.maxResults ?? config.maxResults ?? 5, config.maxResults ?? 10, 10);
@@ -40,7 +40,7 @@ export async function searchJobs(config: JobSearchConfig, value: Record<string, 
   if (input.permanent !== undefined) endpoint.searchParams.set('permanent', input.permanent ? '1' : '0');
   let body: { count?: number; results?: Array<Record<string, unknown>> };
   try {
-    const response = await safeHttpRequest(endpoint.toString(), { maxBytes: 1_500_000, timeoutMs: 20_000 });
+    const response = await safeHttpRequest(endpoint.toString(), { maxBytes: 1_500_000, timeoutMs: 20_000, signal });
     body = jsonBody<{ count?: number; results?: Array<Record<string, unknown>> }>(response);
   } catch {
     throw Object.assign(
@@ -81,7 +81,7 @@ export async function searchJobs(config: JobSearchConfig, value: Record<string, 
   };
 }
 
-export async function testJobSearch(config: JobSearchConfig) {
-  const output = await searchJobs({ ...config, maxResults: 1 }, { query: 'software', maxResults: 1 });
+export async function testJobSearch(config: JobSearchConfig, signal?: AbortSignal) {
+  const output = await searchJobs({ ...config, maxResults: 1 }, { query: 'software', maxResults: 1 }, signal);
   return { provider: config.provider, status: 'healthy', resultCount: output.resultCount };
 }

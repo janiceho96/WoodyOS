@@ -99,6 +99,22 @@ type Task = {
   parent_span_id: string | null;
   created_at: string;
 };
+
+async function finalizeIfCancellationRequested(subject: {
+  kind: 'task' | 'workflow_run';
+  id: string;
+}) {
+  const table = subject.kind === 'task' ? 'tasks' : 'workflow_runs';
+  const status = (await query<{ status: string }>(
+    `SELECT status FROM ${table} WHERE id=$1`,
+    [subject.id],
+  )).rows[0]?.status;
+  if (!['cancel_requested', 'cancelling', 'cancelled', 'cancelled_with_side_effects'].includes(status ?? '')) {
+    return false;
+  }
+  await finalizeCancellation(subject);
+  return true;
+}
 function openAiToolDefinitions(tools: ToolRecord[]): ChatCompletionTool[] {
   return tools.map((tool) => {
     const definition = definitionFor(tool);
@@ -342,6 +358,7 @@ export async function executeAgentTask(
     )).rows[0];
     if (!task) {
       if (signal.aborted) await finalizeCancellation({ kind: 'task', id: taskId });
+      else await finalizeIfCancellationRequested({ kind: 'task', id: taskId });
       return null;
     }
     const taskTrace = authoritativeTraceContext(task, queuedTraceId);
@@ -685,12 +702,16 @@ export async function executeAgentTask(
         await enqueueWorkflowRun(task.workflow_run_id, `${task.workflow_run_id}:${task.id}:mcp-resume`, 0, task.trace_id);
       } catch (resumeError) {
         const serialized = serializeRuntimeError(resumeError);
-        await query(
-          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued'",
+        const failedRun = await query(
+          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued' RETURNING id",
           [JSON.stringify({ error: serialized }), JSON.stringify(serialized), task.workflow_run_id],
         );
-        await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [task.workflow_run_id]);
-        await taskEvent(task.workspace_id, task.id, 'workflow.resume_failed', 'Task completed, but its workflow could not resume', { error: resumeError instanceof Error ? resumeError.message : 'Workflow queue unavailable' });
+        if (!failedRun.rowCount) {
+          await finalizeIfCancellationRequested({ kind: 'workflow_run', id: task.workflow_run_id });
+        } else {
+          await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [task.workflow_run_id]);
+          await taskEvent(task.workspace_id, task.id, 'workflow.resume_failed', 'Task completed, but its workflow could not resume', { error: resumeError instanceof Error ? resumeError.message : 'Workflow queue unavailable' });
+        }
       }
     }
     return output;
@@ -705,7 +726,12 @@ export async function executeAgentTask(
       await finalizeCancellation({ kind: 'task', id: task.id });
       return null;
     }
-    await query("UPDATE tasks SET status='failed',error=$1,completed_at=now(),updated_at=now() WHERE id=$2", [JSON.stringify(serialized), task.id]);
+    const failedTask = await query(
+      "UPDATE tasks SET status='failed',error=$1,completed_at=now(),updated_at=now() WHERE id=$2 AND status='running' RETURNING id",
+      [JSON.stringify(serialized), task.id],
+    );
+    if (!failedTask.rowCount && await finalizeIfCancellationRequested({ kind: 'task', id: task.id })) return null;
+    if (!failedTask.rowCount) throw error;
     await query("UPDATE artifacts SET status='failed',error_message='Source task failed',updated_at=now() WHERE task_id=$1 AND status='pending'", [task.id]);
     await taskEvent(task.workspace_id, task.id, 'task.failed', serialized.message, { error: serialized }, taskTrace);
     throw error;
@@ -795,12 +821,17 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
         await assertWorkflowRunManifestDependencies(run);
       } catch (error) {
         const serialized = serializeRuntimeError(error);
-        await query(
+        const failedRun = await query(
           `UPDATE workflow_runs
               SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now()
-            WHERE id=$3 AND status IN ('queued','awaiting_approval')`,
+            WHERE id=$3 AND status IN ('queued','awaiting_approval')
+            RETURNING id`,
           [JSON.stringify({ error: serialized }), JSON.stringify(serialized), job.data.workflowRunId],
         );
+        if (!failedRun.rowCount && await finalizeIfCancellationRequested({
+          kind: 'workflow_run',
+          id: job.data.workflowRunId,
+        })) return null;
         await query(
           "UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'",
           [job.data.workflowRunId],
@@ -817,6 +848,10 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
       await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
       return null;
     }
+    if (await finalizeIfCancellationRequested({
+      kind: 'workflow_run',
+      id: job.data.workflowRunId,
+    })) return null;
     return result;
   } catch (error) {
     const serialized = serializeRuntimeError(error);
@@ -824,6 +859,10 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
       await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
       return null;
     }
+    if (await finalizeIfCancellationRequested({
+      kind: 'workflow_run',
+      id: job.data.workflowRunId,
+    })) return null;
     throw error;
   } finally {
     cancellation.stop();

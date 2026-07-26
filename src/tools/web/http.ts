@@ -3,6 +3,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
 import { isPublicIp } from '../../lib/network.js';
+import { combinedAbortSignal } from '../../runtime/cancellation.js';
 
 export type SafeHttpResponse = {
   status: number;
@@ -19,6 +20,7 @@ export type SafeHttpOptions = {
   maxBytes?: number;
   maxRedirects?: number;
   allowCrossOriginRedirects?: boolean;
+  signal?: AbortSignal;
 };
 
 export function validatedPublicHttpsUrl(raw: string) {
@@ -64,6 +66,7 @@ function headerMap(headers: Record<string, string | string[] | undefined>) {
 }
 
 async function oneRequest(url: URL, options: Required<Pick<SafeHttpOptions, 'method' | 'timeoutMs' | 'maxBytes'>> & SafeHttpOptions) {
+  options.signal?.throwIfAborted();
   const pinned = await pinnedAddress(url);
   const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
   return new Promise<SafeHttpResponse>((resolve, reject) => {
@@ -84,6 +87,7 @@ async function oneRequest(url: URL, options: Required<Pick<SafeHttpOptions, 'met
       lookup: createPinnedLookup(pinned),
       servername: url.hostname,
       timeout: options.timeoutMs,
+      signal: combinedAbortSignal(options.signal, options.timeoutMs),
     }, (response) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
@@ -118,6 +122,7 @@ export async function safeHttpRequest(rawUrl: string, options: SafeHttpOptions =
   const headers = { ...(options.headers ?? {}) };
   const maxRedirects = Math.min(3, Math.max(0, options.maxRedirects ?? 0));
   for (let redirect = 0; redirect <= maxRedirects; redirect++) {
+    options.signal?.throwIfAborted();
     const response = await oneRequest(url, {
       ...options,
       method,

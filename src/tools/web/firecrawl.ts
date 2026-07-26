@@ -26,7 +26,7 @@ function authorization(apiKey: string) {
   return { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' };
 }
 
-export async function extractWithFirecrawl(config: FirecrawlExtractConfig, value: Record<string, unknown>) {
+export async function extractWithFirecrawl(config: FirecrawlExtractConfig, value: Record<string, unknown>, signal?: AbortSignal) {
   const input = extractInput.parse(value);
   const requested = await assertPublicHttpsUrl(input.url);
   if (requested.pathname.toLowerCase().endsWith('.pdf')) {
@@ -53,6 +53,7 @@ export async function extractWithFirecrawl(config: FirecrawlExtractConfig, value
     }),
     timeoutMs: 30_000,
     maxBytes: 3_000_000,
+    signal,
   });
   const body = jsonBody<{ success?: boolean; data?: { markdown?: unknown; metadata?: Record<string, unknown> } }>(response);
   const markdown = typeof body.data?.markdown === 'string' ? body.data.markdown.trim() : '';
@@ -70,11 +71,12 @@ export async function extractWithFirecrawl(config: FirecrawlExtractConfig, value
   };
 }
 
-export async function testFirecrawl(config: Pick<FirecrawlExtractConfig, 'apiKey'>) {
+export async function testFirecrawl(config: Pick<FirecrawlExtractConfig, 'apiKey'>, signal?: AbortSignal) {
   const response = await safeHttpRequest('https://api.firecrawl.dev/v2/team/token-usage', {
     headers: authorization(config.apiKey),
     timeoutMs: 15_000,
     maxBytes: 500_000,
+    signal,
   });
   jsonBody<Record<string, unknown>>(response);
   return { provider: 'firecrawl', status: 'healthy' };

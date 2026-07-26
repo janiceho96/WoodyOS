@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db, query } from '../db/client.js';
 import { audit } from '../lib/audit.js';
 import { asyncRoute, parse } from '../lib/http.js';
-import { enqueueWorkflowRun } from '../queue/task-queue.js';
+import { enqueueTask, enqueueWorkflowRun } from '../queue/task-queue.js';
 import { assertWorkspaceAiBudgetAvailable } from '../lib/ai-usage.js';
 import { workflowDefinitionErrors, workflowDefinitionSchema, type WorkflowDefinition } from '../workflows/definition.js';
 import { requestWorkflowArtifacts } from '../artifacts/service.js';
@@ -555,57 +555,155 @@ export async function workflowRoutes(app: FastifyInstance) {
         trace.parentSpanId,
       ],
     );
+    const childTasks = await query<{ id: string; trace_id: string }>(
+      `SELECT id,trace_id FROM tasks
+       WHERE workflow_run_id=$1 AND workspace_id=$2
+         AND status IN ('cancel_requested','cancelling')`,
+      [result.id, request.user.workspaceId],
+    );
+    await Promise.all([
+      enqueueWorkflowRun(result.id, result.id, 0, result.trace_id),
+      ...childTasks.rows.map((task) => enqueueTask(task.id, task.id, task.trace_id)),
+    ]);
     await audit(request.user.workspaceId, request.user.sub, 'workflow.cancel_requested', 'workflow_run', result.id);
     return reply.code(202).send(result);
   }));
   app.post('/runs/:runId/approvals/:approvalId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;
     const params = request.params as { runId: string; approvalId: string };
-    const run = (await query<{
-      run_mode: 'test' | 'production';
-      execution_manifest: ExecutionManifest | null;
-      trace_id: string;
-      span_id: string;
-      parent_span_id: string | null;
-    }>(
-      `SELECT run_mode,execution_manifest,trace_id,span_id,parent_span_id
-         FROM workflow_runs WHERE id=$1 AND workspace_id=$2`,
-      [params.runId, request.user.workspaceId],
-    )).rows[0];
-    if (!run) {
-      return reply.code(409).send({
-        error: 'RUN_MANIFEST_INCOMPATIBLE',
-        details: { reasons: ['Execution run is missing'] },
-      });
-    }
-    const traceId = authoritativeTraceContext(run).traceId;
-    if (input.decision === 'approved') {
-      const compatibility = run?.run_mode === 'production'
-        ? validateManifestCompatibility(run.execution_manifest)
-        : { ok: true, reasons: [] };
-      if (!compatibility.ok) {
+    const client = await db.connect();
+    let traceId = '';
+    let approval: Record<string, unknown> | null = null;
+    try {
+      await client.query('BEGIN');
+      const run = (await client.query<{
+        run_mode: 'test' | 'production';
+        execution_manifest: ExecutionManifest | null;
+        trace_id: string;
+        span_id: string;
+        parent_span_id: string | null;
+        status: string;
+      }>(
+        `SELECT run_mode,execution_manifest,trace_id,span_id,parent_span_id,status
+           FROM workflow_runs
+          WHERE id=$1 AND workspace_id=$2
+          FOR UPDATE`,
+        [params.runId, request.user.workspaceId],
+      )).rows[0];
+      if (!run) {
+        await client.query('ROLLBACK');
         return reply.code(409).send({
           error: 'RUN_MANIFEST_INCOMPATIBLE',
-          details: { reasons: compatibility.reasons },
+          details: { reasons: ['Execution run is missing'] },
         });
       }
+      traceId = authoritativeTraceContext(run).traceId;
+      if (run.status !== 'awaiting_approval') {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ error: 'APPROVAL_NOT_PENDING' });
+      }
+      if (input.decision === 'approved') {
+        const compatibility = run.run_mode === 'production'
+          ? validateManifestCompatibility(run.execution_manifest)
+          : { ok: true, reasons: [] };
+        if (!compatibility.ok) {
+          await client.query('ROLLBACK');
+          return reply.code(409).send({
+            error: 'RUN_MANIFEST_INCOMPATIBLE',
+            details: { reasons: compatibility.reasons },
+          });
+        }
+      }
+      const pending = await client.query(
+        `SELECT * FROM workflow_approvals
+          WHERE id=$1 AND workflow_run_id=$2 AND workspace_id=$3 AND status='pending'
+          FOR UPDATE`,
+        [params.approvalId, params.runId, request.user.workspaceId],
+      );
+      if (!pending.rowCount) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ error: 'APPROVAL_NOT_PENDING' });
+      }
+      const resolved = await client.query(
+        `UPDATE workflow_approvals
+            SET status=$1,resolved_at=now(),resolved_by=$2,comment=$3
+          WHERE id=$4 AND workflow_run_id=$5 AND workspace_id=$6 AND status='pending'
+          RETURNING *`,
+        [input.decision, request.user.sub, input.comment ?? null, params.approvalId, params.runId, request.user.workspaceId],
+      );
+      const transitioned = input.decision === 'rejected'
+        ? await client.query(
+          `UPDATE workflow_runs SET status='cancelled',completed_at=now(),updated_at=now()
+            WHERE id=$1 AND workspace_id=$2 AND status='awaiting_approval' RETURNING id`,
+          [params.runId, request.user.workspaceId],
+        )
+        : await client.query(
+          `UPDATE workflow_runs SET status='queued',updated_at=now()
+            WHERE id=$1 AND workspace_id=$2 AND status='awaiting_approval' RETURNING id`,
+          [params.runId, request.user.workspaceId],
+        );
+      if (!resolved.rowCount || !transitioned.rowCount) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ error: 'APPROVAL_NOT_PENDING' });
+      }
+      approval = resolved.rows[0];
+      if (input.decision === 'rejected') {
+        await client.query(
+          "UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'",
+          [params.runId],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
-    const approval = await query("UPDATE workflow_approvals SET status=$1,resolved_at=now(),resolved_by=$2,comment=$3 WHERE id=$4 AND workflow_run_id=$5 AND workspace_id=$6 AND status='pending' RETURNING *", [input.decision, request.user.sub, input.comment ?? null, params.approvalId, params.runId, request.user.workspaceId]);
-    if (!approval.rowCount) return reply.code(409).send({ error: 'APPROVAL_NOT_PENDING' });
-    if (input.decision === 'rejected') {
-      await query("UPDATE workflow_runs SET status='cancelled',completed_at=now(),updated_at=now() WHERE id=$1", [params.runId]);
-      await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [params.runId]);
-    }
-    else {
-      await query("UPDATE workflow_runs SET status='queued',updated_at=now() WHERE id=$1", [params.runId]);
+    if (input.decision === 'approved') {
       try {
         await enqueueWorkflowRun(params.runId, `${params.runId}-${params.approvalId}`, 0, traceId);
       } catch (queueError) {
-        await query("UPDATE workflow_approvals SET status='pending',resolved_at=NULL,resolved_by=NULL,comment=NULL WHERE id=$1", [params.approvalId]);
-        await query("UPDATE workflow_runs SET status='awaiting_approval',updated_at=now() WHERE id=$1", [params.runId]);
+        const recovery = await db.connect();
+        try {
+          await recovery.query('BEGIN');
+          const queued = await recovery.query(
+            `SELECT id FROM workflow_runs
+              WHERE id=$1 AND workspace_id=$2 AND status='queued'
+              FOR UPDATE`,
+            [params.runId, request.user.workspaceId],
+          );
+          if (queued.rowCount) {
+            await recovery.query(
+              `UPDATE workflow_approvals
+                  SET status='pending',resolved_at=NULL,resolved_by=NULL,comment=NULL
+                WHERE id=$1 AND workflow_run_id=$2 AND workspace_id=$3 AND status='approved'`,
+              [params.approvalId, params.runId, request.user.workspaceId],
+            );
+            await recovery.query(
+              `UPDATE workflow_runs SET status='awaiting_approval',updated_at=now()
+                WHERE id=$1 AND workspace_id=$2 AND status='queued'`,
+              [params.runId, request.user.workspaceId],
+            );
+          }
+          await recovery.query('COMMIT');
+        } catch (recoveryError) {
+          await recovery.query('ROLLBACK');
+          throw recoveryError;
+        } finally {
+          recovery.release();
+        }
         throw queueError;
       }
     }
-    return approval.rows[0];
+    await audit(
+      request.user.workspaceId,
+      request.user.sub,
+      `workflow.approval.${input.decision}`,
+      'workflow_run',
+      params.runId,
+      { approvalId: params.approvalId, comment: input.comment ?? null },
+    );
+    return approval;
   }));
 }

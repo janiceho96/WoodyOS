@@ -51,6 +51,10 @@ export type WorkflowActionRequest = WorkflowActionIdentity & {
   requestedBy: string;
   targetSummary?: string | null;
   trace: TraceContext;
+  precedingApproval?: {
+    nodeId: string;
+    iterationKey: string;
+  };
 };
 
 type AuthorizationRow = {
@@ -116,7 +120,7 @@ async function subjectAllowsActions(input: Pick<ActionRequest, 'workspaceId' | '
   return result.rows[0]?.subject_allows_actions !== false;
 }
 
-export async function authorizeAction(input: ActionRequest) {
+async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalSatisfied = false) {
   if (!(await subjectAllowsActions(input))) {
     return {
       status: 'denied' as const,
@@ -154,7 +158,9 @@ export async function authorizeAction(input: ActionRequest) {
     return { status: 'denied' as const, authorizationId: existing.id, reason: existing.error_message ?? `Action was ${existing.status}` };
   }
 
-  const status = actionNeedsConfirmation(input.riskLevel) ? 'awaiting_confirmation' : 'approved';
+  const status = actionNeedsConfirmation(input.riskLevel) && !precedingApprovalSatisfied
+    ? 'awaiting_confirmation'
+    : 'approved';
   let inserted;
   try {
     inserted = await query<{ id: string }>(
@@ -208,7 +214,9 @@ export async function authorizeAction(input: ActionRequest) {
       ],
     );
   } catch (error) {
-    if ((error as { code?: string }).code === '23505') return authorizeAction(input);
+    if ((error as { code?: string }).code === '23505') {
+      return authorizeActionWithTrust(input, precedingApprovalSatisfied);
+    }
     throw error;
   }
   if (!inserted.rowCount) {
@@ -223,8 +231,16 @@ export async function authorizeAction(input: ActionRequest) {
     : { status: 'awaiting_confirmation' as const, authorizationId: inserted.rows[0].id };
 }
 
+export function authorizeAction(input: ActionRequest) {
+  return authorizeActionWithTrust(input);
+}
+
 export function authorizeWorkflowAction(input: WorkflowActionRequest) {
-  return authorizeAction({
+  const precedingApprovalSatisfied = Boolean(
+    input.precedingApproval
+    && input.precedingApproval.iterationKey === input.iterationKey,
+  );
+  return authorizeActionWithTrust({
     workspaceId: input.workspaceId,
     subject: {
       type: 'workflow_run',
@@ -242,7 +258,7 @@ export function authorizeWorkflowAction(input: WorkflowActionRequest) {
     requestedBy: input.requestedBy,
     targetSummary: input.targetSummary,
     trace: input.trace,
-  });
+  }, precedingApprovalSatisfied);
 }
 
 export async function beginAction(authorizationId: string) {

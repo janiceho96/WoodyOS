@@ -6,15 +6,29 @@ const ids = vi.hoisted(() => ({
   user: '00000000-0000-4000-8000-000000000002',
   task: '00000000-0000-4000-8000-000000000003',
   workflowRun: '00000000-0000-4000-8000-000000000004',
+  childTask: '00000000-0000-4000-8000-000000000005',
 }));
 const state = vi.hoisted(() => ({
   requests: [] as Array<Record<string, unknown>>,
   audits: [] as string[],
+  enqueuedTasks: [] as Array<unknown[]>,
+  enqueuedWorkflows: [] as Array<unknown[]>,
 }));
 
 vi.mock('../src/db/client.js', () => ({
   db: { connect: vi.fn() },
-  query: vi.fn(async () => ({ rowCount: 0, rows: [] })),
+  query: vi.fn(async (sql: string) => {
+    if (sql.includes('FROM tasks') && sql.includes('workflow_run_id')) {
+      return {
+        rowCount: 1,
+        rows: [{
+          id: ids.childTask,
+          trace_id: '00000000-0000-4000-8000-000000000012',
+        }],
+      };
+    }
+    return { rowCount: 0, rows: [] };
+  }),
 }));
 vi.mock('../src/runtime/cancellation.js', () => ({
   requestCancellation: vi.fn(async (input: Record<string, unknown>) => {
@@ -34,8 +48,12 @@ vi.mock('../src/lib/audit.js', () => ({
   }),
 }));
 vi.mock('../src/queue/task-queue.js', () => ({
-  enqueueTask: vi.fn(),
-  enqueueWorkflowRun: vi.fn(),
+  enqueueTask: vi.fn(async (...args: unknown[]) => {
+    state.enqueuedTasks.push(args);
+  }),
+  enqueueWorkflowRun: vi.fn(async (...args: unknown[]) => {
+    state.enqueuedWorkflows.push(args);
+  }),
 }));
 vi.mock('../src/lib/ai-usage.js', () => ({
   assertWorkspaceAiBudgetAvailable: vi.fn(),
@@ -67,6 +85,8 @@ describe('cancellation routes', () => {
   beforeEach(() => {
     state.requests = [];
     state.audits = [];
+    state.enqueuedTasks = [];
+    state.enqueuedWorkflows = [];
   });
 
   it('requests task cancellation idempotently without declaring immediate completion', async () => {
@@ -84,6 +104,11 @@ describe('cancellation routes', () => {
       { kind: 'task', id: ids.task, workspaceId: ids.workspace, actorId: ids.user },
     ]);
     expect(state.audits).toEqual(['task.cancel_requested', 'task.cancel_requested']);
+    expect(state.enqueuedTasks).toEqual([
+      [ids.task, ids.task, '00000000-0000-4000-8000-000000000010'],
+      [ids.task, ids.task, '00000000-0000-4000-8000-000000000010'],
+    ]);
+    expect(state.enqueuedWorkflows).toEqual([]);
   });
 
   it('exposes the same cancellation transition for workflow runs', async () => {
@@ -106,5 +131,16 @@ describe('cancellation routes', () => {
       actorId: ids.user,
     }]);
     expect(state.audits).toEqual(['workflow.cancel_requested']);
+    expect(state.enqueuedWorkflows).toEqual([[
+      ids.workflowRun,
+      ids.workflowRun,
+      0,
+      '00000000-0000-4000-8000-000000000010',
+    ]]);
+    expect(state.enqueuedTasks).toEqual([[
+      ids.childTask,
+      ids.childTask,
+      '00000000-0000-4000-8000-000000000012',
+    ]]);
   });
 });

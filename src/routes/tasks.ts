@@ -251,6 +251,7 @@ export async function taskRoutes(app: FastifyInstance) {
         cancellationTrace.parentSpanId,
       ],
     );
+    await enqueueTask(result.id, result.id, result.trace_id);
     await audit(request.user.workspaceId, request.user.sub, 'task.cancel_requested', 'task', result.id);
     return reply.code(202).send(result);
   }));

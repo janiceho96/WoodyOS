@@ -47,7 +47,7 @@ function mergedDomains(configured: string[] | undefined, requested: string[]) {
   return requested.filter((item) => configuredSet.has(item));
 }
 
-async function tavily(config: WebSearchConfig, input: SearchInput, limit: number) {
+async function tavily(config: WebSearchConfig, input: SearchInput, limit: number, signal?: AbortSignal) {
   if (!config.apiKey) throw Object.assign(new Error('Tavily API key is not configured'), { statusCode: 400 });
   const response = await safeHttpRequest('https://api.tavily.com/search', {
     method: 'POST',
@@ -60,12 +60,13 @@ async function tavily(config: WebSearchConfig, input: SearchInput, limit: number
       ...(input.days ? { time_range: input.days <= 1 ? 'day' : input.days <= 7 ? 'week' : input.days <= 31 ? 'month' : 'year' } : {}),
     }),
     maxBytes: 1_500_000,
+    signal,
   });
   const body = jsonBody<{ results?: Array<Record<string, unknown>>; usage?: { credits?: number } }>(response);
   return { results: (body.results ?? []).map((item) => result(item.title, item.url, item.content, item.published_date)).filter((item): item is SearchResult => Boolean(item)), usage: body.usage ?? null };
 }
 
-async function brave(config: WebSearchConfig, input: SearchInput, limit: number) {
+async function brave(config: WebSearchConfig, input: SearchInput, limit: number, signal?: AbortSignal) {
   if (!config.apiKey) throw Object.assign(new Error('Brave Search API key is not configured'), { statusCode: 400 });
   const searchUrl = new URL('https://api.search.brave.com/res/v1/web/search');
   const includeDomains = mergedDomains(config.allowedDomains, input.includeDomains);
@@ -76,20 +77,20 @@ async function brave(config: WebSearchConfig, input: SearchInput, limit: number)
   searchUrl.searchParams.set('safesearch', config.safeSearch ?? 'moderate');
   searchUrl.searchParams.set('extra_snippets', 'true');
   if (input.days) searchUrl.searchParams.set('freshness', input.days <= 1 ? 'pd' : input.days <= 7 ? 'pw' : input.days <= 31 ? 'pm' : 'py');
-  const response = await safeHttpRequest(searchUrl.toString(), { headers: { 'x-subscription-token': config.apiKey, accept: 'application/json' }, maxBytes: 1_500_000 });
+  const response = await safeHttpRequest(searchUrl.toString(), { headers: { 'x-subscription-token': config.apiKey, accept: 'application/json' }, maxBytes: 1_500_000, signal });
   const body = jsonBody<{ web?: { results?: Array<Record<string, unknown>> }; news?: { results?: Array<Record<string, unknown>> } }>(response);
   const rows = input.topic === 'news' ? body.news?.results ?? body.web?.results ?? [] : body.web?.results ?? [];
   return { results: rows.map((item) => result(item.title, item.url, [item.description, ...(Array.isArray(item.extra_snippets) ? item.extra_snippets : [])].filter(Boolean).join(' '), item.age)).filter((item): item is SearchResult => Boolean(item)), usage: null };
 }
 
-async function searxng(config: WebSearchConfig, input: SearchInput, limit: number) {
+async function searxng(config: WebSearchConfig, input: SearchInput, limit: number, signal?: AbortSignal) {
   if (!config.endpoint) throw Object.assign(new Error('SearXNG endpoint is not configured'), { statusCode: 400 });
   const searchUrl = validatedPublicHttpsUrl(config.endpoint);
   searchUrl.searchParams.set('q', input.query);
   searchUrl.searchParams.set('format', 'json');
   searchUrl.searchParams.set('safesearch', config.safeSearch === 'strict' ? '2' : '1');
   if (input.topic === 'news') searchUrl.searchParams.set('categories', 'news');
-  const response = await safeHttpRequest(searchUrl.toString(), { maxBytes: 1_500_000 });
+  const response = await safeHttpRequest(searchUrl.toString(), { maxBytes: 1_500_000, signal });
   const body = jsonBody<{ results?: Array<Record<string, unknown>> }>(response);
   const includes = mergedDomains(config.allowedDomains, input.includeDomains);
   const excludes = new Set([...(config.blockedDomains ?? []), ...input.excludeDomains]);
@@ -97,7 +98,7 @@ async function searxng(config: WebSearchConfig, input: SearchInput, limit: numbe
   return { results: rows.slice(0, limit), usage: null };
 }
 
-async function firecrawl(config: WebSearchConfig, input: SearchInput, limit: number) {
+async function firecrawl(config: WebSearchConfig, input: SearchInput, limit: number, signal?: AbortSignal) {
   if (!config.apiKey) throw Object.assign(new Error('Firecrawl API key is not configured'), { statusCode: 400 });
   const includeDomains = mergedDomains(config.allowedDomains, input.includeDomains);
   const excludeDomains = [...new Set([...(config.blockedDomains ?? []), ...input.excludeDomains])];
@@ -116,6 +117,7 @@ async function firecrawl(config: WebSearchConfig, input: SearchInput, limit: num
     }),
     timeoutMs: 30_000,
     maxBytes: 1_500_000,
+    signal,
   });
   const body = jsonBody<{ data?: { web?: Array<Record<string, unknown>>; news?: Array<Record<string, unknown>> }; creditsUsed?: number }>(response);
   const rows = input.topic === 'news' ? body.data?.news ?? body.data?.web ?? [] : body.data?.web ?? [];
@@ -125,13 +127,13 @@ async function firecrawl(config: WebSearchConfig, input: SearchInput, limit: num
   };
 }
 
-export async function searchWeb(config: WebSearchConfig, value: Record<string, unknown>) {
+export async function searchWeb(config: WebSearchConfig, value: Record<string, unknown>, signal?: AbortSignal) {
   const input = webSearchInput.parse(value);
   const limit = Math.min(input.maxResults ?? config.maxResults ?? 5, config.maxResults ?? 10, 10);
-  const output = config.provider === 'tavily' ? await tavily(config, input, limit)
-    : config.provider === 'brave' ? await brave(config, input, limit)
-      : config.provider === 'firecrawl' ? await firecrawl(config, input, limit)
-        : await searxng(config, input, limit);
+  const output = config.provider === 'tavily' ? await tavily(config, input, limit, signal)
+    : config.provider === 'brave' ? await brave(config, input, limit, signal)
+      : config.provider === 'firecrawl' ? await firecrawl(config, input, limit, signal)
+        : await searxng(config, input, limit, signal);
   return {
     type: 'web_search_results', provider: config.provider, query: input.query, resultCount: output.results.length,
     results: output.results.slice(0, limit), usage: output.usage,
@@ -139,7 +141,7 @@ export async function searchWeb(config: WebSearchConfig, value: Record<string, u
   };
 }
 
-export async function testWebSearch(config: WebSearchConfig) {
-  const output = await searchWeb({ ...config, maxResults: 1 }, { query: 'Woody Agent OS connectivity test', maxResults: 1 });
+export async function testWebSearch(config: WebSearchConfig, signal?: AbortSignal) {
+  const output = await searchWeb({ ...config, maxResults: 1 }, { query: 'Woody Agent OS connectivity test', maxResults: 1 }, signal);
   return { provider: config.provider, status: 'healthy', resultCount: output.resultCount };
 }

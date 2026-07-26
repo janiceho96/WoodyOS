@@ -7,13 +7,18 @@ const ids = vi.hoisted(() => ({
   agentVersion: '00000000-0000-4000-8000-000000000004',
   trace: '00000000-0000-4000-8000-000000000005',
   span: '00000000-0000-4000-8000-000000000006',
+  workflowRun: '00000000-0000-4000-8000-000000000008',
 }));
 const state = vi.hoisted(() => ({
   taskStatus: 'queued',
+  workflowStatus: 'queued',
   controller: new AbortController(),
   finalized: [] as string[],
   providerSignals: [] as Array<AbortSignal | undefined>,
   statements: [] as string[],
+  providerError: false,
+  workflowManifestError: false,
+  processors: {} as Record<string, (job: { data: Record<string, string> }) => Promise<unknown>>,
 }));
 
 const manifest = {
@@ -55,7 +60,14 @@ const task = {
 };
 
 vi.mock('bullmq', () => ({
-  Worker: class Worker {},
+  Worker: class Worker {
+    constructor(
+      queue: string,
+      processor: (job: { data: Record<string, string> }) => Promise<unknown>,
+    ) {
+      state.processors[queue] = processor;
+    }
+  },
 }));
 vi.mock('ioredis', () => ({
   Redis: class Redis {},
@@ -64,6 +76,26 @@ vi.mock('../src/db/client.js', () => ({
   query: vi.fn(async (sql: string) => {
     state.statements.push(sql);
     if (sql.includes('runtime_trust_migration_applied_at')) {
+      if (sql.includes('FROM workflow_runs')) {
+        const selectable = state.workflowStatus === 'queued'
+          || state.workflowStatus === 'cancel_requested';
+        return {
+          rowCount: selectable ? 1 : 0,
+          rows: selectable ? [{
+            workspace_id: ids.workspace,
+            workflow_version_id: '00000000-0000-4000-8000-000000000009',
+            definition_snapshot: { nodes: [], edges: [] },
+            run_mode: 'production',
+            execution_manifest: manifest,
+            trace_id: ids.trace,
+            span_id: ids.span,
+            parent_span_id: null,
+            created_at: task.created_at,
+            runtime_trust_migration_applied_at: '2026-07-26T00:00:00.000Z',
+            status: state.workflowStatus,
+          }] : [],
+        };
+      }
       const selectable = state.taskStatus === 'queued'
         || (state.taskStatus === 'cancel_requested' && sql.includes('cancel_requested'));
       return {
@@ -81,6 +113,20 @@ vi.mock('../src/db/client.js', () => ({
     if (sql.includes("UPDATE tasks SET status='running'")) {
       state.taskStatus = 'running';
       return { rowCount: 1, rows: [{ ...task }] };
+    }
+    if (sql.includes("UPDATE tasks SET status='failed'")) {
+      state.taskStatus = 'cancel_requested';
+      return { rowCount: sql.includes("status='running'") ? 0 : 1, rows: [] };
+    }
+    if (sql.includes('UPDATE workflow_runs') && sql.includes("SET status='failed'")) {
+      state.workflowStatus = 'cancel_requested';
+      return { rowCount: 0, rows: [] };
+    }
+    if (sql.includes('SELECT status FROM tasks')) {
+      return { rowCount: 1, rows: [{ status: state.taskStatus }] };
+    }
+    if (sql.includes('SELECT status FROM workflow_runs')) {
+      return { rowCount: 1, rows: [{ status: state.workflowStatus }] };
     }
     if (sql.includes('FROM agent_versions')) {
       return {
@@ -133,7 +179,9 @@ vi.mock('../src/runtime/cancellation.js', async (importOriginal) => ({
 vi.mock('../src/runtime/manifest.js', () => ({
   assertManifestCompatible: vi.fn(() => manifest),
   assertTaskManifestDependencies: vi.fn(async () => undefined),
-  assertWorkflowRunManifestDependencies: vi.fn(async () => undefined),
+  assertWorkflowRunManifestDependencies: vi.fn(async () => {
+    if (state.workflowManifestError) throw new Error('manifest dependency unavailable');
+  }),
   validateManifestCompatibility: vi.fn(() => ({ ok: true, reasons: [] })),
 }));
 vi.mock('../src/lib/ai-provider.js', () => ({
@@ -147,14 +195,17 @@ vi.mock('../src/lib/ai-provider.js', () => ({
         create: vi.fn((_input: unknown, options?: { signal?: AbortSignal }) => {
           state.providerSignals.push(options?.signal);
           return {
-            withResponse: vi.fn(async () => ({
-              data: {
-                usage: { input_tokens: 1, output_tokens: 1 },
-                content: [{ type: 'text', text: 'done' }],
-              },
-              request_id: 'request-a',
-              response: { headers: new Headers() },
-            })),
+            withResponse: vi.fn(async () => {
+              if (state.providerError) throw new Error('provider unavailable');
+              return {
+                data: {
+                  usage: { input_tokens: 1, output_tokens: 1 },
+                  content: [{ type: 'text', text: 'done' }],
+                },
+                request_id: 'request-a',
+                response: { headers: new Headers() },
+              };
+            }),
           };
         }),
       },
@@ -205,10 +256,13 @@ import { executeAgentTask } from '../src/worker.js';
 describe('task worker cancellation', () => {
   beforeEach(() => {
     state.taskStatus = 'queued';
+    state.workflowStatus = 'queued';
     state.controller = new AbortController();
     state.finalized = [];
     state.providerSignals = [];
     state.statements = [];
+    state.providerError = false;
+    state.workflowManifestError = false;
   });
 
   it('finalizes queued cancellation without starting the provider', async () => {
@@ -225,5 +279,28 @@ describe('task worker cancellation', () => {
     await executeAgentTask(ids.task, ids.trace);
 
     expect(state.providerSignals).toEqual([state.controller.signal]);
+  });
+
+  it('finalizes when cancellation wins before a task failure write observes the poll signal', async () => {
+    state.providerError = true;
+
+    await expect(executeAgentTask(ids.task, ids.trace)).resolves.toBeNull();
+
+    expect(state.finalized).toEqual([ids.task]);
+    const failureWrite = state.statements.find((sql) => sql.includes("UPDATE tasks SET status='failed'"));
+    expect(failureWrite).toContain("status='running'");
+    expect(failureWrite).toContain('RETURNING id');
+  });
+
+  it('finalizes when cancellation wins the workflow manifest failure transition', async () => {
+    state.workflowManifestError = true;
+    const processor = state.processors.workflows;
+
+    await expect(processor({
+      data: { workflowRunId: ids.workflowRun, traceId: ids.trace },
+    })).resolves.toBeNull();
+
+    expect(state.finalized).toEqual([ids.workflowRun]);
+    expect(state.workflowStatus).toBe('cancel_requested');
   });
 });

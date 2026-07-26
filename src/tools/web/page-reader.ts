@@ -37,12 +37,12 @@ export function extractReadableHtml(html: string) {
   return { title, text };
 }
 
-export async function readPublicPage(config: PageReaderConfig, value: Record<string, unknown>) {
+export async function readPublicPage(config: PageReaderConfig, value: Record<string, unknown>, signal?: AbortSignal) {
   const input = inputSchema.parse(value);
   const requested = validatedPublicHttpsUrl(input.url);
   if ((config.blockedDomains ?? []).some((domain) => matchesDomain(requested.hostname, domain))) throw Object.assign(new Error('This domain is blocked by the workspace page-reader policy'), { statusCode: 403 });
   if ((config.allowedDomains ?? []).length && !(config.allowedDomains ?? []).some((domain) => matchesDomain(requested.hostname, domain))) throw Object.assign(new Error('This domain is not in the page-reader allowlist'), { statusCode: 403 });
-  const response = await safeHttpRequest(requested.toString(), { maxBytes: 2_000_000, maxRedirects: 3, timeoutMs: 20_000 });
+  const response = await safeHttpRequest(requested.toString(), { maxBytes: 2_000_000, maxRedirects: 3, timeoutMs: 20_000, signal });
   if (response.status < 200 || response.status >= 300) throw Object.assign(new Error(`Page returned HTTP ${response.status}`), { statusCode: 502 });
   const contentType = response.headers['content-type']?.split(';')[0].trim().toLowerCase() ?? '';
   if (!['text/html', 'application/xhtml+xml', 'text/plain'].includes(contentType)) throw Object.assign(new Error(`Unsupported page content type: ${contentType || 'unknown'}`), { statusCode: 415 });
