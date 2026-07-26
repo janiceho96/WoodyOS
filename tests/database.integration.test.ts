@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+import type { PoolClient } from 'pg';
 
 const enabled = process.env.RUN_INTEGRATION === 'true';
 
@@ -13,6 +15,99 @@ describe.runIf(enabled)('database-backed API flow', () => {
   let mcpConnectionId = '';
   let starterInstallationId = '';
   let jobToolId = '';
+
+  type LegacyDepartmentFixtures = {
+    ambiguousManagerDepartmentId: string;
+    duplicateDepartmentIds: [string, string];
+    financeDepartmentId: string;
+    managerAgentId: string;
+    multiTeamAgentId: string;
+    primaryDepartmentId: string;
+    primaryAgentId: string;
+    researchDepartmentId: string;
+  };
+
+  async function withLegacyDepartmentMigration(
+    callback: (client: PoolClient, fixtures: LegacyDepartmentFixtures) => Promise<void>,
+  ) {
+    const { db } = await import('../src/db/client.js');
+    const client = await db.connect();
+    const schema = `department_legacy_${suffix.replace(/[^a-z0-9]/gi, '')}`;
+    try {
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET search_path TO "${schema}", public`);
+      await client.query(`
+        CREATE TABLE workspaces (id UUID PRIMARY KEY);
+        CREATE TABLE agents (id UUID PRIMARY KEY);
+        CREATE TABLE agent_teams (
+          id UUID PRIMARY KEY,
+          workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE team_memberships (
+          team_id UUID NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+          agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+          manager_agent_id UUID REFERENCES agents(id) ON DELETE SET NULL,
+          PRIMARY KEY(team_id, agent_id)
+        );
+      `);
+
+      const workspaceId = (await client.query<{ id: string }>('INSERT INTO workspaces(id) VALUES(gen_random_uuid()) RETURNING id')).rows[0].id;
+      const createAgent = async () => (await client.query<{ id: string }>('INSERT INTO agents(id) VALUES(gen_random_uuid()) RETURNING id')).rows[0].id;
+      const createLegacyTeam = async (name: string) => (await client.query<{ id: string }>(
+        'INSERT INTO agent_teams(id,workspace_id,name) VALUES(gen_random_uuid(),$1,$2) RETURNING id',
+        [workspaceId, name],
+      )).rows[0].id;
+      const managerAgentId = await createAgent();
+      const alternateManagerAgentId = await createAgent();
+      const multiTeamAgentId = await createAgent();
+      const primaryAgentId = await createAgent();
+      const ambiguousManagerAgentId = await createAgent();
+      const secondAmbiguousManagerAgentId = await createAgent();
+      const researchDepartmentId = await createLegacyTeam('Research');
+      const financeDepartmentId = await createLegacyTeam('Finance');
+      const primaryDepartmentId = await createLegacyTeam('Operations');
+      const ambiguousManagerDepartmentId = await createLegacyTeam('Ambiguous management');
+      const duplicateDepartmentIds: [string, string] = [
+        await createLegacyTeam('Repeated legacy team'),
+        await createLegacyTeam('Repeated legacy team'),
+      ];
+
+      await client.query(
+        `INSERT INTO team_memberships(team_id,agent_id,manager_agent_id)
+         VALUES($1,$2,$3),($4,$5,NULL),($6,$7,$3),($8,$9,$3),($8,$10,$11)`,
+        [
+          researchDepartmentId,
+          multiTeamAgentId,
+          managerAgentId,
+          financeDepartmentId,
+          multiTeamAgentId,
+          primaryDepartmentId,
+          primaryAgentId,
+          ambiguousManagerDepartmentId,
+          ambiguousManagerAgentId,
+          secondAmbiguousManagerAgentId,
+          alternateManagerAgentId,
+        ],
+      );
+      await client.query(await readFile(new URL('../src/db/migrations/029_departments.sql', import.meta.url), 'utf8'));
+      await callback(client, {
+        ambiguousManagerDepartmentId,
+        duplicateDepartmentIds,
+        financeDepartmentId,
+        managerAgentId,
+        multiTeamAgentId,
+        primaryDepartmentId,
+        primaryAgentId,
+        researchDepartmentId,
+      });
+    } finally {
+      await client.query('RESET search_path');
+      await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      client.release();
+    }
+  }
 
   function multipartFile(filename: string, contentType: string, content: string | Buffer, fields: Record<string, string> = {}) {
     const boundary = `----woody-integration-${suffix}`;
@@ -1025,5 +1120,74 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const task = await app.inject({ method: 'POST', url: '/v1/tasks', headers, payload: { agentId, title: 'Blocked by local budget', input: {} } });
     expect(task.statusCode, task.body).toBe(429);
     expect(task.json()).toMatchObject({ error: 'AI_BUDGET_EXHAUSTED' });
+  });
+
+  it('migrates legacy teams without inventing a primary department for multi-team agents', async () => {
+    const { query } = await import('../src/db/client.js');
+    await expect(query('SELECT 1 FROM departments LIMIT 1')).resolves.toBeDefined();
+
+    await withLegacyDepartmentMigration(async (client, {
+      ambiguousManagerDepartmentId,
+      financeDepartmentId,
+      duplicateDepartmentIds,
+      managerAgentId,
+      multiTeamAgentId,
+      primaryDepartmentId,
+      primaryAgentId,
+      researchDepartmentId,
+    }) => {
+      const memberships = await client.query<{
+        agent_id: string;
+        membership_type: 'primary' | 'shared';
+      }>(
+        `SELECT agent_id,membership_type
+           FROM department_memberships
+          WHERE agent_id=$1
+          ORDER BY membership_type`,
+        [multiTeamAgentId],
+      );
+
+      expect(memberships.rows).toHaveLength(2);
+      expect(memberships.rows.every((row) => row.membership_type === 'shared')).toBe(true);
+      await expect(client.query(
+        `SELECT membership_type FROM department_memberships
+          WHERE department_id=$1 AND agent_id=$2`,
+        [primaryDepartmentId, primaryAgentId],
+      )).resolves.toMatchObject({ rows: [{ membership_type: 'primary' }] });
+      await expect(client.query(
+        'SELECT id FROM departments WHERE id = ANY($1::uuid[]) ORDER BY id',
+        [[financeDepartmentId, primaryDepartmentId, researchDepartmentId]],
+      )).resolves.toMatchObject({ rowCount: 3 });
+      const duplicateNames = await client.query<{ name: string }>(
+        'SELECT name FROM departments WHERE id = ANY($1::uuid[]) ORDER BY id',
+        [duplicateDepartmentIds],
+      );
+      expect(duplicateNames.rows).toHaveLength(2);
+      expect(new Set(duplicateNames.rows.map((department) => department.name.toLowerCase())).size).toBe(2);
+      await expect(client.query(
+        'SELECT id,manager_agent_id FROM departments WHERE id = ANY($1::uuid[]) ORDER BY id',
+        [[ambiguousManagerDepartmentId, financeDepartmentId, researchDepartmentId]],
+      )).resolves.toMatchObject({
+        rows: expect.arrayContaining([
+          { id: ambiguousManagerDepartmentId, manager_agent_id: null },
+          { id: financeDepartmentId, manager_agent_id: null },
+          { id: researchDepartmentId, manager_agent_id: managerAgentId },
+        ]),
+      });
+      await expect(client.query('SELECT count(*)::int AS count FROM agent_teams')).resolves.toMatchObject({ rows: [{ count: 6 }] });
+    });
+  });
+
+  it('rejects a second primary department', async () => {
+    await withLegacyDepartmentMigration(async (client, {
+      primaryAgentId,
+      researchDepartmentId: secondDepartmentId,
+    }) => {
+      await expect(client.query(
+        `INSERT INTO department_memberships(department_id,agent_id,membership_type)
+         VALUES($1,$2,'primary')`,
+        [secondDepartmentId, primaryAgentId],
+      )).rejects.toMatchObject({ code: '23505' });
+    });
   });
 });
