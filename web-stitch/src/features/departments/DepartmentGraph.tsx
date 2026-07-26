@@ -45,20 +45,20 @@ function metricLabel(data: DepartmentGraphNode['data']) {
   return metrics.length ? metrics.join(' · ') : 'No active work';
 }
 
-function DepartmentOrgNode({ id, data }: NodeProps<DepartmentGraphNode>) {
+export function DepartmentOrgNode({ id, data }: NodeProps<DepartmentGraphNode>) {
   const callbacks = data as DepartmentGraphNode['data'] & GraphCallbacks;
   const focus = () => {
     if (isDepartmentFocusTarget(id)) callbacks.onFocus?.(id);
   };
   if (data.kind === 'workspace') {
-    return <button type="button" className="department-node workspace-node" onClick={focus}>
+    return <div className="department-node workspace-node">
       <Building2 size={18}/><span><small>Workspace</small><strong>{data.name}</strong></span>
-    </button>;
+    </div>;
   }
   if (data.kind === 'shared-rail') {
-    return <button type="button" className="department-node shared-rail-node" onClick={focus}>
+    return <div className="department-node shared-rail-node">
       <Share2 size={17}/><span><small>Collaboration rail</small><strong>{data.name}</strong></span>
-    </button>;
+    </div>;
   }
   if (data.kind === 'department') {
     return <article className="department-node department-card">

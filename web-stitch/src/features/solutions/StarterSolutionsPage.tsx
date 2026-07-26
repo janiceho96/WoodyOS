@@ -25,6 +25,7 @@ type Tab = 'starters' | 'generate' | 'installed';
 export function StarterSolutionsPage() {
   const { session } = useWorkspace();
   const canInstall = session.workspace.role === 'owner' || session.workspace.role === 'admin';
+  const canManageInstalledDrafts = canInstall || session.workspace.role === 'member';
   const location = useLocation();
   const inAgentLibrary = location.pathname === '/agents/library';
   const [params, setParams] = useSearchParams();
@@ -48,7 +49,7 @@ export function StarterSolutionsPage() {
     </div>
     {tab === 'starters' && <section id="create-panel-starters" role="tabpanel" aria-labelledby="create-tab-starters"><StarterCatalog canInstall={canInstall} openInstalled={() => setTab('installed')}/></section>}
     {tab === 'generate' && <section id="create-panel-generate" role="tabpanel" aria-labelledby="create-tab-generate"><PromptCompiler canInstall={canInstall} initialPrompt={params.get('prompt') ?? ''} initialAttachmentIds={initialAttachmentIds} openInstalled={() => setTab('installed')}/></section>}
-    {tab === 'installed' && <section id="create-panel-installed" role="tabpanel" aria-labelledby="create-tab-installed"><InstalledSolutions canInstall={canInstall}/></section>}
+    {tab === 'installed' && <section id="create-panel-installed" role="tabpanel" aria-labelledby="create-tab-installed"><InstalledSolutions canManageDrafts={canManageInstalledDrafts}/></section>}
   </div>;
 }
 
@@ -226,7 +227,7 @@ function PromptCompiler({ canInstall, openInstalled, initialPrompt = '', initial
   </div>;
 }
 
-function InstalledSolutions({ canInstall }: { canInstall: boolean }) {
+function InstalledSolutions({ canManageDrafts }: { canManageDrafts: boolean }) {
   const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const installations = useQuery({ queryKey: ['agent-solution-installations'], queryFn: api.agentSolutionInstallations, refetchInterval: 10_000 });
@@ -272,10 +273,10 @@ function InstalledSolutions({ canInstall }: { canInstall: boolean }) {
   return <div className="installed-solutions">
     {records.map((installation) => <article className="installed-solution panel" key={installation.id}>
       <div className="installed-head"><div><span className="eyebrow">{installation.source_type} · v{installation.solution_version}</span><h2>{installation.solution_name}</h2><p>{installation.solution.description}</p></div><Status value={installation.status}/></div>
-      <div className="installed-resources"><span><Bot size={14}/><strong>{installation.solution.agents.length}</strong> draft agents</span><span><Users size={14}/>1 team</span><span><GitBranch size={14}/>1 workflow</span><span><LockKeyhole size={14}/>0 automatic tool grants</span></div>
+      <div className="installed-resources"><span><Bot size={14}/><strong>{installation.solution.agents.length}</strong> draft agents</span><span><Users size={14}/>1 Department</span><span><GitBranch size={14}/>1 workflow</span><span><LockKeyhole size={14}/>0 automatic tool grants</span></div>
       <SolutionToolReadiness installation={installation} tools={data.tools} agents={data.agents}/>
       <WorkflowPreview solution={installation.solution}/>
-      {installation.status === 'draft' && <div className="solution-test-form"><div><span className="eyebrow">Safe test input</span><p>Draft testing runs the real workflow without activating agents or assigning integrations.</p></div><div className="test-input-grid">{installation.solution.requiredInputs.map((field) => <label key={field.key}>{field.label}{field.required && <span> *</span>}<input value={inputs[installation.id]?.[field.key] ?? ''} placeholder={field.example ?? field.description} onChange={(event) => setInputs((current) => ({ ...current, [installation.id]: { ...current[installation.id], [field.key]: event.target.value } }))}/></label>)}</div><div className="installed-actions"><span>{installation.last_test_status ? <>Last test: <Status value={installation.last_test_status}/></> : 'A successful test is required before activation.'}</span>{canInstall ? <><button className="button" disabled={test.isPending} onClick={() => test.mutate(installation)}>{test.isPending ? <LoaderCircle className="spin" size={14}/> : <Play size={14}/>}Run test · {installation.solution.estimatedModelCalls} calls</button><button className="button primary" disabled={activate.isPending || installation.last_test_status !== 'completed'} title={installation.last_test_status !== 'completed' ? 'Complete a successful test first' : undefined} onClick={() => activate.mutate(installation)}><Rocket size={14}/>Activate solution</button></> : <small>Administrator access required to change this draft.</small>}</div></div>}
+      {installation.status === 'draft' && <div className="solution-test-form"><div><span className="eyebrow">Safe test input</span><p>Draft testing runs the real workflow without activating agents or assigning integrations.</p></div><div className="test-input-grid">{installation.solution.requiredInputs.map((field) => <label key={field.key}>{field.label}{field.required && <span> *</span>}<input value={inputs[installation.id]?.[field.key] ?? ''} placeholder={field.example ?? field.description} onChange={(event) => setInputs((current) => ({ ...current, [installation.id]: { ...current[installation.id], [field.key]: event.target.value } }))}/></label>)}</div><div className="installed-actions"><span>{installation.last_test_status ? <>Last test: <Status value={installation.last_test_status}/></> : 'A successful test is required before activation.'}</span>{canManageDrafts ? <><button className="button" disabled={test.isPending} onClick={() => test.mutate(installation)}>{test.isPending ? <LoaderCircle className="spin" size={14}/> : <Play size={14}/>}Run test · {installation.solution.estimatedModelCalls} calls</button><button className="button primary" disabled={activate.isPending || installation.last_test_status !== 'completed'} title={installation.last_test_status !== 'completed' ? 'Complete a successful test first' : undefined} onClick={() => activate.mutate(installation)}><Rocket size={14}/>Activate solution</button></> : <small>Administrator access required to change this draft.</small>}</div></div>}
       {installation.status === 'active' && <div className="active-solution-note"><CheckCircle2 size={16}/><span><strong>Active</strong><small>Use the saved workflow from Workflow Designer. Assign reviewed MCP tools per agent when needed.</small></span></div>}
       {runContext?.installationId === installation.id && testRun.data && <TestRunResult run={testRun.data}/>}
     </article>)}

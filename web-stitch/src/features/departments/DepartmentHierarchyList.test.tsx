@@ -3,7 +3,7 @@ import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
-import { DepartmentHierarchyList } from './DepartmentGraph';
+import { DepartmentHierarchyList, DepartmentOrgNode } from './DepartmentGraph';
 import { organizationFixture } from './departmentTestFixture';
 
 afterEach(cleanup);
@@ -77,4 +77,19 @@ it('uses the graph classification so filtered shared and executive agents render
 
   expect(screen.getAllByRole('link', { name: /Sam Specialist/ })).toHaveLength(1);
   expect(screen.getAllByRole('link', { name: /Eli Executive/ })).toHaveLength(1);
+});
+
+it('renders workspace and shared rail nodes as non-interactive containers', () => {
+  const node = (id: string, kind: 'workspace' | 'shared-rail', name: string) => ({
+    id,
+    data: { kind, name },
+  });
+  render(<>
+    <DepartmentOrgNode {...node('workspace', 'workspace', 'Acme') as never}/>
+    <DepartmentOrgNode {...node('shared-rail', 'shared-rail', 'Shared specialists') as never}/>
+  </>);
+
+  expect(screen.queryByRole('button', { name: /Acme|Shared specialists/ })).toBeNull();
+  expect(screen.getByText('Acme').closest('div')?.className).toContain('workspace-node');
+  expect(screen.getByText('Shared specialists').closest('div')?.className).toContain('shared-rail-node');
 });
