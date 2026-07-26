@@ -142,6 +142,35 @@ export type Agent = {
   created_at: string;
   updated_at: string;
 };
+export type AgentMcpAccess = {
+  agentId: string;
+  agentStatus: Agent['status'];
+  connections: Array<{
+    id: string;
+    name: string;
+    permissionLevel: 'read' | 'read_write';
+    assignmentEnabled: boolean;
+    availability: {
+      available: boolean;
+      status: 'available' | 'agent_inactive' | 'assignment_disabled' | 'connection_disabled' | 'connection_unhealthy';
+      connectionEnabled: boolean;
+      healthStatus: string;
+    };
+    tools: Array<{
+      id: string;
+      remoteName: string;
+      title: string | null;
+      riskLevel: 'read' | 'write' | 'destructive' | 'external_write' | 'unknown';
+      permissionLevel: 'read' | 'read_write';
+      assignmentEnabled: boolean;
+      availability: {
+        available: boolean;
+        status: 'available' | 'agent_inactive' | 'assignment_disabled' | 'connection_disabled' | 'connection_unhealthy' | 'tool_disabled';
+        toolEnabled: boolean;
+      };
+    }>;
+  }>;
+};
 export type Task = {
   id: string;
   agent_id: string;
@@ -787,6 +816,7 @@ export const api = {
 
   agents: () => request<{ data: Agent[] }>('/v1/agents'),
   agent: (id: string) => request<Agent>(`/v1/agents/${id}`),
+  agentMcpAccess: (id: string) => request<AgentMcpAccess>(`/v1/agents/${id}/mcp-access`),
   createAgent: (body: Record<string, unknown>) =>
     request<Agent>('/v1/agents', { method: 'POST', body: JSON.stringify(body) }),
   updateAgent: (id: string, body: Record<string, unknown>) =>

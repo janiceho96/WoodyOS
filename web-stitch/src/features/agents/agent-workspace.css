@@ -136,6 +136,11 @@
 .agent-history-list>button>span:last-child { display:flex;align-items:center;gap:8px;color:var(--muted); }
 .agent-history-list strong,.agent-history-list small { overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
 .agent-history-list small { color:var(--muted);font-size:var(--text-caption); }
+.mcp-agent-resource-summary { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px; }
+.mcp-agent-resource-summary>div { display:grid;align-content:start;gap:6px;padding:11px;border:1px solid var(--border);border-radius:6px;background:var(--surface-low); }
+.mcp-agent-resource-summary>div>span { display:grid;gap:2px;padding-top:6px;border-top:1px solid var(--border); }
+.mcp-agent-resource-summary b { font-size:var(--text-caption); }
+.mcp-agent-resource-summary small { display:grid;gap:2px;color:var(--muted);font-size:var(--text-caption); }
 
 .agent-activity-panel { position:sticky;top:64px;height:calc(100vh - 64px);display:flex;flex-direction:column;overflow:hidden;border-left:1px solid var(--border-strong);background:color-mix(in srgb,var(--surface) 96%,transparent);box-shadow:-14px 0 36px rgba(0,0,0,.12); }
 .agent-activity-panel>header { display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:16px;border-bottom:1px solid var(--border); }
@@ -223,6 +228,7 @@
   .agent-workspace-header .button svg { width:17px;height:17px; }
   .agent-overview-grid,.agent-config-overview { grid-template-columns:1fr; }
   .agent-metric-grid { grid-template-columns:1fr 1fr; }
+  .mcp-agent-resource-summary { grid-template-columns:1fr; }
   .config-hero,.task-focus-card { align-items:stretch;flex-direction:column; }
   .config-hero .button { width:100%; }
   .task-focus-card>div:last-child { justify-content:flex-start; }

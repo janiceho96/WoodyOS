@@ -5,7 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api } from '../../api';
-import type { Agent, Session, Tool, WorkflowResources } from '../../api';
+import type { Agent, AgentMcpAccess, Session, Tool } from '../../api';
 import { WorkspaceContext, type WorkspaceContextValue } from '../../app/workspace';
 import { legacyMcpTools } from '../mcp/McpMarketplacePage';
 import { AgentBuilderPage } from './AgentBuilderPage';
@@ -15,7 +15,7 @@ vi.mock('../../api', () => ({
     updateAgent: vi.fn(),
     createAgent: vi.fn(),
     generateAgentPrompt: vi.fn(),
-    workflowResources: vi.fn(),
+    agentMcpAccess: vi.fn(),
   },
   isApiTool: (tool: { kind: string }) => tool.kind === 'api' || tool.kind === 'plugin' || tool.kind === 'internal',
 }));
@@ -62,27 +62,31 @@ const disabledApiTool = {
   enabled: false,
 } as Tool;
 
-const mcpResources = {
-  version: 1,
-  agents: [],
-  apiTools: [],
-  mcpTools: [
-    {
+const savedMcpAccess: AgentMcpAccess = {
+  agentId: 'agent-1',
+  agentStatus: 'draft',
+  connections: [{
+    id: 'docs-mcp',
+    name: 'Docs MCP',
+    permissionLevel: 'read',
+    assignmentEnabled: true,
+    availability: {
+      available: false,
+      status: 'agent_inactive',
+      connectionEnabled: false,
+      healthStatus: 'unhealthy',
+    },
+    tools: [{
       id: 'mcp-action',
-      connectionId: 'docs-mcp',
-      connectionName: 'Docs MCP',
       remoteName: 'search_docs',
       title: 'Search docs',
-      description: 'Search the documentation',
-      inputSchema: {},
       riskLevel: 'read',
-      agentId: 'agent-1',
-      connectionPermission: 'read',
-      toolPermission: 'read',
-    },
-  ],
-  knowledge: { scope: 'workspace', total: 0, ready: 0, processing: 0, failed: 0 },
-} as WorkflowResources;
+      permissionLevel: 'read',
+      assignmentEnabled: false,
+      availability: { available: false, status: 'agent_inactive', toolEnabled: false },
+    }],
+  }],
+};
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -103,7 +107,7 @@ function renderPage() {
 }
 
 beforeEach(() => {
-  vi.mocked(api.workflowResources).mockResolvedValue(mcpResources);
+  vi.mocked(api.agentMcpAccess).mockResolvedValue(savedMcpAccess);
 });
 
 afterEach(cleanup);
@@ -133,7 +137,36 @@ describe('AgentBuilderPage API Tool boundary', () => {
     expect(within(review as HTMLElement).getByText('API Tools')).toBeTruthy();
     expect(within(review as HTMLElement).getByText('Company API')).toBeTruthy();
     expect(within(review as HTMLElement).getByText('MCP access')).toBeTruthy();
-    expect(await within(review as HTMLElement).findByText('Docs MCP · Search docs')).toBeTruthy();
+    expect(await within(review as HTMLElement).findByText('Docs MCP · Search docs (Unavailable · agent draft)')).toBeTruthy();
+    expect(within(review as HTMLElement).getByLabelText('MCP access review status: warning')).toBeTruthy();
     expect(within(review as HTMLElement).queryByText('Integrations')).toBeNull();
+  });
+
+  it('renders MCP loading as neutral instead of success', async () => {
+    vi.mocked(api.agentMcpAccess).mockReturnValue(new Promise(() => undefined));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('button', { name: /Review/ }));
+
+    const review = screen.getByRole('heading', { name: 'Review before publishing' }).closest('.guided-section');
+    expect(review).toBeTruthy();
+    expect(await within(review as HTMLElement).findByText('Loading MCP access…')).toBeTruthy();
+    expect(within(review as HTMLElement).getByLabelText('MCP access review status: neutral')).toBeTruthy();
+    expect(within(review as HTMLElement).queryByLabelText('MCP access review status: success')).toBeNull();
+  });
+
+  it('renders an MCP loading error as warning instead of success', async () => {
+    vi.mocked(api.agentMcpAccess).mockRejectedValue(new Error('offline'));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('button', { name: /Review/ }));
+
+    const review = screen.getByRole('heading', { name: 'Review before publishing' }).closest('.guided-section');
+    expect(review).toBeTruthy();
+    expect(await within(review as HTMLElement).findByText('MCP access could not be loaded')).toBeTruthy();
+    expect(within(review as HTMLElement).getByLabelText('MCP access review status: warning')).toBeTruthy();
+    expect(within(review as HTMLElement).queryByLabelText('MCP access review status: success')).toBeNull();
   });
 });

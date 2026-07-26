@@ -3,14 +3,14 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import type { Agent, Session, Tool, WorkflowResources } from '../../api';
+import type { Agent, AgentMcpAccess, Session, Tool } from '../../api';
 import { api } from '../../api';
 import { WorkspaceContext, type WorkspaceContextValue } from '../../app/workspace';
 import { AgentWorkspacePage } from './AgentWorkspacePage';
 
 vi.mock('../../api', () => ({
   api: {
-    workflowResources: vi.fn(),
+    agentMcpAccess: vi.fn(),
   },
   isApiTool: (tool: { kind: string }) => tool.kind === 'api' || tool.kind === 'plugin' || tool.kind === 'internal',
 }));
@@ -22,7 +22,7 @@ const agent = {
   goal: 'Find accurate answers.',
   instructions: 'Verify every source.',
   personality: null,
-  status: 'active',
+  status: 'paused',
   model: 'gpt-5',
   model_config: { temperature: 0.2, maxTokens: 4096, topP: 1 },
   capabilities: { webBrowser: true, codeInterpreter: false, knowledgeBase: true },
@@ -43,53 +43,42 @@ const apiTool = {
   created_at: '2026-01-01T00:00:00.000Z',
 } as Tool;
 
-const resources = {
-  version: 1,
-  agents: [],
-  apiTools: [],
-  mcpTools: [
-    {
-      id: 'search-docs',
-      connectionId: 'docs',
-      connectionName: 'Docs MCP',
-      remoteName: 'search_docs',
-      title: 'Search docs',
-      description: 'Search docs',
-      inputSchema: {},
-      riskLevel: 'read',
-      agentId: 'agent-1',
-      connectionPermission: 'read',
-      toolPermission: 'read',
+const savedMcpAccess: AgentMcpAccess = {
+  agentId: 'agent-1',
+  agentStatus: 'paused',
+  connections: [{
+    id: 'docs',
+    name: 'Docs MCP',
+    permissionLevel: 'read_write',
+    assignmentEnabled: true,
+    availability: {
+      available: false,
+      status: 'agent_inactive',
+      connectionEnabled: false,
+      healthStatus: 'unhealthy',
     },
-    {
-      id: 'create-page',
-      connectionId: 'docs',
-      connectionName: 'Docs MCP',
-      remoteName: 'create_page',
-      title: 'Create page',
-      description: 'Create a page',
-      inputSchema: {},
-      riskLevel: 'external_write',
-      agentId: 'agent-1',
-      connectionPermission: 'read_write',
-      toolPermission: 'read_write',
-    },
-    {
-      id: 'other-agent-action',
-      connectionId: 'crm',
-      connectionName: 'CRM MCP',
-      remoteName: 'search_crm',
-      title: 'Search CRM',
-      description: 'Search CRM',
-      inputSchema: {},
-      riskLevel: 'read',
-      agentId: 'agent-2',
-      connectionPermission: 'read',
-      toolPermission: 'read',
-    },
-  ],
-  knowledge: { scope: 'workspace', total: 0, ready: 0, processing: 0, failed: 0 },
-} as WorkflowResources;
+    tools: [
+      {
+        id: 'search-docs',
+        remoteName: 'search_docs',
+        title: 'Search docs',
+        riskLevel: 'read',
+        permissionLevel: 'read',
+        assignmentEnabled: true,
+        availability: { available: false, status: 'agent_inactive', toolEnabled: true },
+      },
+      {
+        id: 'create-page',
+        remoteName: 'create_page',
+        title: 'Create page',
+        riskLevel: 'external_write',
+        permissionLevel: 'read_write',
+        assignmentEnabled: false,
+        availability: { available: false, status: 'agent_inactive', toolEnabled: false },
+      },
+    ],
+  }],
+};
 
 beforeEach(() => {
   Object.defineProperty(window, 'matchMedia', {
@@ -100,13 +89,13 @@ beforeEach(() => {
       removeEventListener: vi.fn(),
     }),
   });
-  vi.mocked(api.workflowResources).mockResolvedValue(resources);
+  vi.mocked(api.agentMcpAccess).mockResolvedValue(savedMcpAccess);
 });
 
 afterEach(cleanup);
 
 describe('AgentWorkspacePage resource projection', () => {
-  it('renders assigned MCP connections and actions separately from API Tools', async () => {
+  it('renders saved MCP assignments for a paused agent and labels availability separately', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const workspace: WorkspaceContextValue = {
       session: {} as Session,
@@ -134,7 +123,9 @@ describe('AgentWorkspacePage resource projection', () => {
     expect(within(mcpSection as HTMLElement).getByText('Assigned MCP actions')).toBeTruthy();
     expect(within(mcpSection as HTMLElement).getByText('Search docs')).toBeTruthy();
     expect(within(mcpSection as HTMLElement).getByText('Create page')).toBeTruthy();
+    expect(within(mcpSection as HTMLElement).getAllByText('Unavailable · agent paused')).toHaveLength(3);
     expect(within(mcpSection as HTMLElement).queryByText('CRM MCP')).toBeNull();
     expect(within(mcpSection as HTMLElement).getByRole('button', { name: 'Manage MCP access' })).toBeTruthy();
+    expect(api.agentMcpAccess).toHaveBeenCalledWith('agent-1');
   });
 });

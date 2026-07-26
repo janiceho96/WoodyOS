@@ -8,7 +8,7 @@ import { Status } from '../../components/ui';
 import { humanize } from '../../lib/format';
 import { AgentAvatar } from '../../components/agents/AgentAvatar';
 import { AgentAvatarPicker } from '../../components/agents/AgentAvatarPicker';
-import { mcpAccessForAgent, mcpAccessSummary } from '../mcp/agentMcpAccess';
+import { mcpAccessSummary } from '../mcp/agentMcpAccess';
 import { normalizeAgentApiToolIds } from '../tools/agentToolAccess';
 
 type Draft = {
@@ -83,17 +83,22 @@ export function AgentBuilderPage() {
   const activeWebTools = activeTools.filter((tool) => tool.permissions.includes('web.read'));
   const webReady = !draft.capabilities.webBrowser || activeWebTools.length > 0;
   const currentIndex = steps.findIndex((item) => item.id === step);
-  const mcpResources = useQuery({
-    queryKey: ['workflow-resources'],
-    queryFn: api.workflowResources,
+  const mcpAccess = useQuery({
+    queryKey: ['agent-mcp-access', agent?.id],
+    queryFn: () => api.agentMcpAccess(agent!.id),
     enabled: Boolean(agent?.id),
   });
-  const mcpAccess = mcpAccessForAgent(mcpResources.data, agent?.id);
-  const mcpSummary = mcpResources.isError
-    ? 'MCP access could not be loaded'
-    : mcpResources.isLoading && agent
+  const mcpAccessState = !agent ? 'unsaved' : mcpAccess.isLoading ? 'loading' : mcpAccess.isError ? 'error' : 'loaded';
+  const mcpSummary = mcpAccessState === 'unsaved'
+    ? 'Save this agent before assigning MCP access'
+    : mcpAccessState === 'error'
+      ? 'MCP access could not be loaded'
+      : mcpAccessState === 'loading'
       ? 'Loading MCP access…'
-      : mcpAccessSummary(mcpResources.data, agent?.id);
+      : mcpAccessSummary(mcpAccess.data);
+  const mcpReviewStatus = mcpAccessState === 'loaded'
+    ? mcpAccess.data?.connections.length ? 'warning' : 'success'
+    : mcpAccessState === 'error' ? 'warning' : 'neutral';
 
   const mutation = useMutation({
     mutationFn: async (status: Agent['status']) => {
@@ -234,7 +239,7 @@ export function AgentBuilderPage() {
         </BuilderSection>}
 
         {step === 'review' && <BuilderSection Icon={ShieldCheck} eyebrow="Step 5" title="Review before publishing" description="Publishing makes this agent available for tasks. It does not automatically run work or grant new permissions.">
-          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="API Tools" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API Tool access'} good={!activeTools.length}/><ReviewRow label="MCP access" value={mcpSummary} good={!mcpAccess.actions.length}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
+          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="API Tools" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API Tool access'} good={!activeTools.length}/><ReviewRow label="MCP access" value={mcpSummary} status={mcpReviewStatus}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
           <div className="publish-boundary"><ShieldCheck size={19}/><div><strong>What happens when you publish</strong><p>The configuration is saved and the agent becomes selectable for tasks. No task starts automatically, no external action is performed, and MCP permissions remain separately enforced.</p></div></div>
           <div className="review-actions"><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save as draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}><Rocket size={15}/>{agent?.status === 'active' ? 'Update published agent' : 'Publish agent'}</button>{agent && <button className="button" onClick={() => navigate(`/agents/${agent.id}?section=history`)}><Play size={15}/>Open task history</button>}</div>
         </BuilderSection>}
@@ -259,6 +264,7 @@ function BuilderSection({ Icon, eyebrow, title, description, children }: { Icon:
   return <section className="guided-section"><header><span><Icon size={20}/></span><div><small className="eyebrow">{eyebrow}</small><h1>{title}</h1><p>{description}</p></div></header><div className="guided-fields">{children}</div></section>;
 }
 
-function ReviewRow({ label, value, good }: { label: string; value: string; good: boolean }) {
-  return <div className="review-row"><span className={good ? 'good' : ''}>{good ? <Check size={13}/> : <AlertTriangle size={13}/>}</span><small>{label}</small><strong>{value}</strong></div>;
+function ReviewRow({ label, value, good, status }: { label: string; value: string; good?: boolean; status?: 'success' | 'warning' | 'neutral' }) {
+  const resolvedStatus = status ?? (good ? 'success' : 'warning');
+  return <div className="review-row"><span className={resolvedStatus === 'success' ? 'good' : resolvedStatus} aria-label={`${label} review status: ${resolvedStatus}`}>{resolvedStatus === 'success' ? <Check size={13}/> : resolvedStatus === 'neutral' ? <LoaderCircle className="spin" size={13}/> : <AlertTriangle size={13}/>}</span><small>{label}</small><strong>{value}</strong></div>;
 }

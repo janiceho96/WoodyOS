@@ -7,6 +7,7 @@ import { agentAvatarSchema } from '../agents/avatar.js';
 import { agentPromptRequestSchema, generateAgentPrompt } from '../agents/prompt-generator.js';
 import { agentAvatarStorage } from '../avatars/storage.js';
 import { deleteAgentAvatar, findAgentAvatar, saveAgentAvatar } from '../avatars/service.js';
+import { loadAgentMcpAccess } from '../agents/mcp-access.js';
 
 const defaultModel = process.env.LLM_DEFAULT_MODEL ?? 'claude-sonnet-4-20250514';
 const modelConfig = z.object({
@@ -62,6 +63,13 @@ export async function agentRoutes(app: FastifyInstance) {
       suppliedRole: Boolean(input.role),
     });
     return generated;
+  }));
+  app.get('/:id/mcp-access', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
+    const params = parse(z.object({ id: z.string().uuid() }), request.params, reply);
+    if (!params) return;
+    const access = await loadAgentMcpAccess(request.user.workspaceId, params.id);
+    if (!access) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
+    return access;
   }));
   app.get('/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const result = await query('SELECT * FROM agents WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);
