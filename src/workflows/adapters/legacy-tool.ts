@@ -17,6 +17,7 @@ import {
   failWorkflowAction,
 } from '../../policy/action-gateway.js';
 import { limitedActionResult } from '../../lib/action-safety.js';
+import { expirationPolicy } from '../../runtime/approval-expiry.js';
 
 export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -58,6 +59,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
     arguments: input,
     requestedBy: run.created_by,
     targetSummary: tool.name,
+    onExpiration: expirationPolicy(node.config.onExpiration),
     trace: actionTrace,
     precedingApproval,
     leaseOwnerId: execution.leaseOwnerId,

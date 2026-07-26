@@ -270,6 +270,9 @@ vi.mock('../src/runtime/manifest.js', () => ({
   }),
   validateManifestCompatibility: vi.fn(() => ({ ok: true, reasons: [] })),
 }));
+vi.mock('../src/runtime/approval-expiry.js', () => ({
+  startApprovalExpiryScheduler: vi.fn(() => ({ stop: vi.fn() })),
+}));
 vi.mock('../src/lib/ai-provider.js', () => ({
   assertConfiguredAiProvider: vi.fn((runtime: unknown) => runtime),
   configuredAiProviderForWorkspace: vi.fn(async () => ({

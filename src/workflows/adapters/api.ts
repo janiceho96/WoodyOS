@@ -6,6 +6,7 @@ import { limitedActionResult } from '../../lib/action-safety.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 import { childTraceContext } from '../../runtime/trace.js';
 import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/errors.js';
+import { expirationPolicy } from '../../runtime/approval-expiry.js';
 
 export async function executeApiActionNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -35,6 +36,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     arguments: arguments_,
     requestedBy: run.created_by,
     targetSummary: tool.name,
+    onExpiration: expirationPolicy(node.config.onExpiration),
     trace: actionTrace,
     leaseOwnerId: execution.leaseOwnerId,
   });

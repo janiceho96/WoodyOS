@@ -5,6 +5,7 @@ import type { WorkflowNodeRisk } from '../workflows/registry.js';
 import { serializeRuntimeError } from '../runtime/errors.js';
 import { assertFencedMutation, type ExecutionLeaseContext } from '../runtime/leases.js';
 import type { TraceContext } from '../runtime/trace.js';
+import type { ExpirationPolicy } from '../runtime/approval-expiry.js';
 
 export type ActionAdapter = 'api' | 'mcp' | 'browser';
 export type ActionSubject =
@@ -32,6 +33,7 @@ export type ActionRequest = {
   arguments: Record<string, unknown>;
   requestedBy: string;
   targetSummary?: string | null;
+  onExpiration?: ExpirationPolicy;
   leaseOwnerId?: string;
   trace: TraceContext;
 };
@@ -52,6 +54,7 @@ export type WorkflowActionRequest = WorkflowActionIdentity & {
   arguments: Record<string, unknown>;
   requestedBy: string;
   targetSummary?: string | null;
+  onExpiration?: ExpirationPolicy;
   leaseOwnerId?: string;
   trace: TraceContext;
   precedingApproval?: {
@@ -162,32 +165,6 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
 
   if (existing) {
     if (existing.status === 'awaiting_confirmation' && new Date(existing.expires_at).getTime() <= Date.now()) {
-      const expired = await query(
-        `UPDATE action_authorizations SET status='expired',resolved_at=now()
-          WHERE id=$1 AND status='awaiting_confirmation'
-            AND (
-              $2::text IS NULL
-              OR EXISTS(
-                SELECT 1 FROM execution_leases lease
-                WHERE lease.subject_type=action_authorizations.subject_type
-                  AND lease.subject_id=COALESCE(action_authorizations.task_id,action_authorizations.workflow_run_id)
-                  AND lease.owner_id=$2 AND lease.expires_at>now()
-              )
-            )
-          RETURNING id`,
-        [existing.id, input.leaseOwnerId ?? null],
-      );
-      await assertFencedMutation(
-        expired.rowCount,
-        input.leaseOwnerId
-          ? {
-            subject: input.subject.type === 'task'
-              ? { kind: 'task', id: input.subject.taskId }
-              : { kind: 'workflow_run', id: input.subject.workflowRunId },
-            ownerId: input.leaseOwnerId,
-          }
-          : undefined,
-      );
       return { status: 'denied' as const, authorizationId: existing.id, reason: 'Action confirmation expired' };
     }
     if (existing.status === 'awaiting_confirmation') return { status: 'awaiting_confirmation' as const, authorizationId: existing.id };
@@ -211,9 +188,9 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
       `INSERT INTO action_authorizations(
          workspace_id,subject_type,workflow_run_id,task_id,agent_id,node_id,iteration_key,attempt,action_key,
          adapter,resource_id,operation,target_summary,risk_level,arguments_summary,arguments_hash,status,requested_by,resolved_at,
-         trace_id,span_id,parent_span_id
+         trace_id,span_id,parent_span_id,on_expiration
        ) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-                CASE WHEN $17='approved' THEN now() ELSE NULL END,$19,$20,$21
+                CASE WHEN $17='approved' THEN now() ELSE NULL END,$19,$20,$21,$22
          WHERE (
            (
              $2='task'
@@ -222,11 +199,11 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
                WHERE task.id=$4 AND task.workspace_id=$1
                  AND task.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
                  AND (
-                   $22::text IS NULL
+                   $23::text IS NULL
                    OR EXISTS(
                      SELECT 1 FROM execution_leases lease
                      WHERE lease.subject_type='task' AND lease.subject_id=$4
-                       AND lease.owner_id=$22 AND lease.expires_at>now()
+                       AND lease.owner_id=$23 AND lease.expires_at>now()
                    )
                  )
              )
@@ -238,11 +215,11 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
                WHERE run.id=$3 AND run.workspace_id=$1
                  AND run.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
                  AND (
-                   $22::text IS NULL
+                   $23::text IS NULL
                    OR EXISTS(
                      SELECT 1 FROM execution_leases lease
                      WHERE lease.subject_type='workflow_run' AND lease.subject_id=$3
-                       AND lease.owner_id=$22 AND lease.expires_at>now()
+                       AND lease.owner_id=$23 AND lease.expires_at>now()
                    )
                  )
              )
@@ -271,6 +248,7 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
         input.trace.traceId,
         input.trace.spanId,
         input.trace.parentSpanId,
+        input.onExpiration ?? 'auto_reject',
         input.leaseOwnerId ?? null,
       ],
     );
@@ -318,6 +296,7 @@ export function authorizeWorkflowAction(input: WorkflowActionRequest) {
     arguments: input.arguments,
     requestedBy: input.requestedBy,
     targetSummary: input.targetSummary,
+    onExpiration: input.onExpiration,
     leaseOwnerId: input.leaseOwnerId,
     trace: input.trace,
   }, precedingApprovalSatisfied);

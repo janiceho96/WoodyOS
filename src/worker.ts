@@ -81,6 +81,7 @@ import {
   type ExecutionLeaseContext,
   type LeaseSubject,
 } from './runtime/leases.js';
+import { startApprovalExpiryScheduler } from './runtime/approval-expiry.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
 const workerProcessOwner = `${process.pid}:${randomUUID()}`;
@@ -1067,6 +1068,7 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
 }, { connection, concurrency: 2 });
 
 startMcpMaintenance();
+startApprovalExpiryScheduler();
 const fileCleanup = setInterval(() => { void purgeExpiredFiles(); }, 60 * 60 * 1_000);
 fileCleanup.unref();
 console.log('Woody task, workflow, file, artifact, knowledge, and MCP maintenance workers started');

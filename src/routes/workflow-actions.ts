@@ -43,11 +43,6 @@ export async function workflowActionRoutes(app: FastifyInstance) {
         [params.id, request.user.workspaceId],
       );
       if (!pending.rowCount) {
-        await client.query(
-          `UPDATE action_authorizations SET status='expired',resolved_at=now()
-           WHERE id=$1 AND workspace_id=$2 AND status='awaiting_confirmation' AND expires_at<=now()`,
-          [params.id, request.user.workspaceId],
-        );
         await client.query('COMMIT');
         return reply.code(409).send({ error: 'WORKFLOW_ACTION_CONFIRMATION_NOT_PENDING' });
       }
