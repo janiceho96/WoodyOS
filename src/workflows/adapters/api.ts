@@ -3,9 +3,11 @@ import { authorizeWorkflowAction, beginWorkflowAction, completeWorkflowAction, f
 import { invokeTool, toolRiskLevel, type ToolRecord } from '../../tools/runtime.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { limitedActionResult } from '../../lib/action-safety.js';
+import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 
 export async function executeApiActionNode(context: WorkflowAdapterContext) {
   const { run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  await assertWorkflowRunManifestDependencies(run);
   const toolId = node.config.toolId;
   if (typeof toolId !== 'string') throw new Error(`API action ${node.id} has no toolId`);
   const tool = (await query<ToolRecord>(

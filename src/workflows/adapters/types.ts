@@ -7,6 +7,7 @@ export type WorkflowRunRecord = {
   id: string;
   workspace_id: string;
   workflow_id: string;
+  workflow_version_id?: string | null;
   input: Record<string, unknown>;
   definition_snapshot: WorkflowDefinition;
   state: Record<string, unknown>;

@@ -32,10 +32,13 @@ import { retrieveTaskAttachmentContext } from './files/context.js';
 import { outputContractFromTaskInput, outputContractInstruction, parseAgentOutput } from './workflows/output-contracts.js';
 import {
   assertManifestCompatible,
+  assertTaskManifestDependencies,
+  assertWorkflowRunManifestDependencies,
   validateManifestCompatibility,
   type ExecutionManifest,
 } from './runtime/manifest.js';
 import type { AgentVersionSnapshot } from './agents/versions.js';
+import type { WorkflowDefinition } from './workflows/definition.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
 type Agent = {
@@ -61,9 +64,6 @@ type Task = {
   agent_version_id: string | null;
   execution_manifest: ExecutionManifest | null;
 };
-type WorkflowNode = { id: string; type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output'; config: Record<string, unknown> };
-type WorkflowDefinition = { nodes: WorkflowNode[]; edges: Array<{ source: string; target: string; condition?: string }> };
-
 function openAiToolDefinitions(tools: ToolRecord[]): ChatCompletionTool[] {
   return tools.map((tool) => {
     const definition = definitionFor(tool);
@@ -112,7 +112,38 @@ function actionName(action: TaskToolAction) {
   return action.adapter === 'api' ? action.tool.name : action.tool.title ?? action.tool.remote_name;
 }
 
+async function assertTaskExecutionDependencies(task: Task) {
+  if (task.workflow_run_id) {
+    const run = (await query<{
+      workspace_id: string;
+      workflow_version_id: string | null;
+      definition_snapshot: WorkflowDefinition;
+      execution_manifest: ExecutionManifest | null;
+      run_mode: 'test' | 'production';
+    }>(
+      `SELECT workspace_id,workflow_version_id,definition_snapshot,execution_manifest,run_mode
+         FROM workflow_runs WHERE id=$1 AND workspace_id=$2`,
+      [task.workflow_run_id, task.workspace_id],
+    )).rows[0];
+    if (!run) {
+      throw Object.assign(new Error('Workflow run dependency is unavailable'), {
+        code: 'RUN_MANIFEST_INCOMPATIBLE',
+        retryable: false,
+      });
+    }
+    await assertWorkflowRunManifestDependencies(run);
+    return { testRun: run.run_mode === 'test' };
+  }
+  await assertTaskManifestDependencies({
+    workspaceId: task.workspace_id,
+    agentId: task.agent_id,
+    manifest: task.execution_manifest,
+  });
+  return { testRun: false };
+}
+
 async function authorizeTaskToolAction(task: Task, providerCallId: string, action: TaskToolAction, arguments_: Record<string, unknown>) {
+  await assertTaskExecutionDependencies(task);
   if (action.adapter === 'mcp') assertMcpPermission(action.tool);
   return authorizeAction({
     workspaceId: task.workspace_id,
@@ -135,6 +166,7 @@ async function executeTaskToolAction(input: {
   authorizationId: string;
   mcpToolCallId?: string | null;
 }) {
+  await assertTaskExecutionDependencies(input.task);
   if (!(await beginAction(input.authorizationId))) throw new Error('External action execution could not be claimed safely');
   try {
     if (input.action.adapter === 'mcp') {
@@ -160,6 +192,15 @@ async function executeTaskToolAction(input: {
 }
 
 async function runtimeAgentForTask(task: Task): Promise<{ agent: Agent; exactManifest: boolean }> {
+  const dependencyState = await assertTaskExecutionDependencies(task);
+  if (dependencyState.testRun) {
+    const agent = (await query<Agent>(
+      'SELECT name,role,goal,instructions,model,model_config,capabilities,memory_config,tool_ids FROM agents WHERE id=$1 AND workspace_id=$2',
+      [task.agent_id, task.workspace_id],
+    )).rows[0];
+    if (agent) return { agent, exactManifest: false };
+    throw new Error('Agent is missing');
+  }
   const compatibility = validateManifestCompatibility(task.execution_manifest);
   if (compatibility.ok) {
     const manifest = assertManifestCompatible(task.execution_manifest);
@@ -182,19 +223,6 @@ async function runtimeAgentForTask(task: Task): Promise<{ agent: Agent; exactMan
       });
     }
     return { agent: agentRuntimeSourceFromSnapshot(version.snapshot), exactManifest: true };
-  }
-  if (task.workflow_run_id) {
-    const testRun = (await query<{ test_run: boolean }>(
-      "SELECT run_mode='test' AS test_run FROM workflow_runs WHERE id=$1 AND workspace_id=$2",
-      [task.workflow_run_id, task.workspace_id],
-    )).rows[0]?.test_run;
-    if (testRun) {
-      const agent = (await query<Agent>(
-        'SELECT name,role,goal,instructions,model,model_config,capabilities,memory_config,tool_ids FROM agents WHERE id=$1 AND workspace_id=$2',
-        [task.agent_id, task.workspace_id],
-      )).rows[0];
-      if (agent) return { agent, exactManifest: false };
-    }
   }
   assertManifestCompatible(task.execution_manifest);
   throw new Error('Agent is missing');
@@ -574,13 +602,19 @@ new Worker<{ documentId: string }>(KNOWLEDGE_QUEUE, async (job) => {
 }, { connection, concurrency: 2 });
 
 new Worker<{ workflowRunId: string }>(WORKFLOW_QUEUE, async (job) => {
-  const run = (await query<{ run_mode: 'test' | 'production'; execution_manifest: ExecutionManifest | null }>(
-    'SELECT run_mode,execution_manifest FROM workflow_runs WHERE id=$1',
+  const run = (await query<{
+    workspace_id: string;
+    workflow_version_id: string | null;
+    definition_snapshot: WorkflowDefinition;
+    run_mode: 'test' | 'production';
+    execution_manifest: ExecutionManifest | null;
+  }>(
+    'SELECT workspace_id,workflow_version_id,definition_snapshot,run_mode,execution_manifest FROM workflow_runs WHERE id=$1',
     [job.data.workflowRunId],
   )).rows[0];
   if (run?.run_mode === 'production') {
     try {
-      assertManifestCompatible(run.execution_manifest);
+      await assertWorkflowRunManifestDependencies(run);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'RUN_MANIFEST_INCOMPATIBLE';
       await query(

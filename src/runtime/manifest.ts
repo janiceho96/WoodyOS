@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import { z } from 'zod';
 import { db } from '../db/client.js';
 import { decryptJson } from '../lib/crypto.js';
 import type { AgentVersionSnapshot } from '../agents/versions.js';
@@ -48,12 +49,59 @@ type McpManifestRow = {
   input_schema: unknown;
   transport: string;
   endpoint_url: string;
+  risk_level: string;
   connection_permission: string;
   tool_permission: string;
 };
 
 const sensitiveKey = /token|password|secret|authorization|(^|[-_])auth($|[-_])|api[-_]?key|cookie|credential|private[-_]?key|session|encrypted/i;
 const RUNTIME_VERSION = process.env.RUNTIME_VERSION ?? '0.1.0';
+const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+const uuidRecord = <T extends z.ZodTypeAny>(entry: T) => z.record(z.string().uuid(), entry);
+const exactManifestSchema = z.object({
+  manifestVersion: z.literal(1),
+  createdAt: z.string().datetime(),
+  compatibility: z.literal('exact'),
+  workflow: z.object({
+    id: z.string().uuid(),
+    versionId: z.string().uuid(),
+    version: z.number().int().positive(),
+    definitionHash: sha256Schema,
+  }).strict().optional(),
+  agents: uuidRecord(z.object({
+    versionId: z.string().uuid(),
+    version: z.number().int().positive(),
+    snapshotHash: sha256Schema,
+  }).strict()),
+  prompts: uuidRecord(z.object({
+    versionId: z.string().uuid(),
+    contentHash: sha256Schema,
+  }).strict()),
+  models: uuidRecord(z.object({
+    provider: z.string().min(1),
+    model: z.string().min(1),
+    parametersHash: sha256Schema,
+  }).strict()),
+  apiTools: uuidRecord(z.object({
+    toolId: z.string().uuid(),
+    schemaHash: sha256Schema,
+    permissionHash: sha256Schema,
+  }).strict()),
+  mcpActions: uuidRecord(z.object({
+    connectionId: z.string().uuid(),
+    toolId: z.string().uuid(),
+    schemaHash: sha256Schema,
+    permissionHash: sha256Schema,
+  }).strict()),
+  policy: z.object({ version: z.string().min(1) }).strict(),
+  adapters: z.record(z.string().min(1), z.string().min(1)),
+  outputContracts: z.record(z.string().min(1), sha256Schema),
+  artifactTemplates: uuidRecord(sha256Schema),
+  runtime: z.object({
+    version: z.string().min(1),
+    stateSchemaVersion: z.literal(1),
+  }).strict(),
+}).strict();
 
 function manifestError(code: string, details: Record<string, unknown> = {}) {
   return Object.assign(new Error(code), {
@@ -91,14 +139,6 @@ function forbiddenSensitiveField(value: unknown): boolean {
     .some(([key, item]) => sensitiveKey.test(key) || forbiddenSensitiveField(item));
 }
 
-function exactManifestShape(value: Record<string, unknown>) {
-  const recordFields = ['agents', 'prompts', 'models', 'apiTools', 'mcpActions', 'adapters', 'outputContracts', 'artifactTemplates'];
-  return typeof value.createdAt === 'string'
-    && recordFields.every((field) => value[field] && typeof value[field] === 'object' && !Array.isArray(value[field]))
-    && value.policy && typeof value.policy === 'object'
-    && value.runtime && typeof value.runtime === 'object';
-}
-
 export function validateManifestCompatibility(manifest: unknown): { ok: boolean; reasons: string[] } {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
     return { ok: false, reasons: ['Execution manifest is missing'] };
@@ -108,14 +148,17 @@ export function validateManifestCompatibility(manifest: unknown): { ok: boolean;
   if (value.manifestVersion !== 1) reasons.push(`Unsupported manifest version ${String(value.manifestVersion)}`);
   if (value.compatibility === 'legacy_partial') reasons.push('Execution manifest is a legacy partial snapshot');
   else if (value.compatibility !== 'exact') reasons.push('Execution manifest compatibility is invalid');
-  if (value.compatibility === 'exact' && !exactManifestShape(value)) reasons.push('Execution manifest is incomplete');
   const runtime = value.runtime && typeof value.runtime === 'object' && !Array.isArray(value.runtime)
     ? value.runtime as Record<string, unknown>
     : null;
   if (value.compatibility === 'exact' && runtime && runtime.stateSchemaVersion !== 1) {
     reasons.push(`Unsupported runtime state schema ${String(runtime.stateSchemaVersion)}`);
   }
-  if (forbiddenSensitiveField(value)) reasons.push('Execution manifest contains forbidden sensitive fields');
+  const containsSensitiveField = forbiddenSensitiveField(value);
+  if (containsSensitiveField) reasons.push('Execution manifest contains forbidden sensitive fields');
+  if (value.compatibility === 'exact' && reasons.length === 0 && !exactManifestSchema.safeParse(value).success) {
+    reasons.push('Execution manifest is malformed');
+  }
   return { ok: reasons.length === 0, reasons };
 }
 
@@ -193,7 +236,7 @@ async function mcpActionManifest(
   }
   const result = await client.query<McpManifestRow>(
     `SELECT tool.id,connection_access.agent_id,connection.id connection_id,tool.remote_name,
-            tool.input_schema,connection.transport,connection.endpoint_url,
+            tool.input_schema,connection.transport,connection.endpoint_url,tool.risk_level,
             connection_access.permission_level connection_permission,
             tool_access.permission_level tool_permission
        FROM mcp_connection_tools tool
@@ -227,6 +270,7 @@ async function mcpActionManifest(
         remoteName: row.remote_name,
         transport: row.transport,
         endpoint: row.endpoint_url,
+        riskLevel: row.risk_level,
       }),
       permissionHash: canonicalJsonHash(rows
         .map((permission) => ({
@@ -283,20 +327,48 @@ function agentEntries(versions: Map<string, AgentVersionRow>) {
   }]));
 }
 
-function modelEntries(versions: Map<string, AgentVersionRow>, provider: string) {
+type ModelProviderDescriptor = {
+  provider: string;
+  baseUrl: string | null;
+  defaultModel: string;
+};
+
+function modelEntries(versions: Map<string, AgentVersionRow>, provider: ModelProviderDescriptor) {
   return Object.fromEntries([...versions.entries()].map(([agentId, row]) => [agentId, {
-    provider,
+    provider: provider.provider,
     model: row.snapshot.model,
-    parametersHash: canonicalJsonHash(row.snapshot.modelConfig),
+    parametersHash: canonicalJsonHash({
+      modelConfig: row.snapshot.modelConfig,
+      providerConfig: {
+        baseUrl: provider.baseUrl,
+        defaultModel: provider.defaultModel,
+      },
+    }),
   }]));
 }
 
 async function modelProvider(client: Queryable, workspaceId: string) {
-  const configured = (await client.query<{ provider: string }>(
-    'SELECT provider FROM workspace_ai_provider_configs WHERE workspace_id=$1',
+  const configured = (await client.query<{
+    provider: string;
+    base_url: string | null;
+    default_model: string;
+  }>(
+    'SELECT provider,base_url,default_model FROM workspace_ai_provider_configs WHERE workspace_id=$1',
     [workspaceId],
-  )).rows[0]?.provider;
-  return configured ?? process.env.LLM_PROVIDER ?? 'anthropic';
+  )).rows[0];
+  if (configured) return {
+    provider: configured.provider,
+    baseUrl: configured.base_url,
+    defaultModel: configured.default_model,
+  };
+  const baseUrl = (process.env.LLM_BASE_URL ?? '')
+    .replace(/\/chat\/completions\/?$/, '')
+    .replace(/\/$/, '');
+  return {
+    provider: process.env.LLM_PROVIDER ?? 'anthropic',
+    baseUrl: baseUrl || null,
+    defaultModel: process.env.LLM_DEFAULT_MODEL ?? 'claude-sonnet-4-20250514',
+  };
 }
 
 export async function buildTaskManifest(
@@ -350,44 +422,15 @@ export async function buildWorkflowManifest(
     throw manifestError('WORKFLOW_VERSION_DEFINITION_MISMATCH');
   }
 
-  const agentIds = input.definition.nodes
-    .filter((node) => node.type === 'agent' || node.type === 'mcp_action')
-    .map((node) => node.config.agentId)
-    .filter((id): id is string => typeof id === 'string');
+  const agentIds = workflowAgentIds(input.definition);
   const versions = await publishedAgentVersions(client, input.workspaceId, agentIds);
-  const explicitToolIds = input.definition.nodes
-    .filter((node) => node.type === 'action' || node.type === 'api_action')
-    .map((node) => node.config.toolId)
-    .filter((id): id is string => typeof id === 'string');
-  const agentToolIds = [...versions.values()].flatMap((version) => version.snapshot.apiToolIds);
-  const requiredMcpToolIds = input.definition.nodes
-    .filter((node) => node.type === 'mcp_action')
-    .map((node) => node.config.mcpToolId)
-    .filter((id): id is string => typeof id === 'string');
-  const promptVersionIds = input.definition.nodes
-    .map((node) => node.config.promptVersionId)
-    .filter((id): id is string => typeof id === 'string');
-  const artifactTemplateIds = input.definition.nodes
-    .map((node) => node.config.artifactTemplateId)
-    .filter((id): id is string => typeof id === 'string');
   const [apiTools, mcpActions, prompts, artifactTemplates, provider] = await Promise.all([
-    apiToolManifest(client, input.workspaceId, [...explicitToolIds, ...agentToolIds]),
-    mcpActionManifest(client, input.workspaceId, agentIds, requiredMcpToolIds),
-    promptManifest(client, input.workspaceId, promptVersionIds),
-    artifactTemplateManifest(client, input.workspaceId, artifactTemplateIds),
+    apiToolManifest(client, input.workspaceId, workflowApiToolIds(input.definition, versions)),
+    mcpActionManifest(client, input.workspaceId, agentIds, workflowMcpToolIds(input.definition)),
+    promptManifest(client, input.workspaceId, workflowPromptVersionIds(input.definition)),
+    artifactTemplateManifest(client, input.workspaceId, workflowArtifactTemplateIds(input.definition)),
     modelProvider(client, input.workspaceId),
   ]);
-  const adapters = Object.fromEntries(input.definition.nodes.map((node) => [
-    node.id,
-    `${workflowNodeDefinition(node.type)?.adapter ?? 'unavailable'}:1`,
-  ]));
-  const outputContracts = Object.fromEntries(input.definition.nodes
-    .filter((node) => node.type === 'agent' || node.type === 'output')
-    .map((node) => [node.id, canonicalJsonHash(
-      node.type === 'agent'
-        ? String(node.config.outputContract ?? 'text')
-        : { artifactFormats: node.config.artifactFormats ?? [], fromNodeId: node.config.fromNodeId ?? null },
-    )]));
 
   return {
     manifestVersion: 1,
@@ -405,8 +448,8 @@ export async function buildWorkflowManifest(
     apiTools,
     mcpActions,
     policy: { version: '1' },
-    adapters,
-    outputContracts,
+    adapters: workflowAdapters(input.definition),
+    outputContracts: workflowOutputContracts(input.definition),
     artifactTemplates,
     runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
   };
@@ -418,4 +461,251 @@ export function assertManifestCompatible(manifest: unknown) {
     throw manifestError('RUN_MANIFEST_INCOMPATIBLE', { reasons: compatibility.reasons });
   }
   return manifest as ExecutionManifest;
+}
+
+export function assertManifestDependenciesMatch(stored: unknown, current: unknown) {
+  const storedManifest = assertManifestCompatible(stored);
+  const currentManifest = assertManifestCompatible(current);
+  const { createdAt: _storedCreatedAt, ...storedDependencies } = storedManifest;
+  const { createdAt: _currentCreatedAt, ...currentDependencies } = currentManifest;
+  if (canonicalJsonHash(storedDependencies) !== canonicalJsonHash(currentDependencies)) {
+    throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+      reasons: ['Execution dependencies changed after the run was created'],
+    });
+  }
+}
+
+function sameIds(actual: string[], expected: string[]) {
+  const left = [...new Set(actual)].sort();
+  const right = [...new Set(expected)].sort();
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
+async function fixedAgentVersions(
+  client: Queryable,
+  workspaceId: string,
+  manifest: ExecutionManifest,
+  expectedAgentIds: string[],
+) {
+  const manifestAgentIds = Object.keys(manifest.agents);
+  if (!sameIds(manifestAgentIds, expectedAgentIds) || !sameIds(Object.keys(manifest.models), expectedAgentIds)) {
+    throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+      reasons: ['Execution manifest agent or model bindings do not match the executable definition'],
+    });
+  }
+  if (!expectedAgentIds.length) return new Map<string, AgentVersionRow>();
+  const versionIds = expectedAgentIds.map((agentId) => manifest.agents[agentId].versionId);
+  const rows = await client.query<AgentVersionRow>(
+    `SELECT id,agent_id,version,snapshot FROM agent_versions
+      WHERE workspace_id=$1 AND id=ANY($2::uuid[])`,
+    [workspaceId, versionIds],
+  );
+  const byAgentId = new Map(rows.rows.map((row) => [row.agent_id, row]));
+  for (const agentId of expectedAgentIds) {
+    const stored = manifest.agents[agentId];
+    const current = byAgentId.get(agentId);
+    if (!current
+      || current.id !== stored.versionId
+      || current.version !== stored.version
+      || canonicalJsonHash(current.snapshot) !== stored.snapshotHash) {
+      throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+        reasons: [`Published agent dependency ${agentId} changed or is unavailable`],
+      });
+    }
+  }
+  return byAgentId;
+}
+
+function workflowAgentIds(definition: WorkflowDefinition) {
+  return definition.nodes
+    .filter((node) => node.type === 'agent' || node.type === 'mcp_action')
+    .map((node) => node.config.agentId)
+    .filter((id): id is string => typeof id === 'string');
+}
+
+function workflowApiToolIds(definition: WorkflowDefinition, versions: Map<string, AgentVersionRow>) {
+  return [
+    ...definition.nodes
+      .filter((node) => node.type === 'action' || node.type === 'api_action')
+      .map((node) => node.config.toolId)
+      .filter((id): id is string => typeof id === 'string'),
+    ...[...versions.values()].flatMap((version) => version.snapshot.apiToolIds),
+  ];
+}
+
+function workflowMcpToolIds(definition: WorkflowDefinition) {
+  return definition.nodes
+    .filter((node) => node.type === 'mcp_action')
+    .map((node) => node.config.mcpToolId)
+    .filter((id): id is string => typeof id === 'string');
+}
+
+function workflowPromptVersionIds(definition: WorkflowDefinition) {
+  return definition.nodes
+    .map((node) => node.config.promptVersionId)
+    .filter((id): id is string => typeof id === 'string');
+}
+
+function workflowArtifactTemplateIds(definition: WorkflowDefinition) {
+  return definition.nodes
+    .map((node) => node.config.artifactTemplateId)
+    .filter((id): id is string => typeof id === 'string');
+}
+
+function workflowAdapters(definition: WorkflowDefinition) {
+  return Object.fromEntries(definition.nodes.map((node) => [
+    node.id,
+    `${workflowNodeDefinition(node.type)?.adapter ?? 'unavailable'}:1`,
+  ]));
+}
+
+function workflowOutputContracts(definition: WorkflowDefinition) {
+  return Object.fromEntries(definition.nodes
+    .filter((node) => node.type === 'agent' || node.type === 'output')
+    .map((node) => [node.id, canonicalJsonHash(
+      node.type === 'agent'
+        ? String(node.config.outputContract ?? 'text')
+        : { artifactFormats: node.config.artifactFormats ?? [], fromNodeId: node.config.fromNodeId ?? null },
+    )]));
+}
+
+function asManifestIncompatible(error: unknown): never {
+  if ((error as { code?: unknown })?.code === 'RUN_MANIFEST_INCOMPATIBLE') throw error;
+  throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+    reasons: [error instanceof Error ? error.message : 'Execution dependency validation failed'],
+  });
+}
+
+export async function assertTaskManifestDependencies(
+  input: { workspaceId: string; agentId: string; manifest: unknown },
+  client: Queryable = db,
+) {
+  const manifest = assertManifestCompatible(input.manifest);
+  if (manifest.workflow || !sameIds(Object.keys(manifest.agents), [input.agentId])) {
+    throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+      reasons: ['Standalone task manifest semantics are invalid'],
+    });
+  }
+  try {
+    const versions = await fixedAgentVersions(client, input.workspaceId, manifest, [input.agentId]);
+    const version = versions.get(input.agentId)!;
+    const [apiTools, mcpActions, provider] = await Promise.all([
+      apiToolManifest(client, input.workspaceId, version.snapshot.apiToolIds),
+      mcpActionManifest(client, input.workspaceId, [input.agentId]),
+      modelProvider(client, input.workspaceId),
+    ]);
+    const current: ExecutionManifest = {
+      manifestVersion: 1,
+      createdAt: new Date().toISOString(),
+      compatibility: 'exact',
+      agents: agentEntries(versions),
+      prompts: {},
+      models: modelEntries(versions, provider),
+      apiTools,
+      mcpActions,
+      policy: { version: '1' },
+      adapters: { agent: '1', api: '1', mcp: '1' },
+      outputContracts: { task: canonicalJsonHash('text') },
+      artifactTemplates: {},
+      runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
+    };
+    assertManifestDependenciesMatch(manifest, current);
+  } catch (error) {
+    asManifestIncompatible(error);
+  }
+}
+
+export async function assertWorkflowManifestDependencies(
+  input: {
+    workspaceId: string;
+    workflowVersionId: string;
+    definition: WorkflowDefinition;
+    manifest: unknown;
+  },
+  client: Queryable = db,
+) {
+  const manifest = assertManifestCompatible(input.manifest);
+  if (!manifest.workflow || manifest.workflow.versionId !== input.workflowVersionId) {
+    throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+      reasons: ['Workflow manifest semantics are invalid'],
+    });
+  }
+  try {
+    const workflowVersion = (await client.query<{
+      id: string;
+      workflow_id: string;
+      version: number;
+      definition: WorkflowDefinition;
+    }>(
+      `SELECT id,workflow_id,version,definition FROM workflow_versions
+        WHERE id=$1 AND workspace_id=$2`,
+      [input.workflowVersionId, input.workspaceId],
+    )).rows[0];
+    if (!workflowVersion
+      || workflowVersion.workflow_id !== manifest.workflow.id
+      || workflowVersion.version !== manifest.workflow.version
+      || canonicalJsonHash(workflowVersion.definition) !== manifest.workflow.definitionHash
+      || canonicalJsonHash(workflowVersion.definition) !== canonicalJsonHash(input.definition)) {
+      throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+        reasons: ['Published workflow dependency changed or is unavailable'],
+      });
+    }
+    const agentIds = workflowAgentIds(input.definition);
+    const versions = await fixedAgentVersions(client, input.workspaceId, manifest, agentIds);
+    const [apiTools, mcpActions, prompts, artifactTemplates, provider] = await Promise.all([
+      apiToolManifest(client, input.workspaceId, workflowApiToolIds(input.definition, versions)),
+      mcpActionManifest(client, input.workspaceId, agentIds, workflowMcpToolIds(input.definition)),
+      promptManifest(client, input.workspaceId, workflowPromptVersionIds(input.definition)),
+      artifactTemplateManifest(client, input.workspaceId, workflowArtifactTemplateIds(input.definition)),
+      modelProvider(client, input.workspaceId),
+    ]);
+    const current: ExecutionManifest = {
+      manifestVersion: 1,
+      createdAt: new Date().toISOString(),
+      compatibility: 'exact',
+      workflow: {
+        id: workflowVersion.workflow_id,
+        versionId: workflowVersion.id,
+        version: workflowVersion.version,
+        definitionHash: canonicalJsonHash(workflowVersion.definition),
+      },
+      agents: agentEntries(versions),
+      prompts,
+      models: modelEntries(versions, provider),
+      apiTools,
+      mcpActions,
+      policy: { version: '1' },
+      adapters: workflowAdapters(input.definition),
+      outputContracts: workflowOutputContracts(input.definition),
+      artifactTemplates,
+      runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
+    };
+    assertManifestDependenciesMatch(manifest, current);
+  } catch (error) {
+    asManifestIncompatible(error);
+  }
+}
+
+export async function assertWorkflowRunManifestDependencies(
+  run: {
+    workspace_id: string;
+    workflow_version_id?: string | null;
+    definition_snapshot: WorkflowDefinition;
+    execution_manifest?: unknown;
+    run_mode?: 'test' | 'production';
+  },
+  client: Queryable = db,
+) {
+  if (run.run_mode === 'test') return;
+  if (!run.workflow_version_id) {
+    throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+      reasons: ['Workflow run has no immutable workflow version'],
+    });
+  }
+  await assertWorkflowManifestDependencies({
+    workspaceId: run.workspace_id,
+    workflowVersionId: run.workflow_version_id,
+    definition: run.definition_snapshot,
+    manifest: run.execution_manifest,
+  }, client);
 }

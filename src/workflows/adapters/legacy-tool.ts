@@ -2,9 +2,11 @@ import { query } from '../../db/client.js';
 import { invokeTool, toolRequiresApproval, type ToolRecord } from '../../tools/runtime.js';
 import { retryPolicy } from '../definition.js';
 import type { WorkflowAdapterContext } from './types.js';
+import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 
 export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   const { run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  await assertWorkflowRunManifestDependencies(run);
   const toolId = node.config.toolId;
   if (typeof toolId !== 'string') throw new Error(`Action node ${node.id} has no toolId`);
   const tool = (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE id=$1 AND workspace_id=$2 AND enabled=true', [toolId, run.workspace_id])).rows[0];
@@ -29,4 +31,3 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   setNodeOutput(output);
   return { output, result: output };
 }
-

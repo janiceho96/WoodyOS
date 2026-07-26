@@ -4,6 +4,8 @@ import { db, query } from '../db/client.js';
 import { audit } from '../lib/audit.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { enqueueWorkflowRun } from '../queue/task-queue.js';
+import { assertWorkflowManifestDependencies } from '../runtime/manifest.js';
+import type { WorkflowDefinition } from '../workflows/definition.js';
 
 const paramsSchema = z.object({ id: z.string().uuid() });
 const decisionSchema = z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2_000).optional() });
@@ -17,10 +19,20 @@ export async function workflowActionRoutes(app: FastifyInstance) {
     let workflowRunId = '';
     try {
       await client.query('BEGIN');
-      const pending = await client.query<{ workflow_run_id: string }>(
-        `SELECT workflow_run_id FROM action_authorizations
-         WHERE id=$1 AND workspace_id=$2 AND status='awaiting_confirmation' AND expires_at>now()
-         FOR UPDATE`,
+      const pending = await client.query<{
+        workflow_run_id: string;
+        run_mode: 'test' | 'production';
+        workflow_version_id: string;
+        definition_snapshot: WorkflowDefinition;
+        execution_manifest: unknown;
+      }>(
+        `SELECT authorization.workflow_run_id,run.run_mode,run.workflow_version_id,
+                run.definition_snapshot,run.execution_manifest
+         FROM action_authorizations authorization
+         JOIN workflow_runs run ON run.id=authorization.workflow_run_id
+         WHERE authorization.id=$1 AND authorization.workspace_id=$2
+           AND authorization.status='awaiting_confirmation' AND authorization.expires_at>now()
+         FOR UPDATE OF authorization,run`,
         [params.id, request.user.workspaceId],
       );
       if (!pending.rowCount) {
@@ -33,6 +45,14 @@ export async function workflowActionRoutes(app: FastifyInstance) {
         return reply.code(409).send({ error: 'WORKFLOW_ACTION_CONFIRMATION_NOT_PENDING' });
       }
       workflowRunId = pending.rows[0].workflow_run_id;
+      if (input.decision === 'approved' && pending.rows[0].run_mode === 'production') {
+        await assertWorkflowManifestDependencies({
+          workspaceId: request.user.workspaceId,
+          workflowVersionId: pending.rows[0].workflow_version_id,
+          definition: pending.rows[0].definition_snapshot,
+          manifest: pending.rows[0].execution_manifest,
+        }, client);
+      }
       await client.query(
         `UPDATE action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
          WHERE id=$4`,

@@ -1,9 +1,11 @@
 import { authorizedMcpTool, executeAuthorizedMcpTool } from '../../mcp/runtime.js';
 import { authorizeWorkflowAction, beginWorkflowAction, completeWorkflowAction, failWorkflowAction } from '../../policy/action-gateway.js';
 import type { WorkflowAdapterContext } from './types.js';
+import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 
 export async function executeMcpActionNode(context: WorkflowAdapterContext) {
   const { run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  await assertWorkflowRunManifestDependencies(run);
   const agentId = node.config.agentId;
   const mcpToolId = node.config.mcpToolId;
   if (typeof agentId !== 'string' || typeof mcpToolId !== 'string') throw new Error(`App action ${node.id} needs an agent and MCP tool`);

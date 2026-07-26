@@ -4,6 +4,11 @@ import { db, query } from '../../db/client.js';
 import { audit } from '../../lib/audit.js';
 import { asyncRoute, parse } from '../../lib/http.js';
 import { enqueueTask } from '../../queue/task-queue.js';
+import {
+  assertTaskManifestDependencies,
+  assertWorkflowManifestDependencies,
+} from '../../runtime/manifest.js';
+import type { WorkflowDefinition } from '../../workflows/definition.js';
 
 const idParams = z.object({ id: z.string().uuid() });
 const listQuery = z.object({
@@ -72,12 +77,27 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
           return reply.code(409).send({ error: 'MCP_CONFIRMATION_NOT_PENDING' });
         }
       }
-      const pending = await client.query<{ task_id: string; workflow_run_id: string | null; action_authorization_id: string | null }>(
-        `SELECT calls.task_id,calls.workflow_run_id,calls.action_authorization_id
+      const pending = await client.query<{
+        task_id: string;
+        agent_id: string;
+        workflow_run_id: string | null;
+        run_mode: 'test' | 'production' | null;
+        workflow_version_id: string | null;
+        definition_snapshot: WorkflowDefinition | null;
+        action_authorization_id: string | null;
+        execution_manifest: unknown;
+        run_execution_manifest: unknown;
+      }>(
+        `SELECT calls.task_id,tasks.agent_id,calls.workflow_run_id,run.run_mode,
+                run.workflow_version_id,run.definition_snapshot,
+                calls.action_authorization_id,tasks.execution_manifest,
+                run.execution_manifest run_execution_manifest
          FROM mcp_tool_calls calls JOIN mcp_tool_confirmations confirmation ON confirmation.tool_call_id=calls.id
+         JOIN tasks ON tasks.id=calls.task_id
+         LEFT JOIN workflow_runs run ON run.id=tasks.workflow_run_id
          WHERE calls.id=$1 AND calls.workspace_id=$2 AND calls.status='awaiting_confirmation'
          AND confirmation.status='pending' AND confirmation.expires_at > now()
-         FOR UPDATE`,
+         FOR UPDATE OF calls,confirmation,tasks`,
         [params.id, request.user.workspaceId],
       );
       if (!pending.rowCount || !pending.rows[0].task_id) {
@@ -87,6 +107,23 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
       taskId = pending.rows[0].task_id;
       workflowRunId = pending.rows[0].workflow_run_id;
       const actionAuthorizationId = pending.rows[0].action_authorization_id;
+      if (pending.rows[0].run_mode !== 'test') {
+        const row = pending.rows[0];
+        if (row.workflow_run_id && row.workflow_version_id && row.definition_snapshot) {
+          await assertWorkflowManifestDependencies({
+            workspaceId: request.user.workspaceId,
+            workflowVersionId: row.workflow_version_id,
+            definition: row.definition_snapshot,
+            manifest: row.run_execution_manifest,
+          }, client);
+        } else {
+          await assertTaskManifestDependencies({
+            workspaceId: request.user.workspaceId,
+            agentId: row.agent_id,
+            manifest: row.execution_manifest,
+          }, client);
+        }
+      }
       await client.query(
         `UPDATE mcp_tool_confirmations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
          WHERE tool_call_id=$4`,

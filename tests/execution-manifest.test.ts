@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  assertManifestDependenciesMatch,
+  assertTaskManifestDependencies,
+  assertWorkflowManifestDependencies,
   buildWorkflowManifest,
   canonicalJsonHash,
   validateManifestCompatibility,
@@ -65,6 +68,83 @@ describe('execution manifest compatibility', () => {
       ok: false,
       reasons: ['Execution manifest contains forbidden sensitive fields'],
     });
+  });
+
+  it('rejects malformed nested entries in an otherwise exact manifest', () => {
+    const agentId = '00000000-0000-4000-8000-000000000001';
+    expect(validateManifestCompatibility({
+      ...exactManifest(),
+      agents: { [agentId]: {} },
+    })).toMatchObject({ ok: false });
+    expect(validateManifestCompatibility({
+      ...exactManifest(),
+      adapters: { node: 1 },
+    })).toMatchObject({ ok: false });
+    expect(validateManifestCompatibility({
+      ...exactManifest(),
+      outputContracts: { node: null },
+    })).toMatchObject({ ok: false });
+    expect(validateManifestCompatibility({
+      ...exactManifest(),
+      unexpected: 'field',
+    })).toMatchObject({ ok: false });
+  });
+
+  it('fails closed when any executable dependency descriptor drifts', () => {
+    const agentId = '00000000-0000-4000-8000-000000000001';
+    const toolId = '00000000-0000-4000-8000-000000000002';
+    const connectionId = '00000000-0000-4000-8000-000000000003';
+    const hash = canonicalJsonHash('original');
+    const baseline: ExecutionManifest = {
+      ...exactManifest(),
+      agents: { [agentId]: { versionId: agentId, version: 1, snapshotHash: hash } },
+      models: { [agentId]: { provider: 'anthropic', model: 'model-a', parametersHash: hash } },
+      apiTools: { [toolId]: { toolId, schemaHash: hash, permissionHash: hash } },
+      mcpActions: { [toolId]: { connectionId, toolId, schemaHash: hash, permissionHash: hash } },
+      adapters: { node: 'api:1' },
+      outputContracts: { node: hash },
+    };
+    const changedHash = canonicalJsonHash('changed');
+    const drifted = [
+      { ...baseline, agents: { [agentId]: { ...baseline.agents[agentId], snapshotHash: changedHash } } },
+      { ...baseline, models: { [agentId]: { ...baseline.models[agentId], provider: 'openai-compatible' } } },
+      { ...baseline, models: { [agentId]: { ...baseline.models[agentId], parametersHash: changedHash } } },
+      { ...baseline, apiTools: { [toolId]: { ...baseline.apiTools[toolId], schemaHash: changedHash } } },
+      { ...baseline, apiTools: { [toolId]: { ...baseline.apiTools[toolId], permissionHash: changedHash } } },
+      { ...baseline, mcpActions: { [toolId]: { ...baseline.mcpActions[toolId], schemaHash: changedHash } } },
+      { ...baseline, mcpActions: { [toolId]: { ...baseline.mcpActions[toolId], permissionHash: changedHash } } },
+      { ...baseline, adapters: { node: 'api:2' } },
+      { ...baseline, outputContracts: { node: changedHash } },
+      { ...baseline, runtime: { version: '0.2.0', stateSchemaVersion: 1 as const } },
+    ];
+
+    for (const current of drifted) {
+      expect(() => assertManifestDependenciesMatch(baseline, current))
+        .toThrow(expect.objectContaining({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false }));
+    }
+    expect(() => assertManifestDependenciesMatch(
+      baseline,
+      { ...baseline, createdAt: '2026-07-27T00:00:00.000Z' },
+    )).not.toThrow();
+  });
+
+  it('enforces task and workflow manifest semantics before querying live dependencies', async () => {
+    const noQueries = {
+      query: async () => {
+        throw new Error('Malformed manifests must fail before database access');
+      },
+    };
+    await expect(assertTaskManifestDependencies({
+      workspaceId: '00000000-0000-4000-8000-000000000001',
+      agentId: '00000000-0000-4000-8000-000000000002',
+      manifest: { ...exactManifest(), agents: {} },
+    }, noQueries)).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
+    await expect(assertWorkflowManifestDependencies({
+      workspaceId: '00000000-0000-4000-8000-000000000001',
+      workflowVersionId: '00000000-0000-4000-8000-000000000003',
+      definition: { nodes: [], edges: [] },
+      manifest: exactManifest(),
+    }, noQueries)).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
   });
 });
 
@@ -196,6 +276,39 @@ describe.runIf(integrationEnabled)('database-backed execution manifests', () => 
     expect(manifest.mcpActions[mcpToolId].schemaHash).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(manifest)).not.toContain('must-not-leak');
     expect(validateManifestCompatibility(manifest)).toEqual({ ok: true, reasons: [] });
+  });
+
+  it('rejects live API, MCP, permission, and provider drift against a stored manifest', async () => {
+    const manifest = await buildWorkflowManifest({ workspaceId, workflowVersionId, definition });
+    const assertCurrent = () => assertWorkflowManifestDependencies({
+      workspaceId,
+      workflowVersionId,
+      definition,
+      manifest,
+    });
+    await expect(assertCurrent()).resolves.toBeUndefined();
+
+    await query("UPDATE tools SET permissions='[\"records.write\"]'::jsonb WHERE id=$1", [apiToolId]);
+    await expect(assertCurrent()).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
+    await query("UPDATE tools SET permissions='[\"records.read\"]'::jsonb WHERE id=$1", [apiToolId]);
+
+    await query("UPDATE mcp_connection_tools SET risk_level='write' WHERE id=$1", [mcpToolId]);
+    await expect(assertCurrent()).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
+    await query("UPDATE mcp_connection_tools SET risk_level='read' WHERE id=$1", [mcpToolId]);
+
+    await query("UPDATE mcp_agent_tool_access SET permission_level='write' WHERE agent_id=$1 AND mcp_tool_id=$2", [agentId, mcpToolId]);
+    await expect(assertCurrent()).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
+    await query("UPDATE mcp_agent_tool_access SET permission_level='read' WHERE agent_id=$1 AND mcp_tool_id=$2", [agentId, mcpToolId]);
+
+    await query(
+      `INSERT INTO workspace_ai_provider_configs(
+         workspace_id,provider,base_url,default_model,encrypted_api_key,api_key_hint,created_by,updated_by
+       ) VALUES($1,'openai-compatible','https://example.test/v1','model-a','{}'::jsonb,'test',$2,$2)`,
+      [workspaceId, actorId],
+    );
+    await expect(assertCurrent()).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
+    await query('DELETE FROM workspace_ai_provider_configs WHERE workspace_id=$1', [workspaceId]);
+    await expect(assertCurrent()).resolves.toBeUndefined();
   });
 
   it('rejects production execution when an agent node has no published version', async () => {
