@@ -18,13 +18,18 @@ describe.runIf(enabled)('database-backed API flow', () => {
 
   type LegacyDepartmentFixtures = {
     ambiguousManagerDepartmentId: string;
+    crossWorkspaceManagerDepartmentId: string;
+    crossWorkspaceMembershipDepartmentId: string;
     duplicateDepartmentIds: [string, string];
     financeDepartmentId: string;
     managerAgentId: string;
     multiTeamAgentId: string;
+    otherWorkspaceAgentId: string;
     primaryDepartmentId: string;
     primaryAgentId: string;
     researchDepartmentId: string;
+    suffixShapedDepartmentIds: [string, string, string];
+    workspaceId: string;
   };
 
   async function withLegacyDepartmentMigration(
@@ -38,7 +43,10 @@ describe.runIf(enabled)('database-backed API flow', () => {
       await client.query(`SET search_path TO "${schema}", public`);
       await client.query(`
         CREATE TABLE workspaces (id UUID PRIMARY KEY);
-        CREATE TABLE agents (id UUID PRIMARY KEY);
+        CREATE TABLE agents (
+          id UUID PRIMARY KEY,
+          workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE
+        );
         CREATE TABLE agent_teams (
           id UUID PRIMARY KEY,
           workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -53,30 +61,41 @@ describe.runIf(enabled)('database-backed API flow', () => {
         );
       `);
 
-      const workspaceId = (await client.query<{ id: string }>('INSERT INTO workspaces(id) VALUES(gen_random_uuid()) RETURNING id')).rows[0].id;
-      const createAgent = async () => (await client.query<{ id: string }>('INSERT INTO agents(id) VALUES(gen_random_uuid()) RETURNING id')).rows[0].id;
+      const createWorkspace = async () => (await client.query<{ id: string }>('INSERT INTO workspaces(id) VALUES(gen_random_uuid()) RETURNING id')).rows[0].id;
+      const workspaceId = await createWorkspace();
+      const otherWorkspaceId = await createWorkspace();
+      const createAgent = async (agentWorkspaceId: string) => (await client.query<{ id: string }>(
+        'INSERT INTO agents(id,workspace_id) VALUES(gen_random_uuid(),$1) RETURNING id',
+        [agentWorkspaceId],
+      )).rows[0].id;
       const createLegacyTeam = async (name: string) => (await client.query<{ id: string }>(
         'INSERT INTO agent_teams(id,workspace_id,name) VALUES(gen_random_uuid(),$1,$2) RETURNING id',
         [workspaceId, name],
       )).rows[0].id;
-      const managerAgentId = await createAgent();
-      const alternateManagerAgentId = await createAgent();
-      const multiTeamAgentId = await createAgent();
-      const primaryAgentId = await createAgent();
-      const ambiguousManagerAgentId = await createAgent();
-      const secondAmbiguousManagerAgentId = await createAgent();
+      const managerAgentId = await createAgent(workspaceId);
+      const alternateManagerAgentId = await createAgent(workspaceId);
+      const multiTeamAgentId = await createAgent(workspaceId);
+      const primaryAgentId = await createAgent(workspaceId);
+      const ambiguousManagerAgentId = await createAgent(workspaceId);
+      const secondAmbiguousManagerAgentId = await createAgent(workspaceId);
+      const otherWorkspaceAgentId = await createAgent(otherWorkspaceId);
       const researchDepartmentId = await createLegacyTeam('Research');
       const financeDepartmentId = await createLegacyTeam('Finance');
       const primaryDepartmentId = await createLegacyTeam('Operations');
       const ambiguousManagerDepartmentId = await createLegacyTeam('Ambiguous management');
+      const crossWorkspaceManagerDepartmentId = await createLegacyTeam('Cross workspace manager');
+      const crossWorkspaceMembershipDepartmentId = await createLegacyTeam('Cross workspace member');
       const duplicateDepartmentIds: [string, string] = [
         await createLegacyTeam('Repeated legacy team'),
         await createLegacyTeam('Repeated legacy team'),
       ];
+      const fooDepartmentId = await createLegacyTeam('Foo');
+      const secondFooDepartmentId = await createLegacyTeam('Foo');
+      const suffixShapedDepartmentId = await createLegacyTeam(`Foo (${secondFooDepartmentId})`);
 
       await client.query(
         `INSERT INTO team_memberships(team_id,agent_id,manager_agent_id)
-         VALUES($1,$2,$3),($4,$5,NULL),($6,$7,$3),($8,$9,$3),($8,$10,$11)`,
+         VALUES($1,$2,$3),($4,$5,NULL),($6,$7,$3),($8,$9,$3),($8,$10,$11),($12,$13,$14),($15,$16,NULL)`,
         [
           researchDepartmentId,
           multiTeamAgentId,
@@ -89,18 +108,28 @@ describe.runIf(enabled)('database-backed API flow', () => {
           ambiguousManagerAgentId,
           secondAmbiguousManagerAgentId,
           alternateManagerAgentId,
+          crossWorkspaceManagerDepartmentId,
+          managerAgentId,
+          otherWorkspaceAgentId,
+          crossWorkspaceMembershipDepartmentId,
+          otherWorkspaceAgentId,
         ],
       );
       await client.query(await readFile(new URL('../src/db/migrations/029_departments.sql', import.meta.url), 'utf8'));
       await callback(client, {
         ambiguousManagerDepartmentId,
+        crossWorkspaceManagerDepartmentId,
+        crossWorkspaceMembershipDepartmentId,
         duplicateDepartmentIds,
         financeDepartmentId,
         managerAgentId,
         multiTeamAgentId,
+        otherWorkspaceAgentId,
         primaryDepartmentId,
         primaryAgentId,
         researchDepartmentId,
+        suffixShapedDepartmentIds: [fooDepartmentId, secondFooDepartmentId, suffixShapedDepartmentId],
+        workspaceId,
       });
     } finally {
       await client.query('RESET search_path');
@@ -1128,13 +1157,18 @@ describe.runIf(enabled)('database-backed API flow', () => {
 
     await withLegacyDepartmentMigration(async (client, {
       ambiguousManagerDepartmentId,
+      crossWorkspaceManagerDepartmentId,
+      crossWorkspaceMembershipDepartmentId,
       financeDepartmentId,
       duplicateDepartmentIds,
       managerAgentId,
       multiTeamAgentId,
+      otherWorkspaceAgentId,
       primaryDepartmentId,
       primaryAgentId,
       researchDepartmentId,
+      suffixShapedDepartmentIds,
+      workspaceId,
     }) => {
       const memberships = await client.query<{
         agent_id: string;
@@ -1164,17 +1198,43 @@ describe.runIf(enabled)('database-backed API flow', () => {
       );
       expect(duplicateNames.rows).toHaveLength(2);
       expect(new Set(duplicateNames.rows.map((department) => department.name.toLowerCase())).size).toBe(2);
+      const suffixShapedNames = await client.query<{ name: string }>(
+        'SELECT name FROM departments WHERE id = ANY($1::uuid[]) ORDER BY id',
+        [suffixShapedDepartmentIds],
+      );
+      expect(suffixShapedNames.rows).toHaveLength(3);
+      expect(new Set(suffixShapedNames.rows.map((department) => department.name.toLowerCase())).size).toBe(3);
       await expect(client.query(
         'SELECT id,manager_agent_id FROM departments WHERE id = ANY($1::uuid[]) ORDER BY id',
-        [[ambiguousManagerDepartmentId, financeDepartmentId, researchDepartmentId]],
+        [[ambiguousManagerDepartmentId, crossWorkspaceManagerDepartmentId, financeDepartmentId, researchDepartmentId]],
       )).resolves.toMatchObject({
         rows: expect.arrayContaining([
           { id: ambiguousManagerDepartmentId, manager_agent_id: null },
+          { id: crossWorkspaceManagerDepartmentId, manager_agent_id: null },
           { id: financeDepartmentId, manager_agent_id: null },
           { id: researchDepartmentId, manager_agent_id: managerAgentId },
         ]),
       });
-      await expect(client.query('SELECT count(*)::int AS count FROM agent_teams')).resolves.toMatchObject({ rows: [{ count: 6 }] });
+      await expect(client.query(
+        'SELECT count(*)::int AS count FROM department_memberships WHERE department_id=$1',
+        [crossWorkspaceMembershipDepartmentId],
+      )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+      await expect(client.query(
+        `INSERT INTO departments(workspace_id,name,manager_agent_id)
+         VALUES($1,'Cross workspace manager rejection',$2)`,
+        [workspaceId, otherWorkspaceAgentId],
+      )).rejects.toMatchObject({ code: '23503' });
+      await expect(client.query(
+        `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
+         VALUES($1,$2,$3,'shared')`,
+        [researchDepartmentId, workspaceId, otherWorkspaceAgentId],
+      )).rejects.toMatchObject({ code: '23503' });
+      await expect(client.query(
+        `INSERT INTO workspace_org_settings(workspace_id,executive_agent_id)
+         VALUES($1,$2)`,
+        [workspaceId, otherWorkspaceAgentId],
+      )).rejects.toMatchObject({ code: '23503' });
+      await expect(client.query('SELECT count(*)::int AS count FROM agent_teams')).resolves.toMatchObject({ rows: [{ count: 11 }] });
     });
   });
 
@@ -1182,11 +1242,12 @@ describe.runIf(enabled)('database-backed API flow', () => {
     await withLegacyDepartmentMigration(async (client, {
       primaryAgentId,
       researchDepartmentId: secondDepartmentId,
+      workspaceId,
     }) => {
       await expect(client.query(
-        `INSERT INTO department_memberships(department_id,agent_id,membership_type)
-         VALUES($1,$2,'primary')`,
-        [secondDepartmentId, primaryAgentId],
+        `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
+         VALUES($1,$2,$3,'primary')`,
+        [secondDepartmentId, workspaceId, primaryAgentId],
       )).rejects.toMatchObject({ code: '23505' });
     });
   });
