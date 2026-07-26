@@ -88,11 +88,11 @@ const savedMcpAccess: AgentMcpAccess = {
   }],
 };
 
-function renderPage() {
+function renderPage({ route = '/agents/agent-1/edit', agents = [agent] }: { route?: string; agents?: Agent[] } = {}) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const workspace: WorkspaceContextValue = {
     session: {} as Session,
-    data: { agents: [agent], tasks: [], workflows: [], documents: [], tools: [apiTool, disabledApiTool, legacyMcpTool], runtime: { defaultModel: 'gpt-5' } as WorkspaceContextValue['data']['runtime'] },
+    data: { agents, tasks: [], workflows: [], documents: [], tools: [apiTool, disabledApiTool, legacyMcpTool], runtime: { defaultModel: 'gpt-5' } as WorkspaceContextValue['data']['runtime'] },
     loading: false,
     refresh: vi.fn(),
     notice: '',
@@ -103,7 +103,7 @@ function renderPage() {
     signOut: vi.fn(),
     openOnboarding: vi.fn(),
   };
-  return render(<MemoryRouter initialEntries={['/agents/agent-1/edit']}><QueryClientProvider client={queryClient}><WorkspaceContext.Provider value={workspace}><Routes><Route path="/agents/:agentId/edit" element={<AgentBuilderPage/>}/></Routes></WorkspaceContext.Provider></QueryClientProvider></MemoryRouter>);
+  return render(<MemoryRouter initialEntries={[route]}><QueryClientProvider client={queryClient}><WorkspaceContext.Provider value={workspace}><Routes><Route path="/agents/new" element={<AgentBuilderPage/>}/><Route path="/agents/:agentId/edit" element={<AgentBuilderPage/>}/></Routes></WorkspaceContext.Provider></QueryClientProvider></MemoryRouter>);
 }
 
 beforeEach(() => {
@@ -154,6 +154,28 @@ describe('AgentBuilderPage API Tool boundary', () => {
     expect(await within(review as HTMLElement).findByText('Loading MCP access…')).toBeTruthy();
     expect(within(review as HTMLElement).getByLabelText('MCP access review status: neutral')).toBeTruthy();
     expect(within(review as HTMLElement).queryByLabelText('MCP access review status: success')).toBeNull();
+  });
+
+  it('shows a spinner only while saved-agent MCP access is loading', async () => {
+    const user = userEvent.setup();
+    renderPage({ route: '/agents/new', agents: [] });
+
+    await user.click(screen.getByRole('button', { name: /Review/ }));
+
+    const unsavedReview = screen.getByRole('heading', { name: 'Review before publishing' }).closest('.guided-section');
+    expect(unsavedReview).toBeTruthy();
+    expect(within(unsavedReview as HTMLElement).getByText('Save this agent before assigning MCP access')).toBeTruthy();
+    expect(within(unsavedReview as HTMLElement).getByLabelText('MCP access review status: neutral').querySelector('.spin')).toBeNull();
+
+    cleanup();
+    vi.mocked(api.agentMcpAccess).mockReturnValue(new Promise(() => undefined));
+    renderPage();
+    await user.click(screen.getByRole('button', { name: /Review/ }));
+
+    const loadingReview = screen.getByRole('heading', { name: 'Review before publishing' }).closest('.guided-section');
+    expect(loadingReview).toBeTruthy();
+    expect(await within(loadingReview as HTMLElement).findByText('Loading MCP access…')).toBeTruthy();
+    expect(within(loadingReview as HTMLElement).getByLabelText('MCP access review status: neutral').querySelector('.spin')).toBeTruthy();
   });
 
   it('renders an MCP loading error as warning instead of success', async () => {

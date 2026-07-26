@@ -19,6 +19,8 @@ type Draft = {
   avatar: AgentAvatarConfig | null;
 };
 type BuilderStep = 'purpose' | 'instructions' | 'resources' | 'model' | 'review';
+type ReviewStatus = 'success' | 'warning' | 'neutral';
+type ReviewIndicator = 'success' | 'warning' | 'loading' | 'none';
 
 const steps: Array<{ id: BuilderStep; label: string; hint: string }> = [
   { id: 'purpose', label: 'Purpose', hint: 'Identity and outcome' },
@@ -99,6 +101,9 @@ export function AgentBuilderPage() {
   const mcpReviewStatus = mcpAccessState === 'loaded'
     ? mcpAccess.data?.connections.length ? 'warning' : 'success'
     : mcpAccessState === 'error' ? 'warning' : 'neutral';
+  const mcpReviewIndicator: ReviewIndicator | undefined = mcpAccessState === 'loading'
+    ? 'loading'
+    : mcpAccessState === 'unsaved' ? 'none' : undefined;
 
   const mutation = useMutation({
     mutationFn: async (status: Agent['status']) => {
@@ -239,7 +244,7 @@ export function AgentBuilderPage() {
         </BuilderSection>}
 
         {step === 'review' && <BuilderSection Icon={ShieldCheck} eyebrow="Step 5" title="Review before publishing" description="Publishing makes this agent available for tasks. It does not automatically run work or grant new permissions.">
-          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="API Tools" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API Tool access'} good={!activeTools.length}/><ReviewRow label="MCP access" value={mcpSummary} status={mcpReviewStatus}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
+          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="API Tools" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API Tool access'} good={!activeTools.length}/><ReviewRow label="MCP access" value={mcpSummary} status={mcpReviewStatus} indicator={mcpReviewIndicator}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
           <div className="publish-boundary"><ShieldCheck size={19}/><div><strong>What happens when you publish</strong><p>The configuration is saved and the agent becomes selectable for tasks. No task starts automatically, no external action is performed, and MCP permissions remain separately enforced.</p></div></div>
           <div className="review-actions"><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save as draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}><Rocket size={15}/>{agent?.status === 'active' ? 'Update published agent' : 'Publish agent'}</button>{agent && <button className="button" onClick={() => navigate(`/agents/${agent.id}?section=history`)}><Play size={15}/>Open task history</button>}</div>
         </BuilderSection>}
@@ -264,7 +269,8 @@ function BuilderSection({ Icon, eyebrow, title, description, children }: { Icon:
   return <section className="guided-section"><header><span><Icon size={20}/></span><div><small className="eyebrow">{eyebrow}</small><h1>{title}</h1><p>{description}</p></div></header><div className="guided-fields">{children}</div></section>;
 }
 
-function ReviewRow({ label, value, good, status }: { label: string; value: string; good?: boolean; status?: 'success' | 'warning' | 'neutral' }) {
+function ReviewRow({ label, value, good, status, indicator }: { label: string; value: string; good?: boolean; status?: ReviewStatus; indicator?: ReviewIndicator }) {
   const resolvedStatus = status ?? (good ? 'success' : 'warning');
-  return <div className="review-row"><span className={resolvedStatus === 'success' ? 'good' : resolvedStatus} aria-label={`${label} review status: ${resolvedStatus}`}>{resolvedStatus === 'success' ? <Check size={13}/> : resolvedStatus === 'neutral' ? <LoaderCircle className="spin" size={13}/> : <AlertTriangle size={13}/>}</span><small>{label}</small><strong>{value}</strong></div>;
+  const resolvedIndicator = indicator ?? (resolvedStatus === 'success' ? 'success' : 'warning');
+  return <div className="review-row"><span className={resolvedStatus === 'success' ? 'good' : resolvedStatus} aria-label={`${label} review status: ${resolvedStatus}`}>{resolvedIndicator === 'success' ? <Check size={13}/> : resolvedIndicator === 'warning' ? <AlertTriangle size={13}/> : resolvedIndicator === 'loading' ? <LoaderCircle className="spin" size={13}/> : null}</span><small>{label}</small><strong>{value}</strong></div>;
 }
