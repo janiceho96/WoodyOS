@@ -6,21 +6,27 @@ import { api, type Tool } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState } from '../../components/ui';
 import { BrandIcon } from '../../components/BrandIcon';
+import { normalizeAgentApiToolIds } from './agentToolAccess';
 
 function AgentToolAssignment({ tool, done }: { tool: Tool; done: () => void }) {
   const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const assign = useMutation({
-    mutationFn: (agentId: string) => {
+    mutationFn: async (agentId: string) => {
       const agent = data.agents.find((item) => item.id === agentId);
       if (!agent) throw new Error('Agent is no longer available');
-      return api.updateAgent(agent.id, {
+      const assignment = normalizeAgentApiToolIds([...agent.tool_ids, tool.id], data.tools, [tool]);
+      const saved = await api.updateAgent(agent.id, {
         capabilities: { ...agent.capabilities, webBrowser: true },
-        toolIds: [...new Set([...agent.tool_ids, tool.id])],
+        toolIds: assignment.toolIds,
       });
+      return { saved, removedCount: assignment.removedCount };
     },
-    onSuccess: async (agent) => {
-      report(`${tool.name} assigned to ${agent.name}`);
+    onSuccess: async ({ saved, removedCount }) => {
+      const cleanup = removedCount
+        ? ` Removed ${removedCount} unavailable tool assignment${removedCount === 1 ? '' : 's'}.`
+        : '';
+      report(`${tool.name} assigned to ${saved.name}.${cleanup}`);
       await queryClient.invalidateQueries({ queryKey: ['workspace'] });
     },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not assign this tool'),

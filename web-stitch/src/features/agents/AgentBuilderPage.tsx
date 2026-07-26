@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, House, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -8,6 +8,8 @@ import { Status } from '../../components/ui';
 import { humanize } from '../../lib/format';
 import { AgentAvatar } from '../../components/agents/AgentAvatar';
 import { AgentAvatarPicker } from '../../components/agents/AgentAvatarPicker';
+import { mcpAccessForAgent, mcpAccessSummary } from '../mcp/agentMcpAccess';
+import { normalizeAgentApiToolIds } from '../tools/agentToolAccess';
 
 type Draft = {
   name: string; role: string; goal: string; personality: string; instructions: string; model: string;
@@ -75,10 +77,23 @@ export function AgentBuilderPage() {
   };
   const ready = validation.purpose && validation.model;
   const apiTools = data.tools.filter(isApiTool);
-  const activeTools = apiTools.filter((tool) => draft.toolIds.includes(tool.id));
+  const enabledApiTools = apiTools.filter((tool) => tool.enabled);
+  const normalizedToolAssignment = normalizeAgentApiToolIds(draft.toolIds, data.tools);
+  const activeTools = enabledApiTools.filter((tool) => normalizedToolAssignment.toolIds.includes(tool.id));
   const activeWebTools = activeTools.filter((tool) => tool.permissions.includes('web.read'));
   const webReady = !draft.capabilities.webBrowser || activeWebTools.length > 0;
   const currentIndex = steps.findIndex((item) => item.id === step);
+  const mcpResources = useQuery({
+    queryKey: ['workflow-resources'],
+    queryFn: api.workflowResources,
+    enabled: Boolean(agent?.id),
+  });
+  const mcpAccess = mcpAccessForAgent(mcpResources.data, agent?.id);
+  const mcpSummary = mcpResources.isError
+    ? 'MCP access could not be loaded'
+    : mcpResources.isLoading && agent
+      ? 'Loading MCP access…'
+      : mcpAccessSummary(mcpResources.data, agent?.id);
 
   const mutation = useMutation({
     mutationFn: async (status: Agent['status']) => {
@@ -88,7 +103,7 @@ export function AgentBuilderPage() {
         name: draft.name.trim(), role: draft.role.trim(), goal: draft.goal.trim(), personality: draft.personality.trim() || null,
         instructions: draft.instructions, model: draft.model.trim(), status,
         modelConfig: { temperature: Number(draft.temperature), maxTokens: Number(draft.maxTokens), topP: Number(draft.topP) },
-        capabilities: draft.capabilities, toolIds: draft.toolIds.filter((toolId) => apiTools.some((tool) => tool.id === toolId)),
+        capabilities: draft.capabilities, toolIds: normalizedToolAssignment.toolIds,
         memoryConfig: { shortTerm: true, longTerm: true, knowledgeBase: draft.capabilities.knowledgeBase },
         ...(draft.avatar ? { avatar: draft.avatar } : {}),
       };
@@ -166,6 +181,7 @@ export function AgentBuilderPage() {
       <div>{!agent && <button className="button" onClick={() => leaveBuilder('/agents/library?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => leaveBuilder(agent ? `/agents/${agent.id}?section=configure` : '/agents')}><ChevronLeft size={15}/>{agent ? 'Back to agent' : 'Back to agents'}</button><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Publish agent</button></div>
     </div>
     {formError && <div className="inline-error builder-error"><AlertTriangle size={15}/><span><strong>Agent was not saved.</strong>{formError}</span></div>}
+    {normalizedToolAssignment.removedCount > 0 && <div className="inline-warning builder-error"><AlertTriangle size={15}/><span>{normalizedToolAssignment.removedCount} unavailable tool assignment{normalizedToolAssignment.removedCount === 1 ? '' : 's'} will be removed when you save.</span></div>}
     <div className="guided-builder-layout">
       <aside className="builder-steps" aria-label="Agent builder steps">
         <div><span className="eyebrow">Build progress</span><strong>{ready ? 'Ready to review' : 'Draft in progress'}</strong></div>
@@ -205,8 +221,8 @@ export function AgentBuilderPage() {
             ['codeInterpreter', 'Code-oriented work', 'Allow compatible execution tools for code and data tasks.', Code2],
             ['knowledgeBase', 'Workspace knowledge', 'Search indexed workspace documents. Per-document assignment is not available yet.', Database],
           ] as const).map(([key, label, text, Icon]) => <button className={`permission-card ${draft.capabilities[key] ? 'active' : ''}`} key={key} onClick={() => toggleCapability(key)} type="button"><span><Icon size={18}/></span><div><strong>{label}</strong><small>{text}</small></div><i>{draft.capabilities[key] ? <Check size={13}/> : <X size={13}/>}</i></button>)}</div>
-          <div className="resource-group"><div><h3>API Tools</h3><p>Choose enabled API tools to save in this agent’s API Tool access list.</p></div>{apiTools.filter((tool) => tool.enabled).length ? <div className="permission-list">{apiTools.filter((tool) => tool.enabled).map((tool) => <label key={tool.id}><input type="checkbox" checked={draft.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><b>{draft.toolIds.includes(tool.id) ? 'Allowed' : 'No access'}</b></label>)}</div> : <div className="resource-empty"><Wrench size={18}/><span><strong>No enabled API Tools</strong><small>Connect or enable an API Tool before assigning it to this agent.</small></span><button className="button" onClick={() => navigate('/api-tools')}>Open API Tools</button></div>}</div>
-          <div className="resource-group"><div><h3>MCP access</h3><p>MCP connections and actions use separate per-agent allowlists. Connection IDs are never added to this agent’s API Tool list.</p></div><button type="button" className="button" onClick={() => navigate('/mcp?tab=access')}>Manage MCP access</button></div>
+          <div className="resource-group"><div><h3>API Tools</h3><p>Choose enabled API tools to save in this agent’s API Tool access list.</p></div>{enabledApiTools.length ? <div className="permission-list">{enabledApiTools.map((tool) => <label key={tool.id}><input type="checkbox" checked={normalizedToolAssignment.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><b>{normalizedToolAssignment.toolIds.includes(tool.id) ? 'Allowed' : 'No access'}</b></label>)}</div> : <div className="resource-empty"><Wrench size={18}/><span><strong>No enabled API Tools</strong><small>Connect or enable an API Tool before assigning it to this agent.</small></span><button className="button" onClick={() => navigate('/api-tools')}>Open API Tools</button></div>}</div>
+          <div className="resource-group"><div><h3>MCP access</h3><p>MCP connections and actions use separate per-agent allowlists. Connection IDs are never added to this agent’s API Tool list.</p><strong>{mcpSummary}</strong></div><button type="button" className="button" onClick={() => navigate('/mcp?tab=access')}>Manage MCP access</button></div>
           {draft.capabilities.webBrowser && !activeWebTools.length && <div className="inline-warning"><AlertTriangle size={16}/><span>Web access is enabled, but no Web Research tool is assigned. The agent still cannot search the internet. <button type="button" className="text-button" onClick={() => navigate('/api-tools')}>Configure Web Research</button></span></div>}
           {!draft.capabilities.webBrowser && activeWebTools.length > 0 && <div className="inline-warning"><AlertTriangle size={16}/>Assigned web tools will remain unavailable until Web access is enabled above.</div>}
         </BuilderSection>}
@@ -218,7 +234,7 @@ export function AgentBuilderPage() {
         </BuilderSection>}
 
         {step === 'review' && <BuilderSection Icon={ShieldCheck} eyebrow="Step 5" title="Review before publishing" description="Publishing makes this agent available for tasks. It does not automatically run work or grant new permissions.">
-          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="Integrations" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API tool access'} good={!activeTools.length}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
+          <div className="agent-review-card"><div className="review-identity"><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><span><small>{draft.role || 'Role missing'}</small><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.goal || 'Goal missing'}</p></span></div><ReviewRow label="Instructions" value={draft.instructions ? `${Math.ceil(draft.instructions.length / 4)} estimated prompt tokens` : 'No detailed instructions'} good={validation.instructions}/><ReviewRow label="Knowledge" value={draft.capabilities.knowledgeBase ? 'May search workspace knowledge' : 'No knowledge access'} good={draft.capabilities.knowledgeBase}/><ReviewRow label="API Tools" value={activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'No API Tool access'} good={!activeTools.length}/><ReviewRow label="MCP access" value={mcpSummary} good={!mcpAccess.actions.length}/><ReviewRow label="Web research" value={!draft.capabilities.webBrowser ? 'Not enabled' : activeWebTools.length ? activeWebTools.map((tool) => tool.name).join(', ') : 'Enabled but no web tool assigned'} good={webReady}/><ReviewRow label="Code execution" value={draft.capabilities.codeInterpreter ? 'Enabled for assigned code tools' : 'Not enabled'} good={!draft.capabilities.codeInterpreter}/><ReviewRow label="Model" value={`${draft.model || 'Missing'} · max ${draft.maxTokens.toLocaleString()} tokens`} good={validation.model}/></div>
           <div className="publish-boundary"><ShieldCheck size={19}/><div><strong>What happens when you publish</strong><p>The configuration is saved and the agent becomes selectable for tasks. No task starts automatically, no external action is performed, and MCP permissions remain separately enforced.</p></div></div>
           <div className="review-actions"><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save as draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}><Rocket size={15}/>{agent?.status === 'active' ? 'Update published agent' : 'Publish agent'}</button>{agent && <button className="button" onClick={() => navigate(`/agents/${agent.id}?section=history`)}><Play size={15}/>Open task history</button>}</div>
         </BuilderSection>}
@@ -230,7 +246,8 @@ export function AgentBuilderPage() {
         <span className="eyebrow">Live summary</span><AgentAvatar agent={{ name: draft.name || 'Untitled agent', role: draft.role, avatar_config: draft.avatar ?? {} }} size="lg"/><h2>{draft.name || 'Untitled agent'}</h2><p>{draft.role || 'Add a role to define this specialist.'}</p>
         <div><small>Outcome</small><strong>{draft.goal || 'Not defined yet'}</strong></div>
         <div><small>Access</small><span>{Object.entries(draft.capabilities).map(([key, enabled]) => <i className={enabled ? 'enabled' : ''} key={key}>{enabled ? <Check size={11}/> : <X size={11}/>} {humanize(key)}</i>)}</span></div>
-        <div><small>Integrations</small><strong>{activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'None assigned'}</strong></div>
+        <div><small>API Tools</small><strong>{activeTools.length ? activeTools.map((tool) => tool.name).join(', ') : 'None assigned'}</strong></div>
+        <div><small>MCP access</small><strong>{mcpSummary}</strong></div>
         <div><small>Model</small><strong>{draft.model || 'Not selected'}</strong></div>
         <div className="summary-readiness"><Status value={ready ? 'ready' : 'draft'}/><span>{ready ? 'Required fields complete' : 'Complete Purpose and Model'}</span></div>
       </aside>

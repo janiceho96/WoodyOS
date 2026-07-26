@@ -187,8 +187,6 @@
 :root .filter-row button span,
 :root .agent-card-meta strong,
 :root .config-list span,
-:root .integrations-safety > span,
-:root .integration-sections button span,
 :root .demo-api-grid small,
 :root .builder-step-number,
 :root .woody-chat-trigger > span,
@@ -233,12 +231,10 @@
 :root .agent-card h2 { font-size: var(--text-card); }
 :root .agent-card p,
 :root .agent-detail section p,
-:root .integration-app-entry p,
 :root .demo-api-grid p,
 :root .search-results article p { font-size: var(--text-secondary); line-height: 1.5; }
 :root .agent-card-meta strong,
 :root .config-list span,
-:root .integration-sections button,
 :root .workflow-lifecycle span { font-size: var(--text-label); }
 :root .builder-section-title h2 { font-size: var(--text-card); }
 :root .market-card p,

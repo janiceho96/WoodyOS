@@ -4,7 +4,7 @@ import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, useNavigate } from 'react-router-dom';
-import type { McpConnection, Session } from '../../api';
+import type { McpAgentAccess, McpConnection, McpTool, Session } from '../../api';
 import { api } from '../../api';
 import { WorkspaceContext, type WorkspaceContextValue } from '../../app/workspace';
 import { McpMarketplacePage } from './McpMarketplacePage';
@@ -16,6 +16,8 @@ vi.mock('../../api', () => ({
     mcpToolCalls: vi.fn(),
     mcpTools: vi.fn(),
     mcpConnectionAgents: vi.fn(),
+    createMcpConnection: vi.fn(),
+    startMcpOAuth: vi.fn(),
   },
 }));
 
@@ -37,6 +39,7 @@ function RouteNavigator() {
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const reportError = vi.fn();
   const workspace: WorkspaceContextValue = {
     session: {} as Session,
     data: { agents: [], tasks: [], workflows: [], documents: [], tools: [] },
@@ -45,12 +48,13 @@ function renderPage() {
     notice: '',
     error: '',
     report: vi.fn(),
-    reportError: vi.fn(),
+    reportError,
     clearMessage: vi.fn(),
     signOut: vi.fn(),
     openOnboarding: vi.fn(),
   };
-  return render(<MemoryRouter initialEntries={['/mcp']}><RouteNavigator/><QueryClientProvider client={queryClient}><WorkspaceContext.Provider value={workspace}><McpMarketplacePage/></WorkspaceContext.Provider></QueryClientProvider></MemoryRouter>);
+  const rendered = render(<MemoryRouter initialEntries={['/mcp']}><RouteNavigator/><QueryClientProvider client={queryClient}><WorkspaceContext.Provider value={workspace}><McpMarketplacePage/></WorkspaceContext.Provider></QueryClientProvider></MemoryRouter>);
+  return { ...rendered, reportError };
 }
 
 beforeEach(() => {
@@ -102,5 +106,65 @@ describe('MCP workspace tabs', () => {
 
     expect(screen.getByRole('tab', { name: 'Agent Access' }).getAttribute('aria-selected')).toBe('true');
     expect(await screen.findByRole('combobox', { name: 'Agent' })).toBeTruthy();
+  });
+
+  it('returns from Agent Access directly to the selected connection tools', async () => {
+    vi.mocked(api.mcpTools).mockResolvedValue({
+      data: [{
+        id: 'disabled-action',
+        remote_name: 'search_docs',
+        title: 'Search docs',
+        description: 'Search docs',
+        input_schema: {},
+        annotations: {},
+        risk_level: 'read',
+        enabled: false,
+        discovered_at: '2026-01-01T00:00:00.000Z',
+      } as McpTool],
+    });
+    vi.mocked(api.mcpConnectionAgents).mockResolvedValue({
+      data: [{
+        id: 'agent-1',
+        name: 'Researcher',
+        role: 'Researcher',
+        status: 'active',
+        updated_at: '2026-01-01T00:00:00.000Z',
+        tools: [],
+      } as McpAgentAccess],
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('tab', { name: 'Agent Access' }));
+    await user.click(await screen.findByRole('button', { name: /Docs MCP/ }));
+    await user.click(await screen.findByRole('button', { name: 'Review connection tools' }));
+
+    expect(screen.getByRole('tab', { name: /Connected/ }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('button', { name: /Docs MCP/ }).className).toContain('selected');
+  });
+
+  it('recovers an OAuth start failure on the Connected tab with the new connection selected', async () => {
+    const oauthConnection = {
+      ...connection,
+      id: 'oauth-mcp',
+      name: 'OAuth MCP',
+      auth_type: 'oauth2',
+      authorized: false,
+    } as McpConnection;
+    vi.mocked(api.mcpConnections).mockResolvedValue({ data: [connection, oauthConnection] });
+    vi.mocked(api.createMcpConnection).mockResolvedValue(oauthConnection);
+    vi.mocked(api.startMcpOAuth).mockRejectedValue(new Error('Provider unavailable'));
+    const user = userEvent.setup();
+    const { reportError } = renderPage();
+
+    await user.click(screen.getByRole('button', { name: 'Custom server' }));
+    await user.type(screen.getByLabelText('Connection name'), 'OAuth MCP');
+    await user.type(screen.getByLabelText('Streamable HTTP endpoint'), 'https://oauth.example.com/mcp');
+    await user.selectOptions(screen.getByLabelText('Authentication'), 'oauth2');
+    await user.click(screen.getByRole('button', { name: 'Connect and authenticate' }));
+
+    expect((await screen.findByRole('tab', { name: /Connected/ })).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('button', { name: /OAuth MCP/ }).className).toContain('selected');
+    expect(reportError).toHaveBeenCalledWith(expect.stringContaining('Open Connected and select Authorize to retry.'));
   });
 });

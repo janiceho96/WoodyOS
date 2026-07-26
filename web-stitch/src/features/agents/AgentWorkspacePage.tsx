@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, ArrowRight, Bot, Brain, CheckCircle2, ChevronRight, CircleAlert, Clock3, FileOutput, History, LoaderCircle, PanelRightOpen, Pencil, Play, Plus, RotateCcw, Settings2, Sparkles, Wrench } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -15,6 +15,7 @@ import { thinkingOrbStateForContext } from '../../lib/thinkingOrb';
 import { ArtifactPanel, TaskDialogBody } from '../execution/ExecutionPage';
 import { AgentActivityPanel } from './AgentActivityPanel';
 import { AgentExecutionProvider, useAgentExecution } from './agentExecution';
+import { mcpAccessForAgent } from '../mcp/agentMcpAccess';
 
 export function AgentWorkspacePage() {
   const { agentId } = useParams();
@@ -132,11 +133,13 @@ function AgentConfiguration() {
   const navigate = useNavigate();
   const apiTools = data.tools.filter(isApiTool).filter((tool) => execution.agent.tool_ids?.includes(tool.id));
   const capabilities = Object.entries(execution.agent.capabilities ?? {});
+  const mcpResources = useQuery({ queryKey: ['workflow-resources'], queryFn: api.workflowResources });
+  const mcpAccess = mcpAccessForAgent(mcpResources.data, execution.agent.id);
   return <div className="agent-config-overview">
     <section className="panel config-hero"><div><span className="eyebrow">Published configuration</span><h2>Purpose and instructions</h2><p>Review the operating contract before changing how this agent works.</p></div><button className="button primary" onClick={() => navigate(`/agents/${execution.agent.id}/edit`)}><Pencil size={14}/>Edit full configuration</button></section>
     <section className="panel"><h3>Role</h3><p>{execution.agent.role}</p><h3>Goal</h3><p>{execution.agent.goal}</p><details className="config-details"><summary>Instructions</summary><OutputViewer value={execution.agent.instructions}/></details></section>
     <section className="panel"><div className="section-title"><div><span className="eyebrow">Runtime</span><h2>Model settings</h2></div><Settings2 size={19}/></div><dl className="config-definition-list"><div><dt>Model</dt><dd>{execution.agent.model}</dd></div><div><dt>Temperature</dt><dd>{execution.agent.model_config?.temperature ?? 0.2}</dd></div><div><dt>Maximum tokens</dt><dd>{execution.agent.model_config?.maxTokens ?? 4096}</dd></div><div><dt>Top P</dt><dd>{execution.agent.model_config?.topP ?? 1}</dd></div></dl></section>
-    <section className="panel"><div className="section-title"><div><span className="eyebrow">Access</span><h2>Capabilities and resources</h2></div><Wrench size={19}/></div><div className="permission-list">{capabilities.map(([name, enabled]) => <span key={name}><strong>{humanize(name)}</strong><Status value={enabled ? 'enabled' : 'disabled'}/></span>)}</div><div className="resource-group"><div><h3>API Tools</h3><p>Saved in this agent’s API Tool access list.</p></div><div className="permission-list">{apiTools.map((tool) => <span key={tool.id}><strong>{tool.name}</strong><small>{tool.permissions.join(', ') || 'No declared permissions'}</small><Status value={tool.enabled ? 'enabled' : 'disabled'}/></span>)}{!apiTools.length && <p>No API Tools are assigned.</p>}</div></div><div className="resource-group"><div><h3>MCP access</h3><p>MCP connections and actions are governed by their own per-agent allowlists and are not stored with API Tool IDs.</p></div><button className="button" onClick={() => navigate('/mcp?tab=access')}>Manage MCP access</button></div><div className="config-actions"><button className="button" onClick={() => navigate('/knowledge')}>Knowledge Hub</button><button className="button" onClick={() => navigate('/api-tools')}>API Tools</button></div></section>
+    <section className="panel"><div className="section-title"><div><span className="eyebrow">Access</span><h2>Capabilities and resources</h2></div><Wrench size={19}/></div><div className="permission-list">{capabilities.map(([name, enabled]) => <span key={name}><strong>{humanize(name)}</strong><Status value={enabled ? 'enabled' : 'disabled'}/></span>)}</div><div className="resource-group"><div><h3>API Tools</h3><p>Saved in this agent’s API Tool access list.</p></div><div className="permission-list">{apiTools.map((tool) => <span key={tool.id}><strong>{tool.name}</strong><small>{tool.permissions.join(', ') || 'No declared permissions'}</small><Status value={tool.enabled ? 'enabled' : 'disabled'}/></span>)}{!apiTools.length && <p>No API Tools are assigned.</p>}</div></div><div className="resource-group"><div><h3>MCP access</h3><p>Currently available through this agent’s separate MCP allowlists.</p></div>{mcpResources.isLoading ? <p>Loading MCP access…</p> : mcpResources.isError ? <p>MCP access could not be loaded.</p> : <div className="mcp-agent-resource-summary"><div><strong>Assigned connections</strong>{mcpAccess.connections.length ? mcpAccess.connections.map((connection) => <span key={connection}>{connection}</span>) : <span>No currently available connections</span>}</div><div><strong>Assigned MCP actions</strong>{mcpAccess.actions.length ? mcpAccess.actions.map((tool) => <span key={tool.id}>{tool.title ?? tool.remoteName}</span>) : <span>No currently available actions</span>}</div></div>}<button className="button" onClick={() => navigate('/mcp?tab=access')}>Manage MCP access</button></div><div className="config-actions"><button className="button" onClick={() => navigate('/knowledge')}>Knowledge Hub</button><button className="button" onClick={() => navigate('/api-tools')}>API Tools</button></div></section>
   </div>;
 }
 
