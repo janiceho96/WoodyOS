@@ -5,6 +5,7 @@ import {
 } from '../src/runtime/errors.js';
 import {
   authoritativeTraceContext,
+  authoritativeQueuedTraceContext,
   childTraceContext,
   createTraceContext,
 } from '../src/runtime/trace.js';
@@ -56,6 +57,16 @@ describe('structured runtime errors', () => {
     expect(serialized).not.toHaveProperty('stack');
   });
 
+  it('redacts camelCase secrets inside quoted embedded JSON', () => {
+    const serialized = serializeRuntimeError(
+      new Error('provider body {"apiKey":"super-secret-value","retryAfterMs":2000}'),
+    );
+
+    expect(serialized.message).toContain('"apiKey":"[REDACTED]"');
+    expect(serialized.message).toContain('"retryAfterMs":2000');
+    expect(JSON.stringify(serialized)).not.toContain('super-secret-value');
+  });
+
   it('revalidates and redacts a previously persisted structured error', () => {
     const serialized = serializeRuntimeError({
       code: 'PROVIDER_LIMIT',
@@ -105,5 +116,25 @@ describe('trace context', () => {
       span_id: root.spanId,
       parent_span_id: root.parentSpanId,
     }, root.traceId)).toEqual(root);
+  });
+
+  it('only adopts a backfilled database trace for a pre-031 queued subject', () => {
+    const root = createTraceContext();
+    const migrationAppliedAt = '2026-07-26T12:00:00.000Z';
+    const legacy = {
+      trace_id: root.traceId,
+      span_id: root.spanId,
+      parent_span_id: null,
+      created_at: '2026-07-25T12:00:00.000Z',
+    };
+    const current = { ...legacy, created_at: '2026-07-27T12:00:00.000Z' };
+
+    expect(authoritativeQueuedTraceContext(legacy, undefined, migrationAppliedAt)).toEqual(root);
+    expect(() => authoritativeQueuedTraceContext(current, undefined, migrationAppliedAt)).toThrow(
+      expect.objectContaining({ code: 'TRACE_CONTEXT_REQUIRED' }),
+    );
+    expect(() => authoritativeQueuedTraceContext(legacy, createTraceContext().traceId, migrationAppliedAt)).toThrow(
+      expect.objectContaining({ code: 'TRACE_CONTEXT_MISMATCH' }),
+    );
   });
 });

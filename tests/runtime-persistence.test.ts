@@ -38,7 +38,7 @@ vi.mock('../src/db/client.js', () => ({
 vi.mock('../src/workflows/adapters/index.js', () => ({
   executeRegisteredWorkflowNode: vi.fn(async (context: Record<string, unknown>) => {
     state.contexts.push(context);
-    throw new Error('Provider failed with api_key=do-not-persist');
+    throw new Error('Provider failed with {"apiKey":"do-not-persist","retryAfterMs":2000}');
   }),
 }));
 vi.mock('../src/queue/task-queue.js', () => ({ enqueueWorkflowRun: vi.fn(async () => undefined) }));

@@ -1,4 +1,5 @@
 import { query } from '../db/client.js';
+import type { TraceContext } from '../runtime/trace.js';
 
 export type KnowledgeResult = {
   chunkId: string;
@@ -10,7 +11,12 @@ export type KnowledgeResult = {
   score: number;
 };
 
-export async function searchWorkspaceKnowledge(workspaceId: string, requestText: string, limit = 8): Promise<KnowledgeResult[]> {
+export async function searchWorkspaceKnowledge(
+  workspaceId: string,
+  requestText: string,
+  limit = 8,
+  _trace?: TraceContext,
+): Promise<KnowledgeResult[]> {
   const search = requestText.replace(/\s+/g, ' ').trim().slice(0, 1_000);
   if (search.length < 2) return [];
   const result = await query<{
@@ -40,4 +46,3 @@ export async function searchWorkspaceKnowledge(workspaceId: string, requestText:
     score: Number(row.score),
   }));
 }
-

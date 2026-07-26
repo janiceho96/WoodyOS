@@ -58,11 +58,68 @@ export function runtimeError(
 
 const sensitiveKey = /token|password|secret|authorization|(^|[-_])auth($|[-_])|api[-_]?key|cookie|credential|private[-_]?key|session|encrypted/i;
 const namedSecret = /\b(api[-_]?key|password|token|authorization|secret|credential)\b(\s*[:=]\s*)([^\s,;]+)/gi;
+const quotedNamedSecret = /(["'])(api[-_]?key|password|token|authorization|secret|credential)\1(\s*:\s*)(["'])(.*?)\4/gi;
 const bearerSecret = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const keyLikeSecret = /\b(?:sk|rk|pk)_[A-Za-z0-9_-]{8,}\b|\bsk-[A-Za-z0-9_-]{8,}\b/g;
 
+function redactEmbeddedJson(value: string) {
+  let output = '';
+  let cursor = 0;
+  while (cursor < value.length) {
+    const opening = value.slice(cursor).search(/[[{]/);
+    if (opening < 0) {
+      output += value.slice(cursor);
+      break;
+    }
+    const start = cursor + opening;
+    output += value.slice(cursor, start);
+    const stack: string[] = [];
+    let quote = '';
+    let escaped = false;
+    let end = -1;
+    for (let index = start; index < value.length; index += 1) {
+      const character = value[index]!;
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === quote) quote = '';
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+        continue;
+      }
+      if (character === '{' || character === '[') stack.push(character);
+      else if (character === '}' || character === ']') {
+        const expected = character === '}' ? '{' : '[';
+        if (stack.pop() !== expected) break;
+        if (stack.length === 0) {
+          end = index + 1;
+          break;
+        }
+      }
+    }
+    if (end < 0) {
+      output += value[start]!;
+      cursor = start + 1;
+      continue;
+    }
+    const candidate = value.slice(start, end);
+    try {
+      output += JSON.stringify(redactRuntimeValue(JSON.parse(candidate)));
+    } catch {
+      output += candidate;
+    }
+    cursor = end;
+  }
+  return output;
+}
+
 export function redactRuntimeMessage(value: string) {
-  return value
+  return redactEmbeddedJson(value)
+    .replace(quotedNamedSecret, (_match, keyQuote: string, name: string, separator: string, valueQuote: string) => (
+      `${keyQuote}${name}${keyQuote}${separator}${valueQuote}[REDACTED]${valueQuote}`
+    ))
     .replace(namedSecret, (_match, name: string, separator: string) => `${name}${separator}[REDACTED]`)
     .replace(bearerSecret, 'Bearer [REDACTED]')
     .replace(keyLikeSecret, '[REDACTED]');

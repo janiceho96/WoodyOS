@@ -1,6 +1,7 @@
 import { query } from '../db/client.js';
 import type { ToolRecord } from '../tools/runtime.js';
 import { searchWorkspaceKnowledge } from '../knowledge/retrieval.js';
+import type { TraceContext } from '../runtime/trace.js';
 
 export type AgentModelConfig = {
   temperature: number;
@@ -140,8 +141,18 @@ export function resolveAgentRuntimePolicy(agent: AgentRuntimeSource, configuredT
   };
 }
 
-export async function retrieveAgentKnowledge(workspaceId: string, requestText: string, limit = 4) {
-  const results = await searchWorkspaceKnowledge(workspaceId, requestText, Math.min(8, Math.max(1, limit)));
+export async function retrieveAgentKnowledge(
+  workspaceId: string,
+  requestText: string,
+  limit = 4,
+  trace?: TraceContext,
+) {
+  const results = await searchWorkspaceKnowledge(
+    workspaceId,
+    requestText,
+    Math.min(8, Math.max(1, limit)),
+    trace,
+  );
   if (!results.length) return '';
   return results
     .map((row, index) => `[Knowledge ${index + 1}: ${row.documentName}]\n${row.content}`)

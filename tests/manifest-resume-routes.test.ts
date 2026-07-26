@@ -2,9 +2,10 @@ import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
-  mode: 'task-action' as 'task-action' | 'workflow-action' | 'mcp-call',
+  mode: 'task-action' as 'task-action' | 'task-action-missing-trace' | 'task-action-queue-failure' | 'workflow-action' | 'mcp-call',
   statements: [] as string[],
   enqueued: [] as string[],
+  queueFailure: false,
 }));
 
 const incompatibleManifest = {
@@ -18,7 +19,7 @@ const client = {
   async query(sql: string) {
     state.statements.push(sql);
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rowCount: null, rows: [] };
-    if (state.mode === 'task-action' && sql.includes('FROM action_authorizations authorization')) {
+    if (state.mode.startsWith('task-action') && sql.includes('FROM action_authorizations authorization')) {
       return {
         rowCount: 1,
         rows: [{
@@ -26,7 +27,11 @@ const client = {
           agent_id: '00000000-0000-4000-8000-000000000010',
           workflow_run_id: null,
           pending_tool_call_id: null,
-          execution_manifest: incompatibleManifest,
+          run_mode: state.mode === 'task-action' ? null : 'test',
+          execution_manifest: state.mode === 'task-action' ? incompatibleManifest : null,
+          trace_id: state.mode === 'task-action-missing-trace' ? null : '00000000-0000-4000-8000-000000000050',
+          span_id: state.mode === 'task-action-missing-trace' ? null : '00000000-0000-4000-8000-000000000051',
+          parent_span_id: null,
         }],
       };
     }
@@ -39,6 +44,9 @@ const client = {
           workflow_version_id: '00000000-0000-4000-8000-000000000031',
           definition_snapshot: { nodes: [], edges: [] },
           execution_manifest: incompatibleManifest,
+          trace_id: '00000000-0000-4000-8000-000000000050',
+          span_id: '00000000-0000-4000-8000-000000000051',
+          parent_span_id: null,
         }],
       };
     }
@@ -54,6 +62,9 @@ const client = {
           workflow_run_id: null,
           action_authorization_id: null,
           execution_manifest: incompatibleManifest,
+          trace_id: '00000000-0000-4000-8000-000000000050',
+          span_id: '00000000-0000-4000-8000-000000000051',
+          parent_span_id: null,
         }],
       };
     }
@@ -68,7 +79,10 @@ vi.mock('../src/db/client.js', () => ({
 }));
 vi.mock('../src/lib/audit.js', () => ({ audit: vi.fn(async () => undefined) }));
 vi.mock('../src/queue/task-queue.js', () => ({
-  enqueueTask: vi.fn(async (id: string) => { state.enqueued.push(id); }),
+  enqueueTask: vi.fn(async (id: string) => {
+    state.enqueued.push(id);
+    if (state.queueFailure) throw new Error('queue unavailable');
+  }),
   enqueueWorkflowRun: vi.fn(async (id: string) => { state.enqueued.push(id); }),
 }));
 
@@ -95,6 +109,7 @@ describe('production resume manifest gates', () => {
   beforeEach(() => {
     state.statements = [];
     state.enqueued = [];
+    state.queueFailure = false;
   });
 
   it('rejects a task action decision before consuming authorization or checkpoint state', async () => {
@@ -143,5 +158,43 @@ describe('production resume manifest gates', () => {
     expect(response.json()).toMatchObject({ error: 'RUN_MANIFEST_INCOMPATIBLE' });
     expect(state.statements.filter((sql) => sql.trimStart().startsWith('UPDATE'))).toEqual([]);
     expect(state.enqueued).toEqual([]);
+  });
+
+  it('fails closed on a missing trace before consuming task approval state', async () => {
+    state.mode = 'task-action-missing-trace';
+    const app = await routeApp(actionAuthorizationRoutes);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/00000000-0000-4000-8000-000000000040/decision',
+      payload: { decision: 'approved' },
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(500);
+    expect(state.statements.filter((sql) => sql.trimStart().startsWith('UPDATE'))).toEqual([]);
+    expect(state.enqueued).toEqual([]);
+  });
+
+  it('restores task approval and checkpoint state when enqueue fails', async () => {
+    state.mode = 'task-action-queue-failure';
+    state.queueFailure = true;
+    const app = await routeApp(actionAuthorizationRoutes);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/00000000-0000-4000-8000-000000000040/decision',
+      payload: { decision: 'approved' },
+    });
+    await app.close();
+
+    expect(response.statusCode).toBe(500);
+    expect(state.statements.some((sql) => (
+      sql.includes("UPDATE action_authorizations SET status='awaiting_confirmation'")
+    ))).toBe(true);
+    expect(state.statements.some((sql) => (
+      sql.includes("UPDATE task_runtime_checkpoints SET status='awaiting_confirmation'")
+    ))).toBe(true);
+    expect(state.statements.some((sql) => (
+      sql.includes("UPDATE tasks SET status='awaiting_approval'")
+    ))).toBe(true);
   });
 });

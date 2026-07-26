@@ -10,6 +10,7 @@ import {
 } from '../../runtime/manifest.js';
 import type { WorkflowDefinition } from '../../workflows/definition.js';
 import { serializeRuntimeError } from '../../runtime/errors.js';
+import { authoritativeTraceContext } from '../../runtime/trace.js';
 
 const idParams = z.object({ id: z.string().uuid() });
 const listQuery = z.object({
@@ -69,6 +70,7 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
     const client = await db.connect();
     let taskId = '';
     let workflowRunId: string | null = null;
+    let traceId = '';
     try {
       await client.query('BEGIN');
       const linkedAuthorization = await client.query<{ action_authorization_id: string | null }>(
@@ -99,11 +101,14 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
         execution_manifest: unknown;
         run_execution_manifest: unknown;
         trace_id: string;
+        span_id: string;
+        parent_span_id: string | null;
       }>(
         `SELECT calls.task_id,tasks.agent_id,calls.workflow_run_id,run.run_mode,
                 run.workflow_version_id,run.definition_snapshot,
                 calls.action_authorization_id,tasks.execution_manifest,
-                run.execution_manifest run_execution_manifest,tasks.trace_id
+                run.execution_manifest run_execution_manifest,tasks.trace_id,
+                tasks.span_id,tasks.parent_span_id
          FROM mcp_tool_calls calls JOIN mcp_tool_confirmations confirmation ON confirmation.tool_call_id=calls.id
          JOIN tasks ON tasks.id=calls.task_id
          LEFT JOIN workflow_runs run ON run.id=tasks.workflow_run_id
@@ -118,6 +123,7 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
       }
       taskId = pending.rows[0].task_id;
       workflowRunId = pending.rows[0].workflow_run_id;
+      traceId = authoritativeTraceContext(pending.rows[0]).traceId;
       const actionAuthorizationId = pending.rows[0].action_authorization_id;
       if (pending.rows[0].run_mode !== 'test') {
         const row = pending.rows[0];
@@ -169,11 +175,49 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
-    const traceId = (await query<{ trace_id: string }>(
-      'SELECT trace_id FROM tasks WHERE id=$1 AND workspace_id=$2',
-      [taskId, request.user.workspaceId],
-    )).rows[0]?.trace_id;
-    await enqueueTask(taskId, `${taskId}:${params.id}:${input.decision}`, traceId);
+    try {
+      await enqueueTask(taskId, `${taskId}:${params.id}:${input.decision}`, traceId);
+    } catch (queueError) {
+      const recovery = await db.connect();
+      try {
+        await recovery.query('BEGIN');
+        await recovery.query(
+          `UPDATE mcp_tool_confirmations SET status='pending',
+                  resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+            WHERE tool_call_id=$1 AND status=$2`,
+          [params.id, input.decision],
+        );
+        await recovery.query(
+          `UPDATE mcp_tool_calls SET status='awaiting_confirmation',completed_at=NULL
+            WHERE id=$1 AND status=$2`,
+          [params.id, input.decision === 'approved' ? 'pending' : 'rejected'],
+        );
+        await recovery.query(
+          `UPDATE task_runtime_checkpoints SET status='awaiting_confirmation',updated_at=now()
+            WHERE task_id=$1 AND pending_tool_call_id=$2 AND status=$3`,
+          [taskId, params.id, input.decision],
+        );
+        await recovery.query(
+          `UPDATE action_authorizations SET status='awaiting_confirmation',
+                  resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+            WHERE id=(SELECT action_authorization_id FROM mcp_tool_calls WHERE id=$1)
+              AND status=$2`,
+          [params.id, input.decision],
+        );
+        await recovery.query(
+          `UPDATE tasks SET status='awaiting_approval',updated_at=now()
+            WHERE id=$1 AND workspace_id=$2 AND status='queued'`,
+          [taskId, request.user.workspaceId],
+        );
+        await recovery.query('COMMIT');
+      } catch (recoveryError) {
+        await recovery.query('ROLLBACK');
+        throw recoveryError;
+      } finally {
+        recovery.release();
+      }
+      throw queueError;
+    }
     await audit(request.user.workspaceId, request.user.sub, `mcp.tool_call.${input.decision}`, 'mcp_tool_call', params.id, {
       taskId,
       workflowRunId,

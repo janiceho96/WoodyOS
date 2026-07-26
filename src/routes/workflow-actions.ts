@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { db, query } from '../db/client.js';
+import { db } from '../db/client.js';
 import { audit } from '../lib/audit.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { enqueueWorkflowRun } from '../queue/task-queue.js';
 import { assertWorkflowManifestDependencies } from '../runtime/manifest.js';
 import type { WorkflowDefinition } from '../workflows/definition.js';
 import { serializeRuntimeError } from '../runtime/errors.js';
+import { authoritativeTraceContext } from '../runtime/trace.js';
 
 const paramsSchema = z.object({ id: z.string().uuid() });
 const decisionSchema = z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2_000).optional() });
@@ -18,6 +19,7 @@ export async function workflowActionRoutes(app: FastifyInstance) {
     if (!params || !input) return;
     const client = await db.connect();
     let workflowRunId = '';
+    let traceId = '';
     try {
       await client.query('BEGIN');
       const pending = await client.query<{
@@ -27,9 +29,12 @@ export async function workflowActionRoutes(app: FastifyInstance) {
         definition_snapshot: WorkflowDefinition;
         execution_manifest: unknown;
         trace_id: string;
+        span_id: string;
+        parent_span_id: string | null;
       }>(
         `SELECT authorization.workflow_run_id,run.run_mode,run.workflow_version_id,
-                run.definition_snapshot,run.execution_manifest,run.trace_id
+                run.definition_snapshot,run.execution_manifest,run.trace_id,
+                run.span_id,run.parent_span_id
          FROM action_authorizations authorization
          JOIN workflow_runs run ON run.id=authorization.workflow_run_id
          WHERE authorization.id=$1 AND authorization.workspace_id=$2
@@ -47,6 +52,7 @@ export async function workflowActionRoutes(app: FastifyInstance) {
         return reply.code(409).send({ error: 'WORKFLOW_ACTION_CONFIRMATION_NOT_PENDING' });
       }
       workflowRunId = pending.rows[0].workflow_run_id;
+      traceId = authoritativeTraceContext(pending.rows[0]).traceId;
       if (input.decision === 'approved' && pending.rows[0].run_mode === 'production') {
         await assertWorkflowManifestDependencies({
           workspaceId: request.user.workspaceId,
@@ -87,18 +93,30 @@ export async function workflowActionRoutes(app: FastifyInstance) {
     }
     if (input.decision === 'approved') {
       try {
-        const traceId = (await query<{ trace_id: string }>(
-          'SELECT trace_id FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
-          [workflowRunId, request.user.workspaceId],
-        )).rows[0]?.trace_id;
         await enqueueWorkflowRun(workflowRunId, `${workflowRunId}-action-${params.id}-approved`, 0, traceId);
-      } catch (error) {
-        const serialized = serializeRuntimeError(error);
-        await query(
-          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued'",
-          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), workflowRunId],
-        );
-        throw error;
+      } catch (queueError) {
+        const recovery = await db.connect();
+        try {
+          await recovery.query('BEGIN');
+          await recovery.query(
+            `UPDATE action_authorizations SET status='awaiting_confirmation',
+                    resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+              WHERE id=$1 AND workflow_run_id=$2 AND status='approved'`,
+            [params.id, workflowRunId],
+          );
+          await recovery.query(
+            `UPDATE workflow_runs SET status='awaiting_approval',updated_at=now()
+              WHERE id=$1 AND workspace_id=$2 AND status='queued'`,
+            [workflowRunId, request.user.workspaceId],
+          );
+          await recovery.query('COMMIT');
+        } catch (recoveryError) {
+          await recovery.query('ROLLBACK');
+          throw recoveryError;
+        } finally {
+          recovery.release();
+        }
+        throw queueError;
       }
     }
     await audit(request.user.workspaceId, request.user.sub, `workflow.action.${input.decision}`, 'workflow_run', workflowRunId, { authorizationId: params.id });

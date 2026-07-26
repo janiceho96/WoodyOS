@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
+import { childTraceContext, createTraceContext, type TraceContext } from '../runtime/trace.js';
 
 export const TASK_QUEUE = 'agent-tasks';
 export const WORKFLOW_QUEUE = 'workflow-runs';
@@ -9,11 +10,14 @@ export const ARTIFACT_QUEUE = 'artifact-generation';
 export const FILE_QUEUE = 'file-processing';
 export type TaskJobData = { taskId: string; traceId: string };
 export type WorkflowJobData = { workflowRunId: string; traceId: string };
+export type KnowledgeJobData = { documentId: string; trace: TraceContext };
+export type ArtifactJobData = { artifactId: string; trace: TraceContext };
+export type FileJobData = { fileId: string; trace: TraceContext };
 let queue: Queue<TaskJobData> | undefined;
 let workflowQueue: Queue<WorkflowJobData> | undefined;
-let knowledgeQueue: Queue<{ documentId: string }> | undefined;
-let artifactQueue: Queue<{ artifactId: string }> | undefined;
-let fileQueue: Queue<{ fileId: string }> | undefined;
+let knowledgeQueue: Queue<KnowledgeJobData> | undefined;
+let artifactQueue: Queue<ArtifactJobData> | undefined;
+let fileQueue: Queue<FileJobData> | undefined;
 
 export function queueJobId(phaseId: string) {
   return createHash('sha256').update(phaseId).digest('hex');
@@ -35,6 +39,22 @@ export function workflowJobData(workflowRunId: string, traceId: string): Workflo
   return { workflowRunId, traceId };
 }
 
+export function knowledgeJobData(documentId: string, trace: TraceContext): KnowledgeJobData {
+  return { documentId, trace };
+}
+
+export function artifactJobData(artifactId: string, trace: TraceContext): ArtifactJobData {
+  return { artifactId, trace };
+}
+
+export function fileJobData(fileId: string, trace: TraceContext): FileJobData {
+  return { fileId, trace };
+}
+
+function standaloneOperationTrace(trace?: TraceContext) {
+  return trace ?? childTraceContext(createTraceContext());
+}
+
 export async function enqueueTask(taskId: string, phaseId = taskId, traceId?: string) {
   if (!traceId) throw new Error('TRACE_CONTEXT_REQUIRED');
   await taskQueue().add('execute', taskJobData(taskId, traceId), { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
@@ -49,28 +69,28 @@ export async function enqueueWorkflowRun(workflowRunId: string, phaseId = workfl
   await workflowQueue.add('execute', workflowJobData(workflowRunId, traceId), { jobId: queueJobId(phaseId), delay, removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
 }
 
-export async function enqueueKnowledgeDocument(documentId: string) {
+export async function enqueueKnowledgeDocument(documentId: string, trace?: TraceContext) {
   if (!knowledgeQueue) {
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
-    knowledgeQueue = new Queue<{ documentId: string }>(KNOWLEDGE_QUEUE, { connection });
+    knowledgeQueue = new Queue<KnowledgeJobData>(KNOWLEDGE_QUEUE, { connection });
   }
-  await knowledgeQueue.add('ingest', { documentId }, { jobId: queueJobId(documentId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+  await knowledgeQueue.add('ingest', knowledgeJobData(documentId, standaloneOperationTrace(trace)), { jobId: queueJobId(documentId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
 }
 
-export async function enqueueArtifact(artifactId: string, phaseId = artifactId) {
+export async function enqueueArtifact(artifactId: string, phaseId = artifactId, trace?: TraceContext) {
   if (!artifactQueue) {
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
-    artifactQueue = new Queue<{ artifactId: string }>(ARTIFACT_QUEUE, { connection });
+    artifactQueue = new Queue<ArtifactJobData>(ARTIFACT_QUEUE, { connection });
   }
-  await artifactQueue.add('generate', { artifactId }, { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1500 } });
+  await artifactQueue.add('generate', artifactJobData(artifactId, standaloneOperationTrace(trace)), { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1500 } });
 }
 
-export async function enqueueFile(fileId: string, phaseId = fileId) {
+export async function enqueueFile(fileId: string, phaseId = fileId, trace?: TraceContext) {
   if (!fileQueue) {
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
-    fileQueue = new Queue<{ fileId: string }>(FILE_QUEUE, { connection });
+    fileQueue = new Queue<FileJobData>(FILE_QUEUE, { connection });
   }
-  await fileQueue.add('process', { fileId }, {
+  await fileQueue.add('process', fileJobData(fileId, standaloneOperationTrace(trace)), {
     jobId: queueJobId(phaseId),
     removeOnComplete: 1000,
     removeOnFail: 1000,

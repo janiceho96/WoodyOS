@@ -54,3 +54,31 @@ export function authoritativeTraceContext(
     parentSpanId: row.parent_span_id ?? null,
   };
 }
+
+export function authoritativeQueuedTraceContext(
+  row: {
+    trace_id?: string | null;
+    span_id?: string | null;
+    parent_span_id?: string | null;
+    created_at?: string | Date | null;
+  },
+  queuedTraceId: string | null | undefined,
+  runtimeTrustMigrationAppliedAt: string | Date | null | undefined,
+): TraceContext {
+  const context = authoritativeTraceContext(row, queuedTraceId);
+  if (queuedTraceId) return context;
+  const createdAt = row.created_at instanceof Date ? row.created_at : new Date(row.created_at ?? '');
+  const migrationAt = runtimeTrustMigrationAppliedAt instanceof Date
+    ? runtimeTrustMigrationAppliedAt
+    : new Date(runtimeTrustMigrationAppliedAt ?? '');
+  if (!Number.isFinite(createdAt.getTime())
+    || !Number.isFinite(migrationAt.getTime())
+    || createdAt.getTime() >= migrationAt.getTime()) {
+    throw runtimeError('TRACE_CONTEXT_REQUIRED', {
+      category: 'infrastructure',
+      retryable: false,
+      message: 'Queued trace identity is required for this runtime record',
+    });
+  }
+  return context;
+}

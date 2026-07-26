@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  artifactJobData,
+  fileJobData,
+  knowledgeJobData,
   queueJobId,
   taskJobData,
   workflowJobData,
@@ -24,5 +27,17 @@ describe('queue job identifiers', () => {
       workflowRunId: '00000000-0000-4000-8000-000000000003',
       traceId,
     });
+  });
+
+  it('preserves operation child spans across knowledge, file, and artifact queues', () => {
+    const trace = {
+      traceId: '00000000-0000-4000-8000-000000000001',
+      spanId: '00000000-0000-4000-8000-000000000002',
+      parentSpanId: '00000000-0000-4000-8000-000000000003',
+    };
+
+    expect(knowledgeJobData('document-id', trace)).toEqual({ documentId: 'document-id', trace });
+    expect(fileJobData('file-id', trace)).toEqual({ fileId: 'file-id', trace });
+    expect(artifactJobData('artifact-id', trace)).toEqual({ artifactId: 'artifact-id', trace });
   });
 });

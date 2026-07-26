@@ -4,11 +4,40 @@ import { enqueueArtifact } from '../queue/task-queue.js';
 import { artifactStorage } from './storage.js';
 import { artifactFormatInfo, artifactTitle, outputText, type ArtifactFormat, type ArtifactRecord } from './types.js';
 import type { PresentationTheme } from '../presentations/theme.js';
+import {
+  authoritativeTraceContext,
+  childTraceContext,
+  createTraceContext,
+  type TraceContext,
+} from '../runtime/trace.js';
 
 type ArtifactSource = { title: string; output: unknown; created_by: string | null; status: string };
 
 async function enqueuePreparedArtifacts(records: ArtifactRecord[]) {
-  const results = await Promise.allSettled(records.map((artifact) => enqueueArtifact(artifact.id, `${artifact.id}:${Date.now()}`)));
+  const results = await Promise.allSettled(records.map(async (artifact) => {
+    const source = (await query<{
+      trace_id: string | null;
+      span_id: string | null;
+      parent_span_id: string | null;
+    }>(
+      `SELECT COALESCE(task.trace_id,run.trace_id) trace_id,
+              COALESCE(task.span_id,run.span_id) span_id,
+              COALESCE(task.parent_span_id,run.parent_span_id) parent_span_id
+         FROM artifacts artifact
+         LEFT JOIN tasks task ON task.id=artifact.task_id
+         LEFT JOIN workflow_runs run ON run.id=artifact.workflow_run_id
+        WHERE artifact.id=$1`,
+      [artifact.id],
+    )).rows[0];
+    const parent = source?.trace_id && source.span_id
+      ? authoritativeTraceContext(source)
+      : createTraceContext();
+    await enqueueArtifact(
+      artifact.id,
+      `${artifact.id}:${Date.now()}`,
+      childTraceContext(parent),
+    );
+  }));
   const failures = results.flatMap((result, index) => result.status === 'rejected' ? [{ artifact: records[index], error: result.reason }] : []);
   await Promise.all(failures.map(({ artifact, error }) => query(
     "UPDATE artifacts SET status='failed',error_message=$1,updated_at=now() WHERE id=$2 AND status='queued'",
@@ -52,7 +81,7 @@ function generatorUrl() {
   return `${(process.env.EXTRACTOR_URL ?? 'http://localhost:8000').replace(/\/$/, '')}/generate`;
 }
 
-export async function generateArtifact(artifactId: string) {
+export async function generateArtifact(artifactId: string, _trace?: TraceContext) {
   const artifact = (await query<ArtifactRecord>(
     `UPDATE artifacts SET status='generating',error_message=NULL,updated_at=now()
       WHERE id=$1 AND status IN ('queued','generating','failed') RETURNING *`,

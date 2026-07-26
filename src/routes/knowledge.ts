@@ -5,6 +5,7 @@ import { asyncRoute, parse } from '../lib/http.js';
 import { enqueueKnowledgeDocument } from '../queue/task-queue.js';
 import { embeddingFor } from '../lib/embeddings.js';
 import { ensureKnowledgeDocument, ingestUploadedFile } from '../files/service.js';
+import { childTraceContext, createTraceContext } from '../runtime/trace.js';
 
 const inputSchema = z.object({ name: z.string().min(1).max(260), sourceType: z.enum(['pdf', 'docx', 'pptx', 'csv', 'url', 'image', 'database', 'text', 'html']), sourceUri: z.string().max(2048).nullable().optional(), content: z.string().min(1).max(2_000_000).optional(), metadata: z.record(z.unknown()).default({}) }).refine((input) => Boolean(input.content || input.sourceUri), 'content or sourceUri is required');
 const searchInput = z.object({ query: z.string().min(2).max(1000), limit: z.number().int().min(1).max(20).default(8) });
@@ -20,7 +21,7 @@ export async function knowledgeRoutes(app: FastifyInstance) {
   app.post('/documents', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(inputSchema, request.body, reply); if (!input) return;
     const result = await query('INSERT INTO knowledge_documents(workspace_id,name,source_type,source_uri,content,metadata,created_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,source_type,status,created_at', [request.user.workspaceId, input.name, input.sourceType, input.sourceUri ?? null, input.content ?? null, JSON.stringify(input.metadata), request.user.sub]);
-    await enqueueKnowledgeDocument(result.rows[0].id);
+    await enqueueKnowledgeDocument(result.rows[0].id, childTraceContext(createTraceContext()));
     return reply.code(202).send(result.rows[0]);
   }));
   app.post('/documents/upload', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {

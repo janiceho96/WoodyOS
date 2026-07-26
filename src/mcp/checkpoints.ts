@@ -4,6 +4,7 @@ import { decryptJsonWithContext, encryptJsonWithContext, type EncryptedPayload }
 import type { AuthorizedMcpTool } from './runtime.js';
 import { argumentHash, safeArgumentsSummary } from './runtime.js';
 import type { TraceContext } from '../runtime/trace.js';
+import { redactRuntimeMessage, redactRuntimeValue } from '../runtime/errors.js';
 
 export type TaskActionCheckpointState = {
   provider: 'anthropic' | 'openai-compatible';
@@ -35,6 +36,23 @@ function targetSummary(arguments_: Record<string, unknown>) {
   return Object.entries(safe).slice(0, 5).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join(', ').slice(0, 1_000) || null;
 }
 
+export function sanitizeTaskActionCheckpointState(
+  state: TaskActionCheckpointState,
+): TaskActionCheckpointState {
+  return {
+    ...state,
+    system: redactRuntimeMessage(state.system),
+    messages: redactRuntimeValue(state.messages) as unknown[],
+    finalText: redactRuntimeMessage(state.finalText),
+    pending: {
+      ...state.pending,
+      // Pending arguments are encrypted execution input and must remain exact.
+      arguments: state.pending.arguments,
+      authorizationId: state.pending.authorizationId,
+    },
+  };
+}
+
 export async function pauseForActionConfirmation(input: {
   workspaceId: string;
   taskId: string;
@@ -46,7 +64,11 @@ export async function pauseForActionConfirmation(input: {
   mcpTool?: AuthorizedMcpTool;
   trace: TraceContext;
 }) {
-  const encrypted = encryptJsonWithContext(input.state as unknown as Record<string, unknown>, checkpointContext(input.workspaceId, input.taskId));
+  const sanitizedState = sanitizeTaskActionCheckpointState(input.state);
+  const encrypted = encryptJsonWithContext(
+    sanitizedState as unknown as Record<string, unknown>,
+    checkpointContext(input.workspaceId, input.taskId),
+  );
   const client = await db.connect();
   try {
     await client.query('BEGIN');

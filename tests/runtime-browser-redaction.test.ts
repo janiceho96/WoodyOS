@@ -16,7 +16,7 @@ vi.mock('../src/db/client.js', () => ({
         rows: [{
           id: ids.task,
           workspace_id: ids.workspace,
-          error: { message: 'Provider failed with password=hunter2' },
+          error: { message: 'Provider failed with {"apiKey":"hunter2","retryAfterMs":2000}' },
           agent_name: 'Agent',
           agent_role: 'Researcher',
           agent_avatar: {},
@@ -28,7 +28,7 @@ vi.mock('../src/db/client.js', () => ({
         rowCount: 1,
         rows: [{
           event_type: 'task.failed',
-          message: 'Request token=event-secret',
+          message: 'Request failed with {"apiKey":"event-secret"}',
           payload: { apiKey: 'payload-secret', retryAfterMs: 100 },
         }],
       };
@@ -38,7 +38,7 @@ vi.mock('../src/db/client.js', () => ({
         rowCount: 1,
         rows: [{
           id: '00000000-0000-4000-8000-000000000004',
-          error_message: 'authorization=auth-secret',
+          error_message: 'Provider failed with {"authorization":"auth-secret"}',
           runtime_error: null,
         }],
       };

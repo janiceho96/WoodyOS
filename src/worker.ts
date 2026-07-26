@@ -12,6 +12,9 @@ import {
   KNOWLEDGE_QUEUE,
   FILE_QUEUE,
   enqueueWorkflowRun,
+  type ArtifactJobData,
+  type FileJobData,
+  type KnowledgeJobData,
   type TaskJobData,
   type WorkflowJobData,
 } from './queue/task-queue.js';
@@ -50,6 +53,7 @@ import type { AgentVersionSnapshot } from './agents/versions.js';
 import type { WorkflowDefinition } from './workflows/definition.js';
 import { redactRuntimeMessage, redactRuntimeValue, serializeRuntimeError } from './runtime/errors.js';
 import {
+  authoritativeQueuedTraceContext,
   authoritativeTraceContext,
   childTraceContext,
   type TraceContext,
@@ -81,6 +85,7 @@ type Task = {
   trace_id: string;
   span_id: string;
   parent_span_id: string | null;
+  created_at: string;
 };
 function openAiToolDefinitions(tools: ToolRecord[]): ChatCompletionTool[] {
   return tools.map((tool) => {
@@ -281,14 +286,21 @@ async function runtimeAgentForTask(task: Task): Promise<{ agent: Agent; exactMan
 }
 
 export async function executeAgentTask(taskId: string, queuedTraceId?: string) {
-  if (queuedTraceId) {
-    const queuedTask = (await query<Pick<Task, 'trace_id' | 'span_id' | 'parent_span_id'>>(
-      "SELECT trace_id,span_id,parent_span_id FROM tasks WHERE id=$1 AND status='queued'",
-      [taskId],
-    )).rows[0];
-    if (!queuedTask) return null;
-    authoritativeTraceContext(queuedTask, queuedTraceId);
-  }
+  const queuedTask = (await query<Pick<Task, 'trace_id' | 'span_id' | 'parent_span_id' | 'created_at'> & {
+    runtime_trust_migration_applied_at: string | null;
+  }>(
+    `SELECT trace_id,span_id,parent_span_id,created_at,
+            (SELECT applied_at FROM schema_migrations WHERE name='031_runtime_trust.sql')
+              runtime_trust_migration_applied_at
+       FROM tasks WHERE id=$1 AND status='queued'`,
+    [taskId],
+  )).rows[0];
+  if (!queuedTask) return null;
+  authoritativeQueuedTraceContext(
+    queuedTask,
+    queuedTraceId,
+    queuedTask.runtime_trust_migration_applied_at,
+  );
   const task = (await query<Task>(
     `UPDATE tasks SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
      WHERE id=$1 AND status='queued' RETURNING *`,
@@ -332,7 +344,9 @@ export async function executeAgentTask(taskId: string, queuedTraceId?: string) {
     let toolCallCount = checkpoint?.state.toolCallCount ?? 0;
     const requestText = `${task.title}\n${JSON.stringify(task.input)}`;
     const [knowledge, attachments, requestedArtifacts] = await Promise.all([
-      runtimePolicy.knowledgeEnabled ? retrieveAgentKnowledge(task.workspace_id, requestText) : Promise.resolve(''),
+      runtimePolicy.knowledgeEnabled
+        ? retrieveAgentKnowledge(task.workspace_id, requestText, 4, childTraceContext(taskTrace))
+        : Promise.resolve(''),
       retrieveTaskAttachmentContext(task.id, requestText),
       query<{ format: string }>('SELECT format FROM artifacts WHERE task_id=$1 OR ($2::uuid IS NOT NULL AND workflow_run_id=$2) ORDER BY format', [task.id, task.workflow_run_id]),
     ]);
@@ -462,9 +476,18 @@ export async function executeAgentTask(taskId: string, queuedTraceId?: string) {
             await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
-            const message = error instanceof Error ? error.message : 'Action failed';
-            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, { adapter: action.adapter, toolId: action.tool.id, error: message });
-            results.push({ type: 'tool_result', tool_use_id: use.id, is_error: true, content: message });
+            const serialized = serializeRuntimeError(error);
+            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, {
+              adapter: action.adapter,
+              toolId: action.tool.id,
+              error: serialized,
+            });
+            results.push({
+              type: 'tool_result',
+              tool_use_id: use.id,
+              is_error: true,
+              content: serialized.message,
+            });
           }
         }
         messages.push({ role: 'user', content: results });
@@ -585,9 +608,13 @@ export async function executeAgentTask(taskId: string, queuedTraceId?: string) {
             await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
-            const detail = error instanceof Error ? error.message : 'Action failed';
-            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, { adapter: action.adapter, toolId: action.tool.id, error: detail });
-            results.push({ role: 'tool', tool_call_id: use.id, content: detail });
+            const serialized = serializeRuntimeError(error);
+            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, {
+              adapter: action.adapter,
+              toolId: action.tool.id,
+              error: serialized,
+            });
+            results.push({ role: 'tool', tool_call_id: use.id, content: serialized.message });
           }
         }
         messages.push(...results);
@@ -632,15 +659,15 @@ export async function executeAgentTask(taskId: string, queuedTraceId?: string) {
 
 new Worker<TaskJobData>(TASK_QUEUE, (job) => executeAgentTask(job.data.taskId, job.data.traceId), { connection, concurrency: 5 });
 
-new Worker<{ artifactId: string }>(ARTIFACT_QUEUE, async (job) => {
-  await generateArtifact(job.data.artifactId);
+new Worker<ArtifactJobData>(ARTIFACT_QUEUE, async (job) => {
+  await generateArtifact(job.data.artifactId, job.data.trace);
 }, { connection, concurrency: 2 });
 
-new Worker<{ fileId: string }>(FILE_QUEUE, async (job) => {
-  await processFile(job.data.fileId);
+new Worker<FileJobData>(FILE_QUEUE, async (job) => {
+  await processFile(job.data.fileId, job.data.trace);
 }, { connection, concurrency: 2 });
 
-new Worker<{ documentId: string }>(KNOWLEDGE_QUEUE, async (job) => {
+new Worker<KnowledgeJobData>(KNOWLEDGE_QUEUE, async (job) => {
   const document = (await query<{ id: string; workspace_id: string; source_type: string; source_uri: string | null; content: string | null }>("SELECT id,workspace_id,source_type,source_uri,content FROM knowledge_documents WHERE id=$1 AND status='queued'", [job.data.documentId])).rows[0];
   if (!document) return;
   await query("UPDATE knowledge_documents SET status='processing',updated_at=now() WHERE id=$1", [document.id]);
@@ -679,13 +706,23 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     trace_id: string;
     span_id: string;
     parent_span_id: string | null;
+    created_at: string;
+    runtime_trust_migration_applied_at: string | null;
   }>(
     `SELECT workspace_id,workflow_version_id,definition_snapshot,run_mode,execution_manifest,
-            trace_id,span_id,parent_span_id
-       FROM workflow_runs WHERE id=$1`,
+            trace_id,span_id,parent_span_id,created_at,
+            (SELECT applied_at FROM schema_migrations WHERE name='031_runtime_trust.sql')
+              runtime_trust_migration_applied_at
+       FROM workflow_runs WHERE id=$1 AND status='queued'`,
     [job.data.workflowRunId],
   )).rows[0];
-  if (run) authoritativeTraceContext(run, job.data.traceId);
+  if (run) {
+    authoritativeQueuedTraceContext(
+      run,
+      job.data.traceId,
+      run.runtime_trust_migration_applied_at,
+    );
+  }
   if (run?.run_mode === 'production') {
     try {
       await assertWorkflowRunManifestDependencies(run);

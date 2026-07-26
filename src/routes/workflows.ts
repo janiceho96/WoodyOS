@@ -16,7 +16,7 @@ import {
   validateManifestCompatibility,
   type ExecutionManifest,
 } from '../runtime/manifest.js';
-import { createTraceContext } from '../runtime/trace.js';
+import { authoritativeTraceContext, createTraceContext } from '../runtime/trace.js';
 import {
   redactRuntimeMessage,
   redactRuntimeValue,
@@ -528,18 +528,32 @@ export async function workflowRoutes(app: FastifyInstance) {
   app.post('/runs/:runId/approvals/:approvalId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;
     const params = request.params as { runId: string; approvalId: string };
+    const run = (await query<{
+      run_mode: 'test' | 'production';
+      execution_manifest: ExecutionManifest | null;
+      trace_id: string;
+      span_id: string;
+      parent_span_id: string | null;
+    }>(
+      `SELECT run_mode,execution_manifest,trace_id,span_id,parent_span_id
+         FROM workflow_runs WHERE id=$1 AND workspace_id=$2`,
+      [params.runId, request.user.workspaceId],
+    )).rows[0];
+    if (!run) {
+      return reply.code(409).send({
+        error: 'RUN_MANIFEST_INCOMPATIBLE',
+        details: { reasons: ['Execution run is missing'] },
+      });
+    }
+    const traceId = authoritativeTraceContext(run).traceId;
     if (input.decision === 'approved') {
-      const run = (await query<{ run_mode: 'test' | 'production'; execution_manifest: ExecutionManifest | null; trace_id: string }>(
-        'SELECT run_mode,execution_manifest,trace_id FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
-        [params.runId, request.user.workspaceId],
-      )).rows[0];
       const compatibility = run?.run_mode === 'production'
         ? validateManifestCompatibility(run.execution_manifest)
         : { ok: true, reasons: [] };
-      if (!run || !compatibility.ok) {
+      if (!compatibility.ok) {
         return reply.code(409).send({
           error: 'RUN_MANIFEST_INCOMPATIBLE',
-          details: { reasons: run ? compatibility.reasons : ['Execution run is missing'] },
+          details: { reasons: compatibility.reasons },
         });
       }
     }
@@ -552,10 +566,6 @@ export async function workflowRoutes(app: FastifyInstance) {
     else {
       await query("UPDATE workflow_runs SET status='queued',updated_at=now() WHERE id=$1", [params.runId]);
       try {
-        const traceId = (await query<{ trace_id: string }>(
-          'SELECT trace_id FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
-          [params.runId, request.user.workspaceId],
-        )).rows[0]?.trace_id;
         await enqueueWorkflowRun(params.runId, `${params.runId}-${params.approvalId}`, 0, traceId);
       } catch (queueError) {
         await query("UPDATE workflow_approvals SET status='pending',resolved_at=NULL,resolved_by=NULL,comment=NULL WHERE id=$1", [params.approvalId]);

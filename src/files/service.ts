@@ -3,6 +3,11 @@ import { db, query } from '../db/client.js';
 import { enqueueFile, enqueueKnowledgeDocument } from '../queue/task-queue.js';
 import { privateFileStorage } from './storage.js';
 import { defaultRetention, inspectUpload, type FileRecord, type FileScope, type RetentionPolicy } from './types.js';
+import {
+  childTraceContext,
+  createTraceContext,
+  type TraceContext,
+} from '../runtime/trace.js';
 
 type UploadLike = {
   filename: string;
@@ -134,9 +139,9 @@ export async function ingestFileBuffer(input: {
     [input.workspaceId, file.id],
   );
   if (process.env.NODE_ENV === 'test' && process.env.RUN_INTEGRATION === 'true') {
-    await processFile(file.id);
+    await processFile(file.id, childTraceContext(createTraceContext()));
   } else try {
-    await enqueueFile(file.id);
+    await enqueueFile(file.id, file.id, childTraceContext(createTraceContext()));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'File processing queue unavailable';
     await query("UPDATE files SET status='failed',error_message=$1,updated_at=now() WHERE id=$2", [message.slice(0, 2_000), file.id]);
@@ -211,7 +216,10 @@ function extractedChunks(extracted: ExtractedPayload) {
   return chunks;
 }
 
-export async function processFile(fileId: string) {
+export async function processFile(
+  fileId: string,
+  trace: TraceContext = childTraceContext(createTraceContext()),
+) {
   const file = (await query<FileRecord>(
     `UPDATE files SET status='scanning',error_message=NULL,updated_at=now()
       WHERE id=$1 AND status IN ('scanning','extracting','failed') RETURNING *`,
@@ -269,7 +277,9 @@ export async function processFile(fileId: string) {
       `SELECT id FROM knowledge_documents WHERE file_id=$1 AND status='queued'`,
       [file.id],
     );
-    await Promise.all(waitingKnowledge.rows.map((row) => enqueueKnowledgeDocument(row.id)));
+    await Promise.all(waitingKnowledge.rows.map((row) => (
+      enqueueKnowledgeDocument(row.id, childTraceContext(trace))
+    )));
     return (await query<FileRecord>('SELECT * FROM files WHERE id=$1', [file.id])).rows[0];
   } catch (error) {
     const message = (error instanceof Error ? error.message : 'File processing failed').slice(0, 2_000);
@@ -288,6 +298,7 @@ export async function ensureKnowledgeDocument(input: {
   workspaceId: string;
   userId: string;
   fileId: string;
+  trace?: TraceContext;
 }) {
   const file = (await query<FileRecord>('SELECT * FROM files WHERE id=$1 AND workspace_id=$2', [input.fileId, input.workspaceId])).rows[0];
   if (!file) throw Object.assign(new Error('FILE_NOT_FOUND'), { statusCode: 404 });
@@ -309,7 +320,12 @@ export async function ensureKnowledgeDocument(input: {
     ],
   )).rows[0];
   await query("UPDATE files SET scope='knowledge',retention_policy='keep',expires_at=NULL,updated_at=now() WHERE id=$1", [file.id]);
-  if (status === 'queued') await enqueueKnowledgeDocument(document.id);
+  if (status === 'queued') {
+    await enqueueKnowledgeDocument(
+      document.id,
+      childTraceContext(input.trace ?? createTraceContext()),
+    );
+  }
   return document;
 }
 

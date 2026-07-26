@@ -8,6 +8,7 @@ import {
   assertTaskManifestDependencies,
   assertWorkflowManifestDependencies,
 } from '../runtime/manifest.js';
+import { authoritativeTraceContext } from '../runtime/trace.js';
 import type { WorkflowDefinition } from '../workflows/definition.js';
 
 const paramsSchema = z.object({ id: z.string().uuid() });
@@ -36,11 +37,14 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
         execution_manifest: unknown;
         run_execution_manifest: unknown;
         trace_id: string;
+        span_id: string;
+        parent_span_id: string | null;
       }>(
         `SELECT authorization.task_id,tasks.agent_id,tasks.workflow_run_id,run.run_mode,
                 run.workflow_version_id,run.definition_snapshot,
                 checkpoint.pending_tool_call_id,tasks.execution_manifest,
-                run.execution_manifest run_execution_manifest,tasks.trace_id
+                run.execution_manifest run_execution_manifest,tasks.trace_id,
+                tasks.span_id,tasks.parent_span_id
          FROM action_authorizations authorization
          JOIN task_runtime_checkpoints checkpoint ON checkpoint.pending_action_authorization_id=authorization.id
          JOIN tasks ON tasks.id=authorization.task_id
@@ -63,7 +67,7 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
       taskId = pending.rows[0].task_id;
       workflowRunId = pending.rows[0].workflow_run_id;
       toolCallId = pending.rows[0].pending_tool_call_id;
-      traceId = pending.rows[0].trace_id;
+      traceId = authoritativeTraceContext(pending.rows[0]).traceId;
       if (pending.rows[0].run_mode !== 'test') {
         const row = pending.rows[0];
         if (row.workflow_run_id && row.workflow_version_id && row.definition_snapshot) {
@@ -114,7 +118,50 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
-    await enqueueTask(taskId, `${taskId}:action:${params.id}:${input.decision}`, traceId);
+    try {
+      await enqueueTask(taskId, `${taskId}:action:${params.id}:${input.decision}`, traceId);
+    } catch (queueError) {
+      const recovery = await db.connect();
+      try {
+        await recovery.query('BEGIN');
+        await recovery.query(
+          `UPDATE action_authorizations SET status='awaiting_confirmation',
+                  resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+            WHERE id=$1 AND task_id=$2 AND status=$3`,
+          [params.id, taskId, input.decision],
+        );
+        await recovery.query(
+          `UPDATE task_runtime_checkpoints SET status='awaiting_confirmation',updated_at=now()
+            WHERE task_id=$1 AND pending_action_authorization_id=$2 AND status=$3`,
+          [taskId, params.id, input.decision],
+        );
+        if (toolCallId) {
+          await recovery.query(
+            `UPDATE mcp_tool_confirmations SET status='pending',
+                    resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+              WHERE tool_call_id=$1 AND status=$2`,
+            [toolCallId, input.decision],
+          );
+          await recovery.query(
+            `UPDATE mcp_tool_calls SET status='awaiting_confirmation',completed_at=NULL
+              WHERE id=$1 AND status=$2`,
+            [toolCallId, input.decision === 'approved' ? 'pending' : 'rejected'],
+          );
+        }
+        await recovery.query(
+          `UPDATE tasks SET status='awaiting_approval',updated_at=now()
+            WHERE id=$1 AND workspace_id=$2 AND status='queued'`,
+          [taskId, request.user.workspaceId],
+        );
+        await recovery.query('COMMIT');
+      } catch (recoveryError) {
+        await recovery.query('ROLLBACK');
+        throw recoveryError;
+      } finally {
+        recovery.release();
+      }
+      throw queueError;
+    }
     await audit(request.user.workspaceId, request.user.sub, `agent.action.${input.decision}`, 'task', taskId, {
       authorizationId: params.id,
       workflowRunId,
