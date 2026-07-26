@@ -12,6 +12,7 @@ import {
   type RemoveMembershipInput,
   type SetExecutiveAgentInput,
   type SetMembershipInput,
+  type SetMembershipWithManagerInput,
   type UpdateDepartmentInput,
 } from './types.js';
 
@@ -450,53 +451,13 @@ export async function setMembership(
   input: SetMembershipInput,
 ): Promise<DepartmentMutationResult> {
   return mutateOrganization(input, async ({ client, workspaceId }) => {
-    await activeDepartmentForUpdate(client, workspaceId, input.departmentId);
-    await agentForUpdate(client, workspaceId, input.agentId);
-
-    if (input.membershipType === 'primary') {
-      await client.query(
-        `UPDATE departments
-            SET manager_agent_id=NULL,updated_at=now()
-          WHERE workspace_id=$1
-            AND manager_agent_id=$2
-            AND id<>$3
-            AND status='active'`,
-        [workspaceId, input.agentId, input.departmentId],
-      );
-      await client.query(
-        `DELETE FROM department_memberships
-          WHERE workspace_id=$1
-            AND agent_id=$2
-            AND membership_type='primary'
-            AND department_id<>$3`,
-        [workspaceId, input.agentId, input.departmentId],
-      );
-    } else {
-      await client.query(
-        `UPDATE departments
-            SET manager_agent_id=NULL,updated_at=now()
-          WHERE id=$1
-            AND workspace_id=$2
-            AND manager_agent_id=$3`,
-        [input.departmentId, workspaceId, input.agentId],
-      );
-    }
-
-    await client.query(
-      `INSERT INTO department_memberships(
-         department_id,workspace_id,agent_id,membership_type
-       ) VALUES($1,$2,$3,$4)
-       ON CONFLICT(department_id,agent_id) DO UPDATE
-         SET membership_type=excluded.membership_type,
-             updated_at=now()
-       WHERE department_memberships.workspace_id=excluded.workspace_id`,
-      [
-        input.departmentId,
-        workspaceId,
-        input.agentId,
-        input.membershipType,
-      ],
-    );
+    await setMembershipWithClient({
+      client,
+      workspaceId,
+      departmentId: input.departmentId,
+      agentId: input.agentId,
+      membershipType: input.membershipType,
+    });
     return {
       action: 'department.membership_set',
       entityType: 'department_membership',
@@ -504,6 +465,110 @@ export async function setMembership(
       metadata: {
         agentId: input.agentId,
         membershipType: input.membershipType,
+      },
+    };
+  });
+}
+
+async function setMembershipWithClient(input: {
+  client: PoolClient;
+  workspaceId: string;
+  departmentId: string;
+  agentId: string;
+  membershipType: MembershipType;
+}) {
+  const {
+    client,
+    workspaceId,
+    departmentId,
+    agentId,
+    membershipType,
+  } = input;
+  await activeDepartmentForUpdate(client, workspaceId, departmentId);
+  await agentForUpdate(client, workspaceId, agentId);
+
+  if (membershipType === 'primary') {
+    await client.query(
+      `UPDATE departments
+          SET manager_agent_id=NULL,updated_at=now()
+        WHERE workspace_id=$1
+          AND manager_agent_id=$2
+          AND id<>$3
+          AND status='active'`,
+      [workspaceId, agentId, departmentId],
+    );
+    await client.query(
+      `DELETE FROM department_memberships
+        WHERE workspace_id=$1
+          AND agent_id=$2
+          AND membership_type='primary'
+          AND department_id<>$3`,
+      [workspaceId, agentId, departmentId],
+    );
+  } else {
+    await client.query(
+      `UPDATE departments
+          SET manager_agent_id=NULL,updated_at=now()
+        WHERE id=$1
+          AND workspace_id=$2
+          AND manager_agent_id=$3`,
+      [departmentId, workspaceId, agentId],
+    );
+  }
+
+  await client.query(
+    `INSERT INTO department_memberships(
+       department_id,workspace_id,agent_id,membership_type
+     ) VALUES($1,$2,$3,$4)
+     ON CONFLICT(department_id,agent_id) DO UPDATE
+       SET membership_type=excluded.membership_type,
+           updated_at=now()
+     WHERE department_memberships.workspace_id=excluded.workspace_id`,
+    [departmentId, workspaceId, agentId, membershipType],
+  );
+}
+
+export async function setMembershipWithManager(
+  input: SetMembershipWithManagerInput,
+): Promise<DepartmentMutationResult> {
+  return mutateOrganization(input, async ({ client, workspaceId }) => {
+    await activeDepartmentForUpdate(
+      client,
+      workspaceId,
+      input.departmentId,
+    );
+    if (input.managerAgentId) {
+      await ensureManagerPrimary({
+        client,
+        workspaceId,
+        departmentId: input.departmentId,
+        managerAgentId: input.managerAgentId,
+        confirmPrimaryMove: input.confirmPrimaryMove,
+      });
+      await client.query(
+        `UPDATE departments
+            SET manager_agent_id=$1,updated_at=now()
+          WHERE id=$2 AND workspace_id=$3`,
+        [input.managerAgentId, input.departmentId, workspaceId],
+      );
+    }
+    await setMembershipWithClient({
+      client,
+      workspaceId,
+      departmentId: input.departmentId,
+      agentId: input.agentId,
+      membershipType: input.membershipType,
+    });
+    return {
+      action: 'department.membership_set',
+      entityType: 'department_membership',
+      entityId: input.departmentId,
+      metadata: {
+        agentId: input.agentId,
+        membershipType: input.membershipType,
+        ...(input.managerAgentId
+          ? { managerAgentId: input.managerAgentId }
+          : {}),
       },
     };
   });

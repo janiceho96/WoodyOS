@@ -120,18 +120,71 @@ async function installWithClient(client: PoolClient, input: InstallInput) {
     agentIds.set(agent.key, created.rows[0].id);
   }
 
-  const team = await client.query<{ id: string }>(
-    'INSERT INTO agent_teams(workspace_id,name,description) VALUES($1,$2,$3) RETURNING id',
-    [input.workspaceId, solution.team.name, solution.team.description],
+  await client.query(
+    `INSERT INTO workspace_org_settings(workspace_id)
+     VALUES($1)
+     ON CONFLICT(workspace_id) DO NOTHING`,
+    [input.workspaceId],
   );
-  const managerId = solution.team.managerAgentKey ? agentIds.get(solution.team.managerAgentKey) ?? null : null;
+  const settings = (await client.query<{ revision: number }>(
+    `SELECT revision
+       FROM workspace_org_settings
+      WHERE workspace_id=$1
+      FOR UPDATE`,
+    [input.workspaceId],
+  )).rows[0];
+  if (!settings) {
+    throw Object.assign(new Error('DEPARTMENT_REVISION_CONFLICT'), {
+      statusCode: 409,
+    });
+  }
+  const sameName = await client.query(
+    `SELECT 1
+       FROM departments
+      WHERE workspace_id=$1 AND status='active' AND lower(name)=lower($2)
+      LIMIT 1`,
+    [input.workspaceId, solution.team.name],
+  );
+  const departmentName = sameName.rowCount
+    ? `${solution.team.name.slice(0, 81)} (${installationId})`
+    : solution.team.name;
+  const department = await client.query<{ id: string }>(
+    `INSERT INTO departments(workspace_id,name,description)
+     VALUES($1,$2,$3)
+     RETURNING id`,
+    [input.workspaceId, departmentName, solution.team.description],
+  );
   for (const agent of solution.agents) {
     const agentId = agentIds.get(agent.key)!;
     await client.query(
-      'INSERT INTO team_memberships(team_id,agent_id,manager_agent_id) VALUES($1,$2,$3)',
-      [team.rows[0].id, agentId, agentId === managerId ? null : managerId],
+      `INSERT INTO department_memberships(
+         department_id,workspace_id,agent_id,membership_type
+       ) VALUES($1,$2,$3,'primary')`,
+      [department.rows[0].id, input.workspaceId, agentId],
     );
   }
+  const nextRevision = (await client.query<{ revision: number }>(
+    `UPDATE workspace_org_settings
+        SET revision=revision+1,updated_at=now()
+      WHERE workspace_id=$1
+      RETURNING revision`,
+    [input.workspaceId],
+  )).rows[0].revision;
+  await client.query(
+    `INSERT INTO audit_events(
+       workspace_id,actor_id,action,entity_type,entity_id,metadata
+     ) VALUES($1,$2,'department.created','department',$3,$4)`,
+    [
+      input.workspaceId,
+      input.userId,
+      department.rows[0].id,
+      {
+        revision: nextRevision,
+        installationId,
+        source: 'agent_solution',
+      },
+    ],
+  );
 
   const definition = materializeWorkflowDefinition(solution, agentIds);
   const workflow = await client.query<{ id: string }>(
@@ -141,7 +194,8 @@ async function installWithClient(client: PoolClient, input: InstallInput) {
   );
   const resources = {
     agentIds: Object.fromEntries(agentIds),
-    teamId: team.rows[0].id,
+    departmentId: department.rows[0].id,
+    teamId: department.rows[0].id,
     workflowId: workflow.rows[0].id,
   };
   await client.query(

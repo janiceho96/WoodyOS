@@ -18,6 +18,7 @@ import { knowledgeRoutes } from './routes/knowledge.js';
 import { analyticsRoutes } from './routes/analytics.js';
 import { auditRoutes } from './routes/audit.js';
 import { teamRoutes } from './routes/teams.js';
+import { departmentRoutes } from './routes/departments.js';
 import { promptRoutes } from './routes/prompts.js';
 import { runtimeRoutes } from './routes/runtime.js';
 import { mcpRoutes } from './routes/mcp/index.js';
@@ -65,6 +66,7 @@ export async function buildApp() {
   await app.register(knowledgeRoutes, { prefix: '/v1/knowledge' });
   await app.register(analyticsRoutes, { prefix: '/v1/analytics' });
   await app.register(auditRoutes, { prefix: '/v1/audit-events' });
+  await app.register(departmentRoutes, { prefix: '/v1/departments' });
   await app.register(teamRoutes, { prefix: '/v1/teams' });
   await app.register(promptRoutes, { prefix: '/v1/prompts' });
   await app.register(runtimeRoutes, { prefix: '/v1/runtime' });

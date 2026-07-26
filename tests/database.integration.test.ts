@@ -214,6 +214,231 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(restored.json().avatar_config).toEqual({});
   });
 
+  it('serves revisioned Departments safely and keeps legacy team clients on the same source of truth', async () => {
+    const ownerHeaders = { authorization: `Bearer ${token}` };
+    const me = await app.inject({
+      method: 'GET',
+      url: '/v1/auth/me',
+      headers: ownerHeaders,
+    });
+    expect(me.statusCode, me.body).toBe(200);
+    const workspaceId = me.json().workspace_id as string;
+    const { query } = await import('../src/db/client.js');
+    const adminId = (await query<{ id: string }>(
+      `INSERT INTO users(email,password_hash,display_name)
+       VALUES($1,'integration-password-hash','Department Admin') RETURNING id`,
+      [`department-admin-${suffix}@example.test`],
+    )).rows[0].id;
+    const memberId = (await query<{ id: string }>(
+      `INSERT INTO users(email,password_hash,display_name)
+       VALUES($1,'integration-password-hash','Department Member') RETURNING id`,
+      [`department-member-${suffix}@example.test`],
+    )).rows[0].id;
+    await query(
+      `INSERT INTO workspace_memberships(workspace_id,user_id,role)
+       VALUES($1,$2,'admin'),($1,$3,'member')`,
+      [workspaceId, adminId, memberId],
+    );
+    const adminHeaders = {
+      authorization: `Bearer ${app.jwt.sign({
+        sub: adminId,
+        workspaceId,
+        role: 'admin',
+      })}`,
+    };
+    const memberHeaders = {
+      authorization: `Bearer ${app.jwt.sign({
+        sub: memberId,
+        workspaceId,
+        role: 'member',
+      })}`,
+    };
+
+    const initial = await app.inject({
+      method: 'GET',
+      url: '/v1/departments',
+      headers: memberHeaders,
+    });
+    expect(initial.statusCode, initial.body).toBe(200);
+    expect(initial.json()).toMatchObject({
+      revision: expect.any(Number),
+      executiveAgentId: null,
+      departments: expect.any(Array),
+      memberships: expect.any(Array),
+      agents: [expect.objectContaining({
+        id: agentId,
+        name: 'Research Agent',
+        role: 'Researcher',
+        status: 'active',
+        avatar: {},
+        activeWorkCount: 0,
+        apiToolCount: 0,
+        mcpConnectionCount: 0,
+      })],
+    });
+    expect(initial.body).not.toMatch(
+      /Be concise|instructions|memory_config|credentials|encrypted_credentials|tool_ids|model_config|raw.*output/i,
+    );
+
+    const createAsMember = await app.inject({
+      method: 'POST',
+      url: '/v1/departments',
+      headers: memberHeaders,
+      payload: { name: 'Forbidden Department', expectedRevision: initial.json().revision },
+    });
+    expect(createAsMember.statusCode, createAsMember.body).toBe(403);
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/departments',
+      headers: adminHeaders,
+      payload: {
+        name: 'Operations',
+        description: 'Coordinates operations',
+        displayOrder: 4,
+        expectedRevision: initial.json().revision,
+      },
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    expect(created.json()).toEqual({ revision: initial.json().revision + 1 });
+
+    const organization = await app.inject({
+      method: 'GET',
+      url: '/v1/departments',
+      headers: memberHeaders,
+    });
+    const department = organization.json().departments.find(
+      (item: { name: string }) => item.name === 'Operations',
+    );
+    expect(department).toMatchObject({
+      workspaceId,
+      description: 'Coordinates operations',
+      displayOrder: 4,
+      status: 'active',
+    });
+
+    const stale = await app.inject({
+      method: 'PATCH',
+      url: `/v1/departments/${department.id}`,
+      headers: adminHeaders,
+      payload: {
+        name: 'Sales Ops',
+        expectedRevision: initial.json().revision,
+      },
+    });
+    expect(stale.statusCode, stale.body).toBe(409);
+    expect(stale.json()).toMatchObject({
+      error: 'DEPARTMENT_REVISION_CONFLICT',
+      currentRevision: created.json().revision,
+    });
+
+    const assigned = await app.inject({
+      method: 'PUT',
+      url: `/v1/departments/${department.id}/members/${agentId}`,
+      headers: adminHeaders,
+      payload: {
+        membershipType: 'primary',
+        expectedRevision: created.json().revision,
+      },
+    });
+    expect(assigned.statusCode, assigned.body).toBe(200);
+    const revisionAfterAssignment = assigned.json().revision as number;
+
+    const legacyCountBefore = (await query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM agent_teams WHERE workspace_id=$1',
+      [workspaceId],
+    )).rows[0].count;
+    const legacyList = await app.inject({
+      method: 'GET',
+      url: '/v1/teams',
+      headers: memberHeaders,
+    });
+    expect(legacyList.statusCode, legacyList.body).toBe(200);
+    expect(legacyList.headers.deprecation).toBe('true');
+    expect(legacyList.headers).not.toHaveProperty('sunset');
+    expect(legacyList.json().data).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: department.id,
+        workspace_id: workspaceId,
+        name: 'Operations',
+        members: [expect.objectContaining({
+          team_id: department.id,
+          agent_id: agentId,
+          manager_agent_id: null,
+          name: 'Research Agent',
+          role: 'Researcher',
+        })],
+      }),
+    ]));
+
+    const legacyCreated = await app.inject({
+      method: 'POST',
+      url: '/v1/teams',
+      headers: adminHeaders,
+      payload: {
+        name: 'Customer Success',
+        description: 'Supports customers',
+      },
+    });
+    expect(legacyCreated.statusCode, legacyCreated.body).toBe(201);
+    expect(legacyCreated.headers.deprecation).toBe('true');
+    expect(legacyCreated.json()).toMatchObject({
+      workspace_id: workspaceId,
+      name: 'Customer Success',
+      description: 'Supports customers',
+    });
+    expect(await query(
+      'SELECT id FROM departments WHERE id=$1 AND workspace_id=$2',
+      [legacyCreated.json().id, workspaceId],
+    )).toMatchObject({ rowCount: 1 });
+    expect((await query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM agent_teams WHERE workspace_id=$1',
+      [workspaceId],
+    )).rows[0].count).toBe(legacyCountBefore);
+
+    const legacyAssigned = await app.inject({
+      method: 'PUT',
+      url: `/v1/teams/${legacyCreated.json().id}/members/${agentId}`,
+      headers: adminHeaders,
+      payload: { managerAgentId: null },
+    });
+    expect(legacyAssigned.statusCode, legacyAssigned.body).toBe(200);
+    expect(legacyAssigned.json()).toMatchObject({
+      team_id: legacyCreated.json().id,
+      agent_id: agentId,
+      manager_agent_id: null,
+    });
+    expect((await query<{ department_id: string }>(
+      `SELECT department_id
+         FROM department_memberships
+        WHERE workspace_id=$1 AND agent_id=$2 AND membership_type='primary'`,
+      [workspaceId, agentId],
+    )).rows).toEqual([{ department_id: legacyCreated.json().id }]);
+
+    const legacyRemoved = await app.inject({
+      method: 'DELETE',
+      url: `/v1/teams/${legacyCreated.json().id}/members/${agentId}`,
+      headers: adminHeaders,
+    });
+    expect(legacyRemoved.statusCode, legacyRemoved.body).toBe(204);
+    const legacyArchived = await app.inject({
+      method: 'DELETE',
+      url: `/v1/teams/${legacyCreated.json().id}`,
+      headers: adminHeaders,
+    });
+    expect(legacyArchived.statusCode, legacyArchived.body).toBe(204);
+    expect(await query(
+      'SELECT status FROM departments WHERE id=$1 AND workspace_id=$2',
+      [legacyCreated.json().id, workspaceId],
+    )).toMatchObject({ rows: [{ status: 'archived' }] });
+
+    expect(revisionAfterAssignment).toBe(created.json().revision + 1);
+    await query(
+      'DELETE FROM users WHERE id = ANY($1::uuid[])',
+      [[adminId, memberId]],
+    );
+  });
+
   it('persists, skips, and restarts versioned onboarding', async () => {
     const headers = { authorization: `Bearer ${token}` };
     const progress = await app.inject({ method: 'PUT', url: '/v1/auth/onboarding', headers, payload: { lastStep: 3, action: 'progress' } });
@@ -457,6 +682,31 @@ describe.runIf(enabled)('database-backed API flow', () => {
     starterInstallationId = installed.json().id;
     const resources = installed.json().resources;
     expect(Object.values(resources.agentIds)).toHaveLength(4);
+    expect(resources.departmentId).toEqual(expect.any(String));
+    expect(resources.teamId).toBe(resources.departmentId);
+    const { query } = await import('../src/db/client.js');
+    await expect(query(
+      `SELECT name,status,manager_agent_id
+         FROM departments
+        WHERE id=$1`,
+      [resources.departmentId],
+    )).resolves.toMatchObject({
+      rows: [{
+        name: 'Deep Research Report Team',
+        status: 'active',
+        manager_agent_id: null,
+      }],
+    });
+    await expect(query(
+      `SELECT count(*)::int AS count
+         FROM department_memberships
+        WHERE department_id=$1 AND membership_type='primary'`,
+      [resources.departmentId],
+    )).resolves.toMatchObject({ rows: [{ count: 4 }] });
+    await expect(query(
+      'SELECT count(*)::int AS count FROM agent_teams WHERE id=$1',
+      [resources.departmentId],
+    )).resolves.toMatchObject({ rows: [{ count: 0 }] });
 
     const agents = await app.inject({ method: 'GET', url: '/v1/agents', headers });
     for (const createdId of Object.values(resources.agentIds) as string[]) {

@@ -66,7 +66,9 @@ describe('agent solution installation transaction', () => {
       };
       if (sql.includes('SELECT id FROM agent_solution_installations')) return { rowCount: 0, rows: [] };
       if (sql.includes('INSERT INTO agents')) return { rowCount: 1, rows: [{ id: '00000000-0000-4000-8000-000000000040' }] };
-      if (sql.includes('INSERT INTO agent_teams')) return { rowCount: 1, rows: [{ id: '00000000-0000-4000-8000-000000000050' }] };
+      if (sql.includes('SELECT revision') && sql.includes('workspace_org_settings')) return { rowCount: 1, rows: [{ revision: 1 }] };
+      if (sql.includes('UPDATE workspace_org_settings')) return { rowCount: 1, rows: [{ revision: 2 }] };
+      if (sql.includes('INSERT INTO departments')) return { rowCount: 1, rows: [{ id: '00000000-0000-4000-8000-000000000050' }] };
       if (sql.includes('INSERT INTO workflows')) return { rowCount: 1, rows: [{ id: '00000000-0000-4000-8000-000000000060' }] };
       return { rowCount: 1, rows: [] };
     });
@@ -106,5 +108,58 @@ describe('agent solution installation transaction', () => {
       toolIdsByAgentKey: { agent_1: [toolId] },
     })).rejects.toThrow('INCOMPATIBLE_OR_NON_READ_ONLY_SOLUTION_TOOL');
     expect(queryMock).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it('creates the solution Department atomically without dual-writing legacy teams', async () => {
+    const departmentId = '00000000-0000-4000-8000-000000000050';
+    let agentNumber = 0;
+    queryMock.mockImplementation(async (sql: string) => {
+      if (sql.includes('SELECT id FROM agent_solution_installations')) {
+        return { rowCount: 0, rows: [] };
+      }
+      if (sql.includes('INSERT INTO agents')) {
+        agentNumber += 1;
+        return {
+          rowCount: 1,
+          rows: [{
+            id: `00000000-0000-4000-8000-${String(agentNumber).padStart(12, '0')}`,
+          }],
+        };
+      }
+      if (sql.includes('INSERT INTO departments')) {
+        return { rowCount: 1, rows: [{ id: departmentId }] };
+      }
+      if (sql.includes('SELECT revision') && sql.includes('workspace_org_settings')) {
+        return { rowCount: 1, rows: [{ revision: 1 }] };
+      }
+      if (sql.includes('UPDATE workspace_org_settings')) {
+        return { rowCount: 1, rows: [{ revision: 2 }] };
+      }
+      if (sql.includes('INSERT INTO workflows')) {
+        return {
+          rowCount: 1,
+          rows: [{ id: '00000000-0000-4000-8000-000000000060' }],
+        };
+      }
+      return { rowCount: 1, rows: [{ '?column?': 1 }] };
+    });
+    const { installAgentSolution } = await import('../src/solutions/installer.js');
+    const installed = await installAgentSolution({
+      workspaceId: '00000000-0000-4000-8000-000000000010',
+      userId: '00000000-0000-4000-8000-000000000020',
+      solution: starterSolutions[0],
+    });
+
+    expect(installed.resources).toMatchObject({
+      departmentId,
+      teamId: departmentId,
+    });
+    const statements = queryMock.mock.calls.map(([sql]) => String(sql));
+    expect(statements.some((sql) => sql.includes('INSERT INTO departments'))).toBe(true);
+    expect(statements.some((sql) => sql.includes('INSERT INTO department_memberships'))).toBe(true);
+    expect(statements.some((sql) => sql.includes('INSERT INTO workspace_org_settings'))).toBe(true);
+    expect(statements.some((sql) => sql.includes('INSERT INTO audit_events'))).toBe(true);
+    expect(statements.every((sql) => !/\b(?:agent_teams|team_memberships)\b/i.test(sql))).toBe(true);
+    expect(queryMock).toHaveBeenCalledWith('COMMIT');
   });
 });

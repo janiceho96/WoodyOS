@@ -78,6 +78,11 @@ export interface SetMembershipInput extends RevisionedDepartmentMutation {
   membershipType: MembershipType;
 }
 
+export interface SetMembershipWithManagerInput extends SetMembershipInput {
+  managerAgentId?: string | null;
+  confirmPrimaryMove?: boolean;
+}
+
 export interface RemoveMembershipInput extends RevisionedDepartmentMutation {
   departmentId: string;
   agentId: string;
