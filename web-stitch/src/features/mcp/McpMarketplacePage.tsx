@@ -4,10 +4,10 @@ import {
   Globe2, KeyRound, LoaderCircle, LockKeyhole, Plus, RefreshCw, Search, ServerCog,
   ShieldCheck, Sparkles, Trash2, Unplug, Users, Wrench,
 } from 'lucide-react';
-import { type FormEvent, useEffect, useMemo, useState } from 'react';
+import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react';
 import {
   api, type CuratedMcpApp, type McpAgentAccess, type McpCatalogServer, type McpConnection,
-  type McpTool, type McpToolCall,
+  type McpTool, type McpToolCall, type Tool,
 } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { AppBrandMark } from '../../components/AppBrandMark';
@@ -22,10 +22,30 @@ type InstallTarget =
   | { kind: 'custom' }
   | null;
 
+// oxlint-disable-next-line react/only-export-components -- the workspace navigation contract is intentionally testable.
+export const MCP_SECTIONS = [
+  { id: 'discover', label: 'Discover' },
+  { id: 'connected', label: 'Connected' },
+  { id: 'access', label: 'Agent Access' },
+  { id: 'activity', label: 'Activity' },
+] as const;
+
+type McpSection = (typeof MCP_SECTIONS)[number]['id'];
+
+// oxlint-disable-next-line react/only-export-components -- the access-selection behavior is intentionally testable.
+export function selectMcpConnection(connections: McpConnection[], selectedId: string | null) {
+  return connections.find((connection) => connection.id === selectedId) ?? null;
+}
+
+// oxlint-disable-next-line react/only-export-components -- the legacy compatibility boundary is intentionally testable.
+export function legacyMcpTools(tools: Tool[]) {
+  return tools.filter((tool) => tool.kind === 'mcp');
+}
+
 export function McpMarketplacePage() {
-  const { report, reportError } = useWorkspace();
+  const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<'discover' | 'installed' | 'activity'>('discover');
+  const [tab, setTab] = useState<McpSection>('discover');
   const [catalogView, setCatalogView] = useState<'top' | 'community'>('top');
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState('');
@@ -46,7 +66,8 @@ export function McpMarketplacePage() {
     },
     onError: (cause) => reportError(message(cause, 'Could not synchronize the MCP catalog')),
   });
-  const selected = connections.data?.data.find((connection) => connection.id === selectedId) ?? null;
+  const selected = selectMcpConnection(connections.data?.data ?? [], selectedId);
+  const legacyTools = legacyMcpTools(data.tools);
   const filteredFeatured = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return featured.data?.data ?? [];
@@ -61,7 +82,7 @@ export function McpMarketplacePage() {
     if (!oauth) return;
     if (oauth === 'success') {
       report('MCP OAuth authorization completed. Test the connection to verify access.');
-      setTab('installed');
+      setTab('connected');
       if (connectionId) setSelectedId(connectionId);
       void queryClient.invalidateQueries({ queryKey: ['mcp-connections'] });
     } else {
@@ -75,19 +96,19 @@ export function McpMarketplacePage() {
     const url = new URL(window.location.href);
     const connectionId = url.searchParams.get('connection');
     if (!connectionId || !connections.data?.data.some((connection) => connection.id === connectionId)) return;
-    setTab('installed');
+    setTab('connected');
     setSelectedId(connectionId);
     url.searchParams.delete('connection');
     window.history.replaceState({}, '', url);
   }, [connections.data]);
 
   return <div className="mcp-page">
-    <PageHeader eyebrow="Advanced integrations" title="MCP connections" description="Connect remote application servers, review their real actions, and grant least-privilege agent access." actions={<>
+    <PageHeader eyebrow="Advanced integrations" title="MCP" description="Connect application servers, review their exact actions, and grant least-privilege agent access." actions={<>
       <button className="button" onClick={() => setInstallTarget({ kind: 'custom' })}><Plus size={15}/>Custom server</button>
       <button className="button primary" disabled={sync.isPending} onClick={() => sync.mutate()}>{sync.isPending ? <LoaderCircle className="spin" size={15}/> : <RefreshCw size={15}/>}Sync Registry</button>
     </>}/>
     <div className="mcp-security-banner"><ShieldCheck size={19}/><div><strong>Safe by default</strong><span>New connections and discovered tools remain disabled until tested and reviewed. Secrets never return to this browser.</span></div></div>
-    <div className="tab-bar" role="tablist" aria-label="MCP connection sections" onKeyDown={handleTabListKeyDown}><button id="mcp-tab-discover" type="button" role="tab" aria-selected={tab === 'discover'} aria-controls="mcp-panel-discover" tabIndex={tab === 'discover' ? 0 : -1} className={tab === 'discover' ? 'active' : ''} onClick={() => setTab('discover')}><Blocks size={15}/>Discover</button><button id="mcp-tab-installed" type="button" role="tab" aria-selected={tab === 'installed'} aria-controls="mcp-panel-installed" tabIndex={tab === 'installed' ? 0 : -1} className={tab === 'installed' ? 'active' : ''} onClick={() => setTab('installed')}><ServerCog size={15}/>Installed <span>{connections.data?.data.length ?? 0}</span></button><button id="mcp-tab-activity" type="button" role="tab" aria-selected={tab === 'activity'} aria-controls="mcp-panel-activity" tabIndex={tab === 'activity' ? 0 : -1} className={tab === 'activity' ? 'active' : ''} onClick={() => setTab('activity')}><Activity size={15}/>Activity</button></div>
+    <div className="tab-bar" role="tablist" aria-label="MCP connection sections" onKeyDown={handleTabListKeyDown}>{MCP_SECTIONS.map((section) => <button key={section.id} id={`mcp-tab-${section.id}`} type="button" role="tab" aria-selected={tab === section.id} aria-controls={`mcp-panel-${section.id}`} tabIndex={tab === section.id ? 0 : -1} className={tab === section.id ? 'active' : ''} onClick={() => setTab(section.id)}>{section.id === 'discover' ? <Blocks size={15}/> : section.id === 'connected' ? <ServerCog size={15}/> : section.id === 'access' ? <Users size={15}/> : <Activity size={15}/>}{section.label}{section.id === 'connected' && <span>{connections.data?.data.length ?? 0}</span>}</button>)}</div>
     {tab === 'discover' ? <section id="mcp-panel-discover" role="tabpanel" aria-labelledby="mcp-tab-discover">
       <div className="mcp-discovery-switch" role="tablist" aria-label="MCP discovery source" onKeyDown={handleTabListKeyDown}>
         <button id="mcp-source-tab-top" type="button" role="tab" aria-selected={catalogView === 'top'} aria-controls="mcp-source-panel-top" tabIndex={catalogView === 'top' ? 0 : -1} className={catalogView === 'top' ? 'active' : ''} onClick={() => { setCatalogView('top'); setQuery(''); }}><Sparkles size={15}/>Supported Apps</button>
@@ -108,18 +129,77 @@ export function McpMarketplacePage() {
           <div className="mcp-catalog-grid">{catalog.data.data.map((server) => <CatalogCard key={server.id} server={server} install={() => setInstallTarget({ kind: 'catalog', server })}/>)}</div>
         </> : <EmptyState Icon={Blocks} title="No compatible servers found" text="Try another search, synchronize the Registry, or add a custom Streamable HTTP endpoint."/ >}
       </section>}
-    </section> : tab === 'installed' ? <section id="mcp-panel-installed" role="tabpanel" aria-labelledby="mcp-tab-installed" className="mcp-installed-layout">
-      <div className="mcp-connection-list panel"><div className="panel-header"><div><span className="eyebrow">Workspace installations</span><h2>Connections</h2></div></div>
-        {connections.isLoading
-          ? <Loading text="Loading connections…"/>
-          : connections.data?.data.length
-            ? connections.data.data.map((connection) => <button key={connection.id} className={selectedId === connection.id ? 'selected' : ''} onClick={() => setSelectedId(connection.id)}><AppBrandMark title={connection.name} size="small"/><span><strong>{connection.name}</strong><small>{connection.tool_count ?? 0} tools · {connection.agent_count ?? 0} agents</small></span><Status value={connectionState(connection)}/></button>)
-            : <EmptyState Icon={Unplug} title="No MCP connections" text="Install a Registry server or add a custom endpoint." action={<button className="button primary" onClick={() => setTab('discover')}>Browse Registry</button>}/>}
+    </section> : tab === 'connected' ? <section id="mcp-panel-connected" role="tabpanel" aria-labelledby="mcp-tab-connected">
+      <div className="mcp-installed-layout">
+        <ConnectionPicker
+          connections={connections.data?.data ?? []}
+          loading={connections.isLoading}
+          selectedId={selectedId}
+          select={setSelectedId}
+          emptyAction={<button className="button primary" onClick={() => setTab('discover')}>Browse Registry</button>}
+        />
+        <div className="mcp-detail panel">{selected ? <ConnectionDetails connection={selected} configureAccess={() => setTab('access')}/> : <EmptyState Icon={ServerCog} title="Select a connection" text="Review its health, tools, and permissions."/ >}</div>
       </div>
-      <div className="mcp-detail panel">{selected ? <ConnectionDetails connection={selected}/> : <EmptyState Icon={ServerCog} title="Select a connection" text="Review its health, tools, permissions and assigned agents."/ >}</div>
+      <LegacyMcpCompatibility tools={legacyTools}/>
+    </section> : tab === 'access' ? <section id="mcp-panel-access" role="tabpanel" aria-labelledby="mcp-tab-access">
+      <div className="mcp-installed-layout">
+        <ConnectionPicker
+          connections={connections.data?.data ?? []}
+          loading={connections.isLoading}
+          selectedId={selectedId}
+          select={setSelectedId}
+          heading="Select a connection"
+          description="Choose the application server whose agent allowlists you want to review."
+          emptyText="Connect an application server before granting agent access."
+          emptyAction={<button className="button primary" onClick={() => setTab('discover')}>Discover MCP</button>}
+        />
+        <div className="mcp-detail panel">{selected ? <AgentAccessDetails connection={selected}/> : <EmptyState Icon={Users} title="Select a connection" text="Choose a connected application server before configuring its agent allowlists."/>}</div>
+      </div>
     </section> : <section id="mcp-panel-activity" role="tabpanel" aria-labelledby="mcp-tab-activity"><McpActivity/></section>}
-    {installTarget && <Modal title={installTarget.kind === 'custom' ? 'Add custom MCP server' : installTarget.kind === 'curated' ? `Connect ${installTarget.app.title}` : `Review ${installTarget.server.title}`} close={() => setInstallTarget(null)}><InstallDialog target={installTarget} cancel={() => setInstallTarget(null)} complete={(connectionId) => { setInstallTarget(null); setTab('installed'); setSelectedId(connectionId); }}/></Modal>}
+    {installTarget && <Modal title={installTarget.kind === 'custom' ? 'Add custom MCP server' : installTarget.kind === 'curated' ? `Connect ${installTarget.app.title}` : `Review ${installTarget.server.title}`} close={() => setInstallTarget(null)}><InstallDialog target={installTarget} cancel={() => setInstallTarget(null)} complete={(connectionId) => { setInstallTarget(null); setTab('connected'); setSelectedId(connectionId); }}/></Modal>}
   </div>;
+}
+
+function ConnectionPicker({
+  connections, loading, selectedId, select, heading = 'Connections', description, emptyText = 'Install a Registry server or add a custom endpoint.', emptyAction,
+}: {
+  connections: McpConnection[];
+  loading: boolean;
+  selectedId: string | null;
+  select: (id: string) => void;
+  heading?: string;
+  description?: string;
+  emptyText?: string;
+  emptyAction: ReactNode;
+}) {
+  return <div className="mcp-connection-list panel"><div className="panel-header"><div><span className="eyebrow">{heading === 'Connections' ? 'Workspace installations' : 'Least privilege'}</span><h2>{heading}</h2>{description && <p>{description}</p>}</div></div>
+    {loading
+      ? <Loading text="Loading connections…"/>
+      : connections.length
+        ? connections.map((connection) => <button key={connection.id} className={selectedId === connection.id ? 'selected' : ''} onClick={() => select(connection.id)}><AppBrandMark title={connection.name} size="small"/><span><strong>{connection.name}</strong><small>{connection.tool_count ?? 0} tools · {connection.agent_count ?? 0} agents</small></span><Status value={connectionState(connection)}/></button>)
+        : <EmptyState Icon={Unplug} title="No MCP connections" text={emptyText} action={emptyAction}/>}
+  </div>;
+}
+
+function LegacyMcpCompatibility({ tools }: { tools: Tool[] }) {
+  const { report, reportError } = useWorkspace();
+  const queryClient = useQueryClient();
+  const test = useMutation({
+    mutationFn: (tool: Tool) => api.testTool(tool.id).then(() => tool),
+    onSuccess: (tool) => report(`${tool.name} connection is healthy`),
+    onError: (cause) => reportError(message(cause, 'Legacy MCP health test failed')),
+  });
+  const toggle = useMutation({
+    mutationFn: (tool: Tool) => api.updateTool(tool.id, { enabled: !tool.enabled }).then(() => tool),
+    onSuccess: async (tool) => {
+      report(`${tool.name} ${tool.enabled ? 'disabled' : 'enabled'}`);
+      await queryClient.invalidateQueries({ queryKey: ['workspace'] });
+    },
+    onError: (cause) => reportError(message(cause, 'Could not update legacy MCP tool')),
+  });
+  return <section className="panel api-tool-panel"><div className="panel-header"><div><span className="eyebrow">Compatibility</span><h2>Legacy MCP</h2><p>Older workspace tools remain manageable here. They are not represented as modern MCP connections or agent actions.</p></div></div>
+    {tools.length ? <div className="api-tool-list">{tools.map((tool) => <article key={tool.id}><span className="tool-glyph"><ServerCog size={18}/></span><span><strong>{tool.name}</strong><small>LEGACY MCP · {tool.description || 'No description'}</small></span><Status value={tool.enabled ? 'active' : 'paused'}/><button className="button" disabled={!tool.enabled || test.isPending} onClick={() => test.mutate(tool)}>{test.isPending ? <LoaderCircle className="spin" size={14}/> : 'Test'}</button><button className="button" disabled={toggle.isPending} onClick={() => toggle.mutate(tool)}>{tool.enabled ? 'Disable' : 'Enable'}</button></article>)}</div> : <EmptyState Icon={Unplug} title="No legacy MCP tools" text="Workspace MCP tools created through the former integration path will appear here."/>}
+  </section>;
 }
 
 function FeaturedCard({ app, open }: { app: CuratedMcpApp; open: () => void }) {
@@ -225,14 +305,13 @@ function InstallDialog({ target, cancel, complete }: { target: Exclude<InstallTa
   </form>;
 }
 
-function ConnectionDetails({ connection }: { connection: McpConnection }) {
+function ConnectionDetails({ connection, configureAccess }: { connection: McpConnection; configureAccess: () => void }) {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const needsAuthorization = connection.auth_type === 'oauth2' && !connection.authorized;
   const needsRepair = !needsAuthorization && connectionState(connection) === 'needs_attention';
   const canEnable = !connection.enabled && connection.health_status === 'healthy';
   const tools = useQuery({ queryKey: ['mcp-tools', connection.id], queryFn: () => api.mcpTools(connection.id) });
-  const agents = useQuery({ queryKey: ['mcp-agents', connection.id], queryFn: () => api.mcpConnectionAgents(connection.id) });
   const action = useMutation({
     mutationFn: async (kind: 'test' | 'discover' | 'toggle' | 'delete' | 'authorize') => {
       if (kind === 'test') return api.testMcpConnection(connection.id);
@@ -255,7 +334,13 @@ function ConnectionDetails({ connection }: { connection: McpConnection }) {
     },
     onError: (cause) => { if (cause instanceof Error && cause.message !== 'CANCELLED') reportError(message(cause, 'MCP connection action failed')); },
   });
-  return <div className="mcp-connection-detail"><div className="mcp-detail-head"><div><span className="eyebrow">Streamable HTTP</span><h2>{connection.name}</h2><p>{connection.description || connection.endpoint_url}</p></div><Status value={connectionState(connection)}/></div><dl className="connection-facts"><div><dt>Endpoint</dt><dd>{connection.endpoint_url}</dd></div><div><dt>Authentication</dt><dd>{connection.auth_type.replaceAll('_', ' ')}{connection.auth_type === 'oauth2' ? connection.authorized ? ' · connected' : ' · required' : ''}</dd></div><div><dt>Last healthy</dt><dd>{connection.last_success_at ? new Date(connection.last_success_at).toLocaleString() : 'Not tested'}</dd></div></dl>{needsAuthorization && <div className="mcp-auth-required"><KeyRound size={16}/><span><strong>Authorization required</strong><small>Connect your provider account before testing or discovering tools.</small></span></div>}{connection.last_error_message && !needsAuthorization && <div className="inline-error"><AlertTriangle size={15}/>{connection.last_error_message}</div>}<div className="mcp-actions">{connection.auth_type === 'oauth2' && <button className={needsAuthorization ? 'button primary' : 'button'} disabled={action.isPending} onClick={() => action.mutate('authorize')}><KeyRound size={14}/>{needsAuthorization ? 'Authorize account' : 'Reconnect OAuth'}</button>}<button className={`button${needsRepair ? ' primary' : ''}`} disabled={action.isPending || needsAuthorization} title={needsAuthorization ? 'Authorize the account first' : needsRepair ? 'Retest the connection and update its health state' : undefined} onClick={() => action.mutate('test')}><Activity size={14}/>{needsRepair ? 'Repair: test again' : 'Test connection'}</button><button className="button" disabled={action.isPending || needsAuthorization} title={needsAuthorization ? 'Authorize the account first' : undefined} onClick={() => action.mutate('discover')}><RefreshCw size={14}/>Discover tools</button>{(tools.data?.data.length ?? 0) > 0 && <button className="button" onClick={() => document.getElementById(`mcp-agent-access-${connection.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}><ShieldCheck size={14}/>Configure access</button>}<button className={canEnable ? 'button primary' : 'button'} disabled={action.isPending || needsAuthorization || needsRepair || (!connection.enabled && !canEnable)} onClick={() => action.mutate('toggle')}>{connection.enabled ? <Unplug size={14}/> : <CheckCircle2 size={14}/>}{connection.enabled ? 'Disable' : 'Enable'}</button><button className="icon-button danger" disabled={action.isPending} title="Uninstall and purge credentials" onClick={() => action.mutate('delete')}><Trash2 size={15}/></button></div><ToolReview connection={connection} tools={tools.data?.data ?? []} loading={tools.isLoading}/><AgentAccessEditor connection={connection} tools={tools.data?.data ?? []} agents={agents.data?.data ?? []} loading={agents.isLoading}/></div>;
+  return <div className="mcp-connection-detail"><div className="mcp-detail-head"><div><span className="eyebrow">Streamable HTTP</span><h2>{connection.name}</h2><p>{connection.description || connection.endpoint_url}</p></div><Status value={connectionState(connection)}/></div><dl className="connection-facts"><div><dt>Endpoint</dt><dd>{connection.endpoint_url}</dd></div><div><dt>Authentication</dt><dd>{connection.auth_type.replaceAll('_', ' ')}{connection.auth_type === 'oauth2' ? connection.authorized ? ' · connected' : ' · required' : ''}</dd></div><div><dt>Last healthy</dt><dd>{connection.last_success_at ? new Date(connection.last_success_at).toLocaleString() : 'Not tested'}</dd></div></dl>{needsAuthorization && <div className="mcp-auth-required"><KeyRound size={16}/><span><strong>Authorization required</strong><small>Connect your provider account before testing or discovering tools.</small></span></div>}{connection.last_error_message && !needsAuthorization && <div className="inline-error"><AlertTriangle size={15}/>{connection.last_error_message}</div>}<div className="mcp-actions">{connection.auth_type === 'oauth2' && <button className={needsAuthorization ? 'button primary' : 'button'} disabled={action.isPending} onClick={() => action.mutate('authorize')}><KeyRound size={14}/>{needsAuthorization ? 'Authorize account' : 'Reconnect OAuth'}</button>}<button className={`button${needsRepair ? ' primary' : ''}`} disabled={action.isPending || needsAuthorization} title={needsAuthorization ? 'Authorize the account first' : needsRepair ? 'Retest the connection and update its health state' : undefined} onClick={() => action.mutate('test')}><Activity size={14}/>{needsRepair ? 'Repair: test again' : 'Test connection'}</button><button className="button" disabled={action.isPending || needsAuthorization} title={needsAuthorization ? 'Authorize the account first' : undefined} onClick={() => action.mutate('discover')}><RefreshCw size={14}/>Discover tools</button>{(tools.data?.data.length ?? 0) > 0 && <button className="button" onClick={configureAccess}><ShieldCheck size={14}/>Configure access</button>}<button className={canEnable ? 'button primary' : 'button'} disabled={action.isPending || needsAuthorization || needsRepair || (!connection.enabled && !canEnable)} onClick={() => action.mutate('toggle')}>{connection.enabled ? <Unplug size={14}/> : <CheckCircle2 size={14}/>}{connection.enabled ? 'Disable' : 'Enable'}</button><button className="icon-button danger" disabled={action.isPending} title="Uninstall and purge credentials" onClick={() => action.mutate('delete')}><Trash2 size={15}/></button></div><ToolReview connection={connection} tools={tools.data?.data ?? []} loading={tools.isLoading}/></div>;
+}
+
+function AgentAccessDetails({ connection }: { connection: McpConnection }) {
+  const tools = useQuery({ queryKey: ['mcp-tools', connection.id], queryFn: () => api.mcpTools(connection.id) });
+  const agents = useQuery({ queryKey: ['mcp-agents', connection.id], queryFn: () => api.mcpConnectionAgents(connection.id) });
+  return <AgentAccessEditor connection={connection} tools={tools.data?.data ?? []} agents={agents.data?.data ?? []} loading={tools.isLoading || agents.isLoading}/>;
 }
 
 function connectionState(connection: McpConnection) {
