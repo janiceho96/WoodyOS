@@ -65,15 +65,22 @@ BEGIN
            team.description,
            (
              SELECT CASE
-               WHEN COUNT(DISTINCT membership.manager_agent_id) = 1
-               THEN (ARRAY_AGG(DISTINCT membership.manager_agent_id))[1]
+               WHEN managers.manager_count=1
+                AND manager.id IS NOT NULL
+               THEN managers.manager_agent_id
                ELSE NULL
              END
-             FROM team_memberships membership
-             JOIN agents manager
-               ON manager.id=membership.manager_agent_id
+             FROM (
+               SELECT COUNT(DISTINCT membership.manager_agent_id)
+                        FILTER (WHERE membership.manager_agent_id IS NOT NULL) AS manager_count,
+                      (ARRAY_AGG(DISTINCT membership.manager_agent_id)
+                        FILTER (WHERE membership.manager_agent_id IS NOT NULL))[1] AS manager_agent_id
+               FROM team_memberships membership
+               WHERE membership.team_id=team.id
+             ) managers
+             LEFT JOIN agents manager
+               ON manager.id=managers.manager_agent_id
               AND manager.workspace_id=team.workspace_id
-             WHERE membership.team_id=team.id
            ) AS manager_agent_id
     FROM agent_teams team
     ORDER BY team.workspace_id,team.id

@@ -23,6 +23,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
     duplicateDepartmentIds: [string, string];
     financeDepartmentId: string;
     managerAgentId: string;
+    mixedWorkspaceManagerDepartmentId: string;
     multiTeamAgentId: string;
     otherWorkspaceAgentId: string;
     primaryDepartmentId: string;
@@ -78,12 +79,15 @@ describe.runIf(enabled)('database-backed API flow', () => {
       const primaryAgentId = await createAgent(workspaceId);
       const ambiguousManagerAgentId = await createAgent(workspaceId);
       const secondAmbiguousManagerAgentId = await createAgent(workspaceId);
+      const mixedManagerFirstMemberId = await createAgent(workspaceId);
+      const mixedManagerSecondMemberId = await createAgent(workspaceId);
       const otherWorkspaceAgentId = await createAgent(otherWorkspaceId);
       const researchDepartmentId = await createLegacyTeam('Research');
       const financeDepartmentId = await createLegacyTeam('Finance');
       const primaryDepartmentId = await createLegacyTeam('Operations');
       const ambiguousManagerDepartmentId = await createLegacyTeam('Ambiguous management');
       const crossWorkspaceManagerDepartmentId = await createLegacyTeam('Cross workspace manager');
+      const mixedWorkspaceManagerDepartmentId = await createLegacyTeam('Mixed workspace managers');
       const crossWorkspaceMembershipDepartmentId = await createLegacyTeam('Cross workspace member');
       const duplicateDepartmentIds: [string, string] = [
         await createLegacyTeam('Repeated legacy team'),
@@ -95,7 +99,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
 
       await client.query(
         `INSERT INTO team_memberships(team_id,agent_id,manager_agent_id)
-         VALUES($1,$2,$3),($4,$5,NULL),($6,$7,$3),($8,$9,$3),($8,$10,$11),($12,$13,$14),($15,$16,NULL)`,
+         VALUES($1,$2,$3),($4,$5,NULL),($6,$7,$3),($8,$9,$3),($8,$10,$11),($12,$13,$14),($15,$16,$3),($15,$17,$14),($18,$19,NULL)`,
         [
           researchDepartmentId,
           multiTeamAgentId,
@@ -111,6 +115,9 @@ describe.runIf(enabled)('database-backed API flow', () => {
           crossWorkspaceManagerDepartmentId,
           managerAgentId,
           otherWorkspaceAgentId,
+          mixedWorkspaceManagerDepartmentId,
+          mixedManagerFirstMemberId,
+          mixedManagerSecondMemberId,
           crossWorkspaceMembershipDepartmentId,
           otherWorkspaceAgentId,
         ],
@@ -123,6 +130,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
         duplicateDepartmentIds,
         financeDepartmentId,
         managerAgentId,
+        mixedWorkspaceManagerDepartmentId,
         multiTeamAgentId,
         otherWorkspaceAgentId,
         primaryDepartmentId,
@@ -1162,6 +1170,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
       financeDepartmentId,
       duplicateDepartmentIds,
       managerAgentId,
+      mixedWorkspaceManagerDepartmentId,
       multiTeamAgentId,
       otherWorkspaceAgentId,
       primaryDepartmentId,
@@ -1206,12 +1215,13 @@ describe.runIf(enabled)('database-backed API flow', () => {
       expect(new Set(suffixShapedNames.rows.map((department) => department.name.toLowerCase())).size).toBe(3);
       await expect(client.query(
         'SELECT id,manager_agent_id FROM departments WHERE id = ANY($1::uuid[]) ORDER BY id',
-        [[ambiguousManagerDepartmentId, crossWorkspaceManagerDepartmentId, financeDepartmentId, researchDepartmentId]],
+        [[ambiguousManagerDepartmentId, crossWorkspaceManagerDepartmentId, financeDepartmentId, mixedWorkspaceManagerDepartmentId, researchDepartmentId]],
       )).resolves.toMatchObject({
         rows: expect.arrayContaining([
           { id: ambiguousManagerDepartmentId, manager_agent_id: null },
           { id: crossWorkspaceManagerDepartmentId, manager_agent_id: null },
           { id: financeDepartmentId, manager_agent_id: null },
+          { id: mixedWorkspaceManagerDepartmentId, manager_agent_id: null },
           { id: researchDepartmentId, manager_agent_id: managerAgentId },
         ]),
       });
@@ -1219,6 +1229,10 @@ describe.runIf(enabled)('database-backed API flow', () => {
         'SELECT count(*)::int AS count FROM department_memberships WHERE department_id=$1',
         [crossWorkspaceMembershipDepartmentId],
       )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+      await expect(client.query(
+        'SELECT count(*)::int AS count FROM team_memberships WHERE team_id=$1',
+        [mixedWorkspaceManagerDepartmentId],
+      )).resolves.toMatchObject({ rows: [{ count: 2 }] });
       await expect(client.query(
         `INSERT INTO departments(workspace_id,name,manager_agent_id)
          VALUES($1,'Cross workspace manager rejection',$2)`,
@@ -1234,7 +1248,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
          VALUES($1,$2)`,
         [workspaceId, otherWorkspaceAgentId],
       )).rejects.toMatchObject({ code: '23503' });
-      await expect(client.query('SELECT count(*)::int AS count FROM agent_teams')).resolves.toMatchObject({ rows: [{ count: 11 }] });
+      await expect(client.query('SELECT count(*)::int AS count FROM agent_teams')).resolves.toMatchObject({ rows: [{ count: 12 }] });
     });
   });
 
