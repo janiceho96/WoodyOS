@@ -1,5 +1,5 @@
-import { Activity, BarChart3, Bot, BookOpen, CircleHelp, LayoutDashboard, LogOut, Menu, Moon, PlugZap, RefreshCw, Search, Settings, Sun, Workflow, X } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, BarChart3, Bot, BookOpen, CircleHelp, LayoutDashboard, LogOut, Menu, Minus, Moon, Plus, PlugZap, RefreshCw, Search, Settings, Sun, Workflow, X } from 'lucide-react';
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api, auth, type Onboarding, type Session } from '../api';
 import { Modal, Notice } from '../components/ui';
@@ -35,6 +35,18 @@ const primaryNav = [
 ];
 
 const emptyWorkspaceData: WorkspaceData = { agents: [], tasks: [], workflows: [], documents: [], tools: [] };
+const workspaceZoomKey = 'woody.workspaceZoom';
+const minimumWorkspaceZoom = 80;
+const maximumWorkspaceZoom = 120;
+
+function initialWorkspaceZoom() {
+  try {
+    const stored = Number(window.localStorage.getItem(workspaceZoomKey));
+    return Number.isFinite(stored) && stored >= minimumWorkspaceZoom && stored <= maximumWorkspaceZoom ? stored : 100;
+  } catch {
+    return 100;
+  }
+}
 
 export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: {
   session: Session; setSession: (session: Session | null) => void; theme: Theme; setTheme: (theme: Theme) => void; toggleTheme: () => void;
@@ -49,6 +61,7 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
   const [error, setError] = useState('');
   const [onboarding, setOnboarding] = useState<Onboarding>(session.user.onboarding);
   const [showOnboarding, setShowOnboarding] = useState(!session.user.onboarding.completed);
+  const [workspaceZoom, setWorkspaceZoom] = useState(initialWorkspaceZoom);
   const data = workspace.data ?? emptyWorkspaceData;
   const agentWorkspaceMatch = location.pathname === '/agents/library' ? null : location.pathname.match(/^\/agents\/([^/]+)$/);
   const workspaceAgent = agentWorkspaceMatch ? data.agents.find((agent) => agent.id === agentWorkspaceMatch[1]) : undefined;
@@ -70,12 +83,28 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
     };
     window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler);
   }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(workspaceZoomKey, String(workspaceZoom));
+    } catch {
+      // The zoom still works for this session when browser storage is unavailable.
+    }
+  }, [workspaceZoom]);
   const go = (path: string) => { navigate(path); setMobileOpen(false); };
+  const zoomStyle = {
+    zoom: workspaceZoom / 100,
+    width: `${100 / (workspaceZoom / 100)}%`,
+  } as CSSProperties;
 
   return <WorkspaceContext.Provider value={value}>
     <div className="app-shell">
       <aside id="primary-navigation" className={`side-rail ${mobileOpen ? 'open' : ''}`}>
-        <div className="brand-block"><BrandMark/><div><strong>Woody</strong><small>Agent OS</small></div><button className="icon-button mobile-only" onClick={() => setMobileOpen(false)} aria-label="Close navigation"><X size={19}/></button></div>
+        <div className="brand-block">
+          <button type="button" className="brand-home-link" onClick={() => go('/dashboard')} aria-label="Go to Woody home">
+            <BrandMark/><span><strong>Woody</strong><small>Agent OS</small></span>
+          </button>
+          <button className="icon-button mobile-only" onClick={() => setMobileOpen(false)} aria-label="Close navigation"><X size={19}/></button>
+        </div>
         {agentWorkspaceMatch ? <AgentWorkspaceNav agentId={agentWorkspaceMatch[1]} close={() => setMobileOpen(false)}/> : <nav className="primary-nav simplified" aria-label="Primary navigation">{primaryNav.map((item) => {
           const active = location.pathname === item.path || (item.id === 'agents' && location.pathname.startsWith('/agents/')) || (item.id === 'integrations' && location.pathname === '/mcp');
           return <div className="primary-nav-item" key={item.id}><button className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} onClick={() => go(item.path)}><item.Icon size={18}/><span>{item.label}</span>{item.id === 'outputs' && liveWork.length > 0 && <b>{liveWork.length}</b>}</button></div>;
@@ -84,8 +113,8 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
       </aside>
       {mobileOpen && <button type="button" className="mobile-nav-backdrop" onClick={() => setMobileOpen(false)} aria-label="Close navigation"/>}
       <div className="workspace">
-        <header className="top-nav"><button className="icon-button mobile-only" onClick={() => setMobileOpen(true)} aria-label="Open navigation" aria-expanded={mobileOpen} aria-controls="primary-navigation"><Menu size={20}/></button><div className="workspace-title"><span>{label}</span><small>{workspace.isFetching ? 'Syncing live data…' : workspaceAgent ? 'Agent command center' : 'Woody Workspace'}</small></div><button className="global-search" onClick={() => setDialog('search')} aria-label="Search workspace"><Search size={17}/><span>Search agents, outputs, knowledge…</span><kbd>⌘K</kbd></button><div className="top-actions">{liveWork.length > 0 && <button className="live-work-pill" onClick={() => { const task = liveWork[0]; go(`/agents/${task.agent_id}?section=workspace&task=${task.id}`); }}><i/>{liveWork.length} active</button>}<button className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>{theme === 'dark' ? <Sun size={18}/> : <Moon size={18}/>}</button><a className="icon-button" href="/docs" target="_blank" rel="noreferrer" aria-label="Open help and API documentation"><CircleHelp size={18}/></a><button className="icon-button" onClick={() => void workspace.refetch()} aria-label="Refresh workspace"><RefreshCw size={18} className={workspace.isFetching ? 'spin' : ''}/></button><span className="avatar small">{session.user.displayName.slice(0, 1).toUpperCase()}</span></div></header>
-        <main className={`page-canvas ${agentWorkspaceMatch ? 'agent-workspace-canvas' : ''}`}><Notice text={error || notice} error={Boolean(error)} action={error ? undefined : noticeAction} dismiss={() => { setError(''); setNotice(''); setNoticeAction(undefined); }}/>{workspace.error && <Notice text={workspace.error instanceof Error ? workspace.error.message : 'Could not load workspace data'} error dismiss={() => void workspace.refetch()}/>}<Outlet context={{ openDialog: setDialog, theme, setTheme, onboarding, resumeOnboarding: () => setShowOnboarding(true), restartOnboarding: async () => { const next = await api.restartOnboarding(); setOnboarding(next); setShowOnboarding(true); report('Onboarding restarted'); } }}/></main>
+        <header className="top-nav"><button className="icon-button mobile-only" onClick={() => setMobileOpen(true)} aria-label="Open navigation" aria-expanded={mobileOpen} aria-controls="primary-navigation"><Menu size={20}/></button><div className="workspace-title"><span>{label}</span><small>{workspace.isFetching ? 'Syncing live data…' : workspaceAgent ? 'Agent command center' : 'Woody Workspace'}</small></div><button className="global-search" onClick={() => setDialog('search')} aria-label="Search workspace"><Search size={17}/><span>Search agents, outputs, knowledge…</span><kbd>⌘K</kbd></button><div className="top-actions">{liveWork.length > 0 && <button className="live-work-pill" onClick={() => { const task = liveWork[0]; go(`/agents/${task.agent_id}?section=workspace&task=${task.id}`); }}><i/>{liveWork.length} active</button>}<div className="workspace-zoom-controls" role="group" aria-label="Workspace zoom"><button type="button" onClick={() => setWorkspaceZoom((current) => Math.max(minimumWorkspaceZoom, current - 10))} disabled={workspaceZoom === minimumWorkspaceZoom} aria-label="Zoom out workspace"><Minus size={14}/></button><button type="button" className="workspace-zoom-value" onClick={() => setWorkspaceZoom(100)} aria-label={`Reset workspace zoom. Current zoom ${workspaceZoom}%`}>{workspaceZoom}%</button><button type="button" onClick={() => setWorkspaceZoom((current) => Math.min(maximumWorkspaceZoom, current + 10))} disabled={workspaceZoom === maximumWorkspaceZoom} aria-label="Zoom in workspace"><Plus size={14}/></button></div><button className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>{theme === 'dark' ? <Sun size={18}/> : <Moon size={18}/>}</button><a className="icon-button" href="/docs" target="_blank" rel="noreferrer" aria-label="Open help and API documentation"><CircleHelp size={18}/></a><button className="icon-button" onClick={() => void workspace.refetch()} aria-label="Refresh workspace"><RefreshCw size={18} className={workspace.isFetching ? 'spin' : ''}/></button><span className="avatar small">{session.user.displayName.slice(0, 1).toUpperCase()}</span></div></header>
+        <main className={`page-canvas ${agentWorkspaceMatch ? 'agent-workspace-canvas' : ''}`}><Notice text={error || notice} error={Boolean(error)} action={error ? undefined : noticeAction} dismiss={() => { setError(''); setNotice(''); setNoticeAction(undefined); }}/>{workspace.error && <Notice text={workspace.error instanceof Error ? workspace.error.message : 'Could not load workspace data'} error dismiss={() => void workspace.refetch()}/>}<div className="workspace-zoom-surface" style={zoomStyle}><Outlet context={{ openDialog: setDialog, theme, setTheme, onboarding, resumeOnboarding: () => setShowOnboarding(true), restartOnboarding: async () => { const next = await api.restartOnboarding(); setOnboarding(next); setShowOnboarding(true); report('Onboarding restarted'); } }}/></div></main>
       </div>
     </div>
     {dialog === 'task' && <Modal title="Initiate task" close={() => setDialog(null)}><TaskDialogBody close={() => setDialog(null)} onCreated={(task) => go(`/agents/${task.agent_id}?section=workspace&task=${task.id}`)}/></Modal>}

@@ -139,7 +139,7 @@ function FeaturedCard({ app, open }: { app: CuratedMcpApp; open: () => void }) {
 
 function CatalogCard({ server, install }: { server: McpCatalogServer; install: () => void }) {
   const endpointCount = server.endpoints.filter((endpoint) => endpoint.supported).length;
-  return <article className="mcp-catalog-card panel"><div className="mcp-card-head"><span className="mcp-logo"><Blocks size={20}/></span><span className="transport-tag">COMMUNITY HTTP</span></div><h2>{server.title}</h2><code>{server.registry_name}</code><p>{server.description || 'No server description was provided.'}</p><div className="mcp-card-meta"><span><ServerCog size={13}/>{endpointCount} endpoint{endpointCount === 1 ? '' : 's'}</span>{server.repository_url && <a href={server.repository_url} target="_blank" rel="noreferrer">Repository <ExternalLink size={12}/></a>}</div><button className="button" onClick={install}>Review community server</button></article>;
+  return <article className="mcp-catalog-card panel"><div className="mcp-card-head"><AppBrandMark appId="mcp" title={server.title}/><span className="transport-tag">COMMUNITY HTTP</span></div><h2>{server.title}</h2><code>{server.registry_name}</code><p>{server.description || 'No server description was provided.'}</p><div className="mcp-card-meta"><span><ServerCog size={13}/>{endpointCount} endpoint{endpointCount === 1 ? '' : 's'}</span>{server.repository_url && <a href={server.repository_url} target="_blank" rel="noreferrer">Repository <ExternalLink size={12}/></a>}</div><button className="button" onClick={install}>Review community server</button></article>;
 }
 
 function InstallDialog({ target, cancel, complete }: { target: Exclude<InstallTarget, null>; cancel: () => void; complete: (connectionId: string) => void }) {

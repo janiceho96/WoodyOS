@@ -4,5 +4,6 @@ dist/
 .env.*
 !.env.example
 coverage/
+data/
 .worktrees/
 .DS_Store

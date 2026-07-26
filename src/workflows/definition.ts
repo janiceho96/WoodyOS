@@ -16,7 +16,7 @@ export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema>;
 
 export type ConditionOperator = 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal' | 'contains' | 'exists' | 'not_exists';
 const conditionOperators = new Set<ConditionOperator>(['equals', 'not_equals', 'greater_than', 'greater_or_equal', 'less_than', 'less_or_equal', 'contains', 'exists', 'not_exists']);
-const artifactFormats = new Set(['pdf', 'docx', 'pptx', 'xlsx']);
+const artifactFormats = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'md', 'txt', 'csv', 'json']);
 const safePathPattern = /^(?:input|variables)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+])*$/;
 const safeNodePathPattern = /^nodes\.([A-Za-z][A-Za-z0-9_-]*)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+])*$/;
 const safeLegacyPathPattern = /^([A-Za-z_][A-Za-z0-9_-]*)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+])*$/;
@@ -72,6 +72,7 @@ function dataReferenceErrors(node: WorkflowNode, ancestors: Set<string>, known: 
   const errors: string[] = [];
   const values: unknown[] = [];
   if (['action', 'api_action', 'mcp_action'].includes(node.type)) values.push(node.config.input);
+  if (node.type === 'agent') values.push(node.config.inputMapping);
   if (node.type === 'knowledge_search') values.push(node.config.query);
   if (node.type === 'condition') values.push(`{{ ${String(node.config.path ?? '')} }}`);
   if (node.type === 'loop') {
@@ -164,6 +165,13 @@ export function workflowDefinitionErrors(definition: WorkflowDefinition) {
   for (const node of definition.nodes) {
     const edges = outgoing.get(node.id) ?? [];
     if (node.type === 'trigger' && (incoming.get(node.id)?.length ?? 0) > 0) errors.push('The trigger node cannot have incoming edges');
+    if (node.type === 'trigger' && Array.isArray(node.config.inputSchema)) {
+      const keys = node.config.inputSchema
+        .filter((field): field is Record<string, unknown> => Boolean(field) && typeof field === 'object' && !Array.isArray(field))
+        .map((field) => field.key)
+        .filter((key): key is string => typeof key === 'string');
+      if (new Set(keys).size !== keys.length) errors.push(`Trigger node ${node.id} inputSchema keys must be unique`);
+    }
     if (node.type === 'output' && edges.length) errors.push(`Output node ${node.id} cannot have outgoing edges`);
     if (!['condition', 'loop', 'output'].includes(node.type) && edges.length !== 1) errors.push(`${node.type} node ${node.id} needs exactly one outgoing edge`);
     if (node.type === 'condition') {
@@ -178,7 +186,7 @@ export function workflowDefinitionErrors(definition: WorkflowDefinition) {
       const fromNodeId = node.config.fromNodeId;
       if (fromNodeId !== undefined && (typeof fromNodeId !== 'string' || !known.has(fromNodeId) || fromNodeId === node.id)) errors.push(`Output node ${node.id} has an invalid fromNodeId`);
       const formats = node.config.artifactFormats;
-      if (formats !== undefined && (!Array.isArray(formats) || formats.some((format) => typeof format !== 'string' || !artifactFormats.has(format)) || new Set(formats).size !== formats.length)) errors.push(`Output node ${node.id} artifactFormats must contain unique pdf, docx, pptx or xlsx values`);
+      if (formats !== undefined && (!Array.isArray(formats) || formats.some((format) => typeof format !== 'string' || !artifactFormats.has(format)) || new Set(formats).size !== formats.length)) errors.push(`Output node ${node.id} artifactFormats must contain unique supported file formats`);
     }
     errors.push(...workflowNodeConfigErrors(node));
     errors.push(...retryConfigErrors(node));

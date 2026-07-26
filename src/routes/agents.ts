@@ -4,6 +4,7 @@ import { query } from '../db/client.js';
 import { audit } from '../lib/audit.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { agentAvatarSchema } from '../agents/avatar.js';
+import { agentPromptRequestSchema, generateAgentPrompt } from '../agents/prompt-generator.js';
 import { agentAvatarStorage } from '../avatars/storage.js';
 import { deleteAgentAvatar, findAgentAvatar, saveAgentAvatar } from '../avatars/service.js';
 
@@ -51,6 +52,16 @@ export async function agentRoutes(app: FastifyInstance) {
     const result = await query('INSERT INTO agents(workspace_id,name,role,goal,instructions,personality,model,model_config,capabilities,status,tool_ids,memory_config,avatar_config,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *', [request.user.workspaceId, input.name, input.role, input.goal, input.instructions, input.personality ?? null, input.model, JSON.stringify(input.modelConfig), JSON.stringify(input.capabilities), input.status, JSON.stringify(input.toolIds ?? []), JSON.stringify(input.memoryConfig ?? { shortTerm: true, longTerm: true, knowledgeBase: true }), JSON.stringify(input.avatar ?? {}), request.user.sub]);
     await audit(request.user.workspaceId, request.user.sub, 'agent.created', 'agent', result.rows[0].id);
     return reply.code(201).send(result.rows[0]);
+  }));
+  app.post('/generate-prompt', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const input = parse(agentPromptRequestSchema, request.body, reply); if (!input) return;
+    const generated = await generateAgentPrompt(request.user.workspaceId, input);
+    await audit(request.user.workspaceId, request.user.sub, 'agent.prompt_generated', 'workspace', request.user.workspaceId, {
+      tone: input.tone,
+      suppliedName: Boolean(input.name),
+      suppliedRole: Boolean(input.role),
+    });
+    return generated;
   }));
   app.get('/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const result = await query('SELECT * FROM agents WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);

@@ -1,7 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { isIP } from 'node:net';
+import { isIP, type LookupFunction } from 'node:net';
 import { isPublicIp } from '../../lib/network.js';
 
 export type SafeHttpResponse = {
@@ -43,6 +43,16 @@ async function pinnedAddress(url: URL) {
   return addresses[0] as { address: string; family: 4 | 6 };
 }
 
+export function createPinnedLookup(pinned: { address: string; family: 4 | 6 }): LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [{ address: pinned.address, family: pinned.family }]);
+      return;
+    }
+    callback(null, pinned.address, pinned.family);
+  };
+}
+
 export async function assertPublicHttpsUrl(raw: string) {
   const url = validatedPublicHttpsUrl(raw);
   await pinnedAddress(url);
@@ -71,7 +81,7 @@ async function oneRequest(url: URL, options: Required<Pick<SafeHttpOptions, 'met
         ...options.headers,
         host: url.host,
       },
-      lookup: (_hostname, _lookupOptions, callback) => callback(null, pinned.address, pinned.family),
+      lookup: createPinnedLookup(pinned),
       servername: url.hostname,
       timeout: options.timeoutMs,
     }, (response) => {

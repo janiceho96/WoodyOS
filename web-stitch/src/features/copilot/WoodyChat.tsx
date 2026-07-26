@@ -2,11 +2,17 @@ import { GripVertical, LoaderCircle, LocateFixed, MessageCircle, Send, Trash2, X
 import { type FormEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { api, type WoodyChatMessage } from '../../api';
+import { api, type FileAsset, type WoodyChatMessage } from '../../api';
 import { Mascot } from '../../components/Mascot';
 import type { MascotExpression } from '../../components/Types';
+import { AttachmentPicker } from '../../components/files/AttachmentPicker';
+import { AttachmentChip } from '../../components/files/AttachmentChip';
 
-type UiMessage = WoodyChatMessage & { id: string };
+type UiMessage = WoodyChatMessage & {
+  id: string;
+  attachments?: FileAsset[];
+  citations?: Array<{ fileId: string; filename: string; locator: string; score: number }>;
+};
 type Position = { x: number; y: number };
 type DragState = { pointerX: number; pointerY: number; position: Position; bounds: DOMRect };
 
@@ -56,6 +62,9 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const [draft, setDraft] = useState('');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
+  const [attachments, setAttachments] = useState<FileAsset[]>([]);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
@@ -72,6 +81,32 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   useEffect(() => {
     if (open) window.setTimeout(() => inputRef.current?.focus(), 80);
   }, [open]);
+  useEffect(() => {
+    if (!open || historyLoaded) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const threads = await api.chatThreads();
+        if (cancelled || !threads.data[0]) return;
+        const thread = await api.chatThread(threads.data[0].id);
+        if (cancelled) return;
+        setThreadId(thread.id);
+        if (thread.messages?.length) setMessages(thread.messages.map((message) => ({
+          id: message.id,
+          role: message.role,
+          content: message.content,
+          attachments: message.attachments,
+          citations: message.metadata?.citations,
+        })));
+      } catch {
+        // Keep the fresh welcome if older history is temporarily unavailable.
+      } finally {
+        if (!cancelled) setHistoryLoaded(true);
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [historyLoaded, open]);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, pending, error]);
@@ -94,14 +129,25 @@ export function WoodyChat({ displayName }: { displayName: string }) {
 
   const send = async (content: string) => {
     const clean = content.trim();
-    if (!clean || pending) return;
-    const userMessage: UiMessage = { id: messageId(), role: 'user', content: clean };
+    if (!clean || pending || attachments.some((file) => file.status !== 'ready')) return;
+    const selectedAttachments = attachments;
+    const userMessage: UiMessage = { id: messageId(), role: 'user', content: clean, attachments: selectedAttachments };
     const next = [...messages, userMessage];
-    setMessages(next); setDraft(''); setPending(true); setError('');
+    setMessages(next); setDraft(''); setAttachments([]); setPending(true); setError('');
     try {
-      const history = next.slice(-20).map(({ role, content: text }) => ({ role, content: text }));
-      const result = await api.woodyChat(history);
-      setMessages((current) => [...current, { id: messageId(), role: 'assistant', content: result.message }]);
+      let activeThread = threadId;
+      if (!activeThread) {
+        const created = await api.createChatThread();
+        activeThread = created.id;
+        setThreadId(created.id);
+      }
+      const result = await api.sendChatThreadMessage(activeThread, clean, selectedAttachments.map((file) => file.id));
+      setMessages((current) => [...current, {
+        id: result.assistant.id,
+        role: 'assistant',
+        content: result.assistant.content,
+        citations: result.citations,
+      }]);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : 'Woody could not answer right now.';
       setError(detail === 'AI_NOT_CONFIGURED' ? 'Connect an AI provider in Settings before chatting with Woody.' : detail);
@@ -112,7 +158,10 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send(draft); }
   };
-  const clear = () => { setMessages([welcome(displayName)]); setError(''); setDraft(''); };
+  const clear = async () => {
+    if (threadId) await api.deleteChatThread(threadId).catch(() => undefined);
+    setThreadId(null); setMessages([welcome(displayName)]); setAttachments([]); setError(''); setDraft('');
+  };
   const startDrag = (event: ReactPointerEvent<HTMLElement>) => {
     if (event.button !== 0 || !hostRef.current) return;
     dragRef.current = { pointerX: event.clientX, pointerY: event.clientY, position: { ...positionRef.current }, bounds: visibleBounds(hostRef.current) };
@@ -157,21 +206,22 @@ export function WoodyChat({ displayName }: { displayName: string }) {
           <GripVertical size={17}/>
         </div>
         <button type="button" onClick={resetPosition} aria-label="Reset Woody position" title="Reset position"><LocateFixed size={16}/></button>
-        <button type="button" onClick={clear} aria-label="Clear conversation" title="Clear conversation"><Trash2 size={16}/></button>
+        <button type="button" onClick={() => void clear()} aria-label="Clear conversation" title="Clear conversation"><Trash2 size={16}/></button>
         <button type="button" onClick={() => setOpen(false)} aria-label="Close Woody chat"><X size={18}/></button>
       </header>
       <div className="woody-chat-messages" ref={scrollRef} aria-live="polite">
         {messages.map((message) => <article className={message.role} key={message.id}>
           {message.role === 'assistant' && <span className="woody-message-avatar"><Mascot expression="happy" size={34} floating={false} blink={false} decorative/></span>}
-          <div><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div>
+          <div><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>{message.attachments?.length ? <div className="woody-message-attachments">{message.attachments.map((file) => <AttachmentChip key={file.id} file={file}/>)}</div> : null}{message.citations?.length ? <div className="woody-message-citations"><strong>Sources used</strong>{message.citations.map((citation, index) => <span key={`${citation.fileId}-${citation.locator}-${index}`}>{citation.filename} · {citation.locator}</span>)}</div> : null}</div>
         </article>)}
         {messages.length === 1 && <div className="woody-chat-suggestions">{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => void send(suggestion)}>{suggestion}</button>)}</div>}
         {pending && <div className="woody-typing"><LoaderCircle className="spin" size={14}/><span>Woody is thinking carefully…</span></div>}
         {error && <div className="woody-chat-error"><strong>I couldn’t answer that.</strong><span>{error}</span></div>}
       </div>
       <form className="woody-chat-composer" onSubmit={submit}>
-        <textarea ref={inputRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} maxLength={8_000} rows={2} placeholder="Ask about agents, workflows, tools, errors, or cost…" aria-label="Message Woody"/>
-        <button type="submit" disabled={pending || !draft.trim()} aria-label="Send message"><Send size={17}/></button>
+        <AttachmentPicker value={attachments} onChange={setAttachments} defaultScope="conversation" allowedScopes={['conversation', 'saved', 'knowledge']} compact/>
+        <textarea ref={inputRef} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} maxLength={8_000} rows={2} placeholder="Ask about agents, workflows, tools, errors, cost, or an attached file…" aria-label="Message Woody"/>
+        <button type="submit" disabled={pending || !draft.trim() || attachments.some((file) => file.status !== 'ready')} aria-label="Send message"><Send size={17}/></button>
         <small>Enter to send · Shift+Enter for a new line</small>
       </form>
     </section>}

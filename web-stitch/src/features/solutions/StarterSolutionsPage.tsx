@@ -9,11 +9,12 @@ import ReactMarkdown from 'react-markdown';
 import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import remarkGfm from 'remark-gfm';
 import {
-  api, type Agent, type AgentSolution, type AgentSolutionAgent, type AgentSolutionInstallation, type Tool, type WorkflowRun,
+  api, type Agent, type AgentSolution, type AgentSolutionAgent, type AgentSolutionInstallation, type FileAsset, type Tool, type WorkflowRun,
 } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState, Modal, PageHeader, Status } from '../../components/ui';
 import { AgentAvatar } from '../../components/agents/AgentAvatar';
+import { AttachmentPicker } from '../../components/files/AttachmentPicker';
 import { handleTabListKeyDown } from '../../lib/a11y';
 import { compact } from '../../lib/format';
 import './solutions.css';
@@ -26,6 +27,7 @@ export function StarterSolutionsPage() {
   const inAgentLibrary = location.pathname === '/agents/library';
   const [params, setParams] = useSearchParams();
   const initial = params.get('tab');
+  const initialAttachmentIds = (params.get('files') ?? '').split(',').filter(Boolean).slice(0, 10);
   const [tab, setTabState] = useState<Tab>(initial === 'generate' || initial === 'installed' ? initial : 'starters');
   const setTab = (next: Tab) => { setTabState(next); setParams(next === 'starters' ? {} : { tab: next }); };
   return <div className="solutions-page">
@@ -42,7 +44,7 @@ export function StarterSolutionsPage() {
       <button id="create-tab-installed" type="button" role="tab" aria-selected={tab === 'installed'} aria-controls="create-panel-installed" tabIndex={tab === 'installed' ? 0 : -1} className={tab === 'installed' ? 'active' : ''} onClick={() => setTab('installed')}><GitBranch size={15}/>Drafts</button>
     </div>
     {tab === 'starters' && <section id="create-panel-starters" role="tabpanel" aria-labelledby="create-tab-starters"><StarterCatalog openInstalled={() => setTab('installed')}/></section>}
-    {tab === 'generate' && <section id="create-panel-generate" role="tabpanel" aria-labelledby="create-tab-generate"><PromptCompiler initialPrompt={params.get('prompt') ?? ''} openInstalled={() => setTab('installed')}/></section>}
+    {tab === 'generate' && <section id="create-panel-generate" role="tabpanel" aria-labelledby="create-tab-generate"><PromptCompiler initialPrompt={params.get('prompt') ?? ''} initialAttachmentIds={initialAttachmentIds} openInstalled={() => setTab('installed')}/></section>}
     {tab === 'installed' && <section id="create-panel-installed" role="tabpanel" aria-labelledby="create-tab-installed"><InstalledSolutions/></section>}
   </div>;
 }
@@ -113,16 +115,30 @@ function StarterCatalog({ openInstalled }: { openInstalled: () => void }) {
   </>;
 }
 
-function PromptCompiler({ openInstalled, initialPrompt = '' }: { openInstalled: () => void; initialPrompt?: string }) {
+function PromptCompiler({ openInstalled, initialPrompt = '', initialAttachmentIds = [] }: {
+  openInstalled: () => void;
+  initialPrompt?: string;
+  initialAttachmentIds?: string[];
+}) {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<'automatic' | 'single' | 'multi'>('automatic');
   const [prompt, setPrompt] = useState(initialPrompt);
+  const [attachments, setAttachments] = useState<FileAsset[]>([]);
   const [persistPrompt, setPersistPrompt] = useState(false);
   const [proposal, setProposal] = useState<AgentSolution | null>(null);
   const proposalReviewRef = useRef<HTMLElement>(null);
+  const initializedAttachments = useRef(false);
+  const files = useQuery({ queryKey: ['files'], queryFn: api.files, staleTime: 15_000 });
+  useEffect(() => {
+    if (initializedAttachments.current || !files.data) return;
+    initializedAttachments.current = true;
+    const requested = new Set(initialAttachmentIds);
+    setAttachments(files.data.data.filter((file) => requested.has(file.id)));
+  }, [files.data, initialAttachmentIds]);
+  const attachmentsReady = attachments.every((file) => file.status === 'ready');
   const compile = useMutation({
-    mutationFn: () => api.compileAgentSolution({ prompt, mode }),
+    mutationFn: () => api.compileAgentSolution({ prompt, mode, attachmentIds: attachments.map((file) => file.id) }),
     onSuccess: ({ solution }) => {
       setProposal(solution);
       report(`Generated a ${solution.agents.length}-agent proposal for review`, {
@@ -146,7 +162,7 @@ function PromptCompiler({ openInstalled, initialPrompt = '' }: { openInstalled: 
     }),
     onSuccess: async (result) => {
       report(`${result.solution.name} saved as an inactive draft`);
-      setProposal(null); setPrompt('');
+      setProposal(null); setPrompt(''); setAttachments([]);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['agent-solution-installations'] }),
         queryClient.invalidateQueries({ queryKey: ['workspace'] }),
@@ -176,8 +192,12 @@ function PromptCompiler({ openInstalled, initialPrompt = '' }: { openInstalled: 
         {(['automatic', 'single', 'multi'] as const).map((value) => <button key={value} className={mode === value ? 'active' : ''} onClick={() => setMode(value)}>{value === 'automatic' ? 'Auto detect' : value === 'single' ? 'Single agent' : 'Multi-agent'}</button>)}
       </div>
       <label>ChatGPT prompt<textarea className="prompt-source" value={prompt} maxLength={50_000} onChange={(event) => setPrompt(event.target.value)} placeholder="Paste the complete prompt describing the job, required output, rules, inputs and constraints…"/></label>
+      <div className="prompt-attachments">
+        <span>Reference files <small>Only relevant extracted passages are sent to the model.</small></span>
+        <AttachmentPicker value={attachments} onChange={setAttachments} defaultScope="saved" allowedScopes={['saved', 'knowledge']} compact uploadLabel="Add files"/>
+      </div>
       <div className="prompt-stats"><span>≈ {Math.ceil(prompt.length / 4).toLocaleString()} input tokens</span><span>{prompt.length.toLocaleString()} / 50,000 characters</span></div>
-      <button className="button primary compile-button" disabled={compile.isPending || prompt.trim().length < 20} onClick={() => compile.mutate()}>{compile.isPending ? <LoaderCircle className="spin" size={15}/> : <Sparkles size={15}/>}Generate proposal</button>
+      <button className="button primary compile-button" disabled={compile.isPending || prompt.trim().length < 20 || !attachmentsReady} onClick={() => compile.mutate()}>{compile.isPending ? <LoaderCircle className="spin" size={15}/> : <Sparkles size={15}/>}Generate proposal</button>
       <div className="compiler-boundaries"><span><X size={13}/>No execution</span><span><X size={13}/>No automatic tools</span><span><X size={13}/>No external writes</span></div>
     </section>
     <section ref={proposalReviewRef} className="proposal-panel panel" tabIndex={-1} aria-label="Generated agent proposal review">

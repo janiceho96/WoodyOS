@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { starterSolutions } from '../src/solutions/catalog.js';
-import { containsLikelySecret, parseCompilerOutput } from '../src/solutions/compiler.js';
+import {
+  compatibleCompletionText,
+  compilerValidationFeedback,
+  containsLikelySecret,
+  normalizeCompilerEdgeCondition,
+  parseCompilerOutput,
+} from '../src/solutions/compiler.js';
 import { materializeWorkflowDefinition } from '../src/solutions/installer.js';
 import { parseAgentSolution, solutionValidationErrors } from '../src/solutions/schema.js';
 
@@ -96,6 +102,56 @@ describe('AgentSolution contract', () => {
     expect(solution.agents).toHaveLength(4);
   });
 
+  it('unwraps proposal envelopes and normalizes boolean branch labels', () => {
+    const generated = structuredClone(starterSolutions[2]) as unknown as Record<string, unknown>;
+    generated.name = 'Proposal Envelope System';
+    expect(parseCompilerOutput(JSON.stringify({ proposal: generated }), 'multi')).toMatchObject({
+      name: 'Proposal Envelope System',
+      source: 'generated',
+    });
+    expect(normalizeCompilerEdgeCondition(true)).toBe('true');
+    expect(normalizeCompilerEdgeCondition(false)).toBe('false');
+    expect(normalizeCompilerEdgeCondition('continue')).toBe('continue');
+  });
+
+  it('normalizes invalid generated usage estimates and model sampling limits', () => {
+    const generated = structuredClone(starterSolutions[2]) as unknown as Record<string, any>;
+    generated.estimatedModelCalls = 0;
+    generated.estimatedTokenRange = { minimum: 0, maximum: -1 };
+    generated.agents[0].modelConfig = { temperature: -1, maxTokens: 0, topP: 2 };
+
+    const solution = parseCompilerOutput(JSON.stringify(generated), 'multi');
+    expect(solution.estimatedModelCalls).toBeGreaterThanOrEqual(1);
+    expect(solution.estimatedTokenRange).toEqual({ minimum: 1_000, maximum: 8_000 });
+    expect(solution.agents[0].modelConfig).toEqual({ temperature: 0.2, maxTokens: 4096, topP: 1 });
+  });
+
+  it('uses a compatible provider reasoning channel when final content is empty', () => {
+    const generated = structuredClone(starterSolutions[2]);
+    generated.name = 'Reasoning Channel Research System';
+    const text = compatibleCompletionText({
+      content: '',
+      reasoning_content: `Planning complete.\n${JSON.stringify(generated)}`,
+    });
+
+    expect(parseCompilerOutput(text, 'multi')).toMatchObject({
+      name: 'Reasoning Channel Research System',
+      source: 'generated',
+    });
+  });
+
+  it('returns sanitized schema feedback for the compiler repair pass', () => {
+    const feedback = compilerValidationFeedback({
+      issues: [
+        { path: ['workflow', 'nodes', 2, 'config'], message: 'Required' },
+        { path: ['agents', 0, 'name'], message: 'String must contain at least 2 character(s)' },
+      ],
+    });
+
+    expect(feedback).toContain('workflow.nodes.2.config: Required');
+    expect(feedback).toContain('agents.0.name: String must contain at least 2 character(s)');
+  });
+
   it('enforces requested single-versus-multi compiler mode', () => {
     const generated = { ...structuredClone(starterSolutions[0]), name: 'Wrong Mode' };
     expect(() => parseCompilerOutput(JSON.stringify(generated), 'single')).toThrow('PROMPT_COMPILER_MODE_MISMATCH');
@@ -117,5 +173,37 @@ describe('AgentSolution contract', () => {
       expect(node.config.agentId).toMatch(/^00000000-/);
       expect(node).not.toHaveProperty('agentKey');
     }
+  });
+
+  it('accepts and materializes a bounded generated quality loop', () => {
+    const solution = structuredClone(starterSolutions[0]);
+    const agentNodes = solution.workflow.nodes.filter((node) => node.type === 'agent');
+    const first = agentNodes[0].id;
+    const last = agentNodes.at(-1)!.id;
+    solution.workflow.nodes.splice(1, 0, {
+      id: 'quality_loop',
+      type: 'loop' as never,
+      config: {
+        mode: 'while',
+        condition: { path: `nodes.${last}.data.passed`, operator: 'not_equals', value: true },
+        maxIterations: 4,
+        onLimit: 'exit',
+      },
+    });
+    solution.workflow.nodes.find((node) => node.id === last)!.config.outputContract = 'grader';
+    solution.workflow.edges = [
+      { source: 'trigger', target: 'quality_loop' },
+      { source: 'quality_loop', target: first, condition: 'body' } as never,
+      ...agentNodes.slice(0, -1).map((node, index) => ({ source: node.id, target: agentNodes[index + 1].id })),
+      { source: last, target: 'quality_loop', condition: 'continue' } as never,
+      { source: 'quality_loop', target: 'output', condition: 'done' } as never,
+    ];
+    expect(() => parseAgentSolution(solution)).not.toThrow();
+    const ids = new Map(solution.agents.map((agent, index) => [agent.key, `00000000-0000-4000-8000-00000000000${index}`]));
+    expect(materializeWorkflowDefinition(solution, ids).edges).toContainEqual({
+      source: last,
+      target: 'quality_loop',
+      condition: 'continue',
+    });
   });
 });

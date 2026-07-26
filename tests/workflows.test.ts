@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { workflowDefinitionErrors } from '../src/routes/workflows.js';
 import { evaluateCondition, valueAtPath } from '../src/workflows/definition.js';
 import { loopResult } from '../src/workflows/runtime.js';
-import { publicWorkflowNodeCatalog, workflowNodeConfigErrors } from '../src/workflows/registry.js';
+import { publicWorkflowNodeCatalog, workflowNodeConfigErrors, workflowNodeDefinition } from '../src/workflows/registry.js';
 import { workflowLayoutErrors, workflowLayoutInputSchema } from '../src/workflows/layout.js';
 import { actionArgumentHash, safeActionSummary } from '../src/lib/action-safety.js';
 import { workflowActionNeedsConfirmation } from '../src/policy/action-gateway.js';
+import { resolveNodeInput } from '../src/workflows/adapters/templates.js';
+import { parseAgentOutput } from '../src/workflows/output-contracts.js';
+import { buildQualityLoopDefinition } from '../src/workflows/quality-loop.js';
 
 describe('workflow definition validation', () => {
   it('publishes a sanitized registry backed by installed adapters', () => {
@@ -16,6 +19,14 @@ describe('workflow definition validation', () => {
     expect(catalog.find((entry) => entry.type === 'knowledge_search')).toMatchObject({ available: true, adapter: 'knowledge' });
     expect(catalog.find((entry) => entry.type === 'browser')).toMatchObject({ available: false, adapter: 'browser', risk: 'unknown', availabilityReason: expect.stringContaining('isolated') });
     expect(catalog.every((entry) => !('configSchema' in entry))).toBe(true);
+  });
+
+  it('declares only the inspector sections supported by each node type', () => {
+    expect(workflowNodeDefinition('agent')?.inspectorSections).toEqual(['inputs', 'configuration', 'execution']);
+    expect(workflowNodeDefinition('condition')?.inspectorSections).toEqual(['inputs', 'conditions']);
+    expect(workflowNodeDefinition('trigger')?.inspectorSections).toEqual(['input_collection', 'variables']);
+    expect(workflowNodeDefinition('output')?.inspectorSections).toEqual(['inputs', 'configuration']);
+    expect(workflowNodeDefinition('output')?.inspectorSections).not.toContain('execution');
   });
 
   it('validates registered node configuration', () => {
@@ -64,6 +75,80 @@ describe('workflow definition validation', () => {
     })).toEqual([]);
   });
 
+  it('resolves explicit node input mappings without exposing unrelated workflow state', () => {
+    const state = {
+      input: { topic: 'Loop engineering', privateNote: 'do not forward' },
+      nodes: { research: { text: 'Evidence' } },
+      variables: {},
+    };
+    expect(resolveNodeInput({
+      topic: '{{ input.topic }}',
+      evidence: '{{ nodes.research.text }}',
+      format: 'brief',
+    }, state)).toEqual({
+      topic: 'Loop engineering',
+      evidence: 'Evidence',
+      format: 'brief',
+    });
+    expect(resolveNodeInput(undefined, state)).toBe(state);
+  });
+
+  it('validates trigger input schemas and agent input mappings', () => {
+    const definition = {
+      nodes: [
+        { id: 'start', type: 'trigger' as const, config: { inputSchema: [{ key: 'topic', label: 'Topic', type: 'text', required: true }] } },
+        { id: 'writer', type: 'agent' as const, config: {
+          agentId: '00000000-0000-4000-8000-000000000001',
+          inputMapping: { topic: '{{ input.topic }}' },
+        } },
+        { id: 'finish', type: 'output' as const, config: { fromNodeId: 'writer' } },
+      ],
+      edges: [{ source: 'start', target: 'writer' }, { source: 'writer', target: 'finish' }],
+    };
+    expect(workflowDefinitionErrors(definition)).toEqual([]);
+    expect(workflowDefinitionErrors({
+      ...definition,
+      nodes: definition.nodes.map((node) => node.id === 'start'
+        ? { ...node, config: { inputSchema: [{ key: 'topic', label: 'Topic', type: 'text' }, { key: 'topic', label: 'Duplicate', type: 'text' }] } }
+        : node),
+    })).toEqual(expect.arrayContaining(['Trigger node start inputSchema keys must be unique']));
+  });
+
+  it('parses and validates a structured grader verdict', () => {
+    const text = '{"passed":false,"score":72,"feedback":["Add evidence"],"criteria":[]}';
+    expect(parseAgentOutput(text, 'grader', 0)).toEqual({
+      text,
+      data: { passed: false, score: 72, feedback: ['Add evidence'], criteria: [] },
+      toolCallCount: 0,
+    });
+    expect(() => parseAgentOutput('Needs work', 'grader', 0))
+      .toThrow('Agent grader output did not match its contract');
+  });
+
+  it('builds bounded quality loops for same-worker and dedicated revision strategies', () => {
+    const common = {
+      workerAgentId: '00000000-0000-4000-8000-000000000001',
+      graderAgentId: '00000000-0000-4000-8000-000000000002',
+      maximumRevisions: 3,
+      passingScore: 80,
+      onLimit: 'return_best' as const,
+    };
+    const sameWorker = buildQualityLoopDefinition({ ...common, revisionStrategy: 'same_worker' });
+    expect(workflowDefinitionErrors(sameWorker)).toEqual([]);
+    expect(sameWorker.edges).toContainEqual({ source: 'grader', target: 'quality_loop', condition: 'continue' });
+    expect(sameWorker.nodes.find((node) => node.id === 'quality_loop')?.config.maxIterations).toBe(4);
+
+    const dedicated = buildQualityLoopDefinition({
+      ...common,
+      revisionStrategy: 'dedicated_agent',
+      revisionAgentId: '00000000-0000-4000-8000-000000000003',
+    });
+    expect(workflowDefinitionErrors(dedicated)).toEqual([]);
+    expect(dedicated.nodes.find((node) => node.id === 'has_feedback')?.type).toBe('condition');
+    expect(dedicated.nodes.find((node) => node.id === 'revision_agent')?.config.agentId)
+      .toBe('00000000-0000-4000-8000-000000000003');
+  });
+
   it('rejects duplicate nodes and dangling edges before a run is queued', () => {
     expect(workflowDefinitionErrors({
       nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'start', type: 'output', config: {} }],
@@ -80,7 +165,7 @@ describe('workflow definition validation', () => {
       edges: [{ source: 'start', target: 'finish' }],
     })).toEqual(expect.arrayContaining([
       'Output node finish has an invalid fromNodeId',
-      'Output node finish artifactFormats must contain unique pdf, docx, pptx or xlsx values',
+      'Output node finish artifactFormats must contain unique supported file formats',
     ]));
   });
 
@@ -187,5 +272,39 @@ describe('workflow definition validation', () => {
     whileCursor.loops.while.iteration = 1;
     expect(() => loopResult(whileNode, whileCursor, { keepGoing: true })).toThrow('iteration safety limit');
     expect(loopResult(whileNode, { nodeId: 'while', loops: {}, attempt: 1 }, { keepGoing: false })).toMatchObject({ branch: 'done', output: { reason: 'condition_false' } });
+  });
+
+  it('enforces the quality score and records each completed grading iteration', () => {
+    const node = {
+      id: 'quality_loop',
+      type: 'loop' as const,
+      config: {
+        mode: 'while',
+        condition: { path: 'nodes.grader.data.passed', operator: 'not_equals', value: true },
+        passingScore: 80,
+        maxIterations: 3,
+        onLimit: 'exit',
+        quality: { graderNodeId: 'grader', workerNodeId: 'worker', revisionNodeId: 'revision_agent' },
+      },
+    };
+    const cursor = { nodeId: 'quality_loop', loops: { quality_loop: { iteration: 1 } }, attempt: 1 };
+    const state: Record<string, unknown> = {
+      nodes: {
+        worker: { text: 'First candidate' },
+        grader: { data: { passed: true, score: 72, feedback: ['Add evidence'], criteria: [] } },
+      },
+    };
+    expect(loopResult(node, cursor, state)).toMatchObject({ branch: 'body' });
+    expect(state.qualityHistory).toMatchObject({
+      quality_loop: [{ iteration: 1, candidate: { text: 'First candidate' }, verdict: { score: 72 } }],
+    });
+
+    cursor.loops.quality_loop.iteration = 2;
+    (state.nodes as Record<string, unknown>).revision_agent = { text: 'Revised candidate' };
+    (state.nodes as Record<string, { data?: Record<string, unknown> }>).grader.data = { passed: true, score: 91, feedback: [], criteria: [] };
+    expect(loopResult(node, cursor, state)).toMatchObject({
+      branch: 'done',
+      output: { reason: 'quality_passed', candidate: { text: 'Revised candidate' }, verdict: { score: 91 } },
+    });
   });
 });

@@ -22,6 +22,45 @@ export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Re
     cursor.loops[node.id] = loop;
     return { branch: 'body', output: { iteration: loop.iteration, item: collection[loop.iteration] } };
   }
+  const quality = node.config.quality && typeof node.config.quality === 'object' && !Array.isArray(node.config.quality)
+    ? node.config.quality as Record<string, unknown>
+    : null;
+  if (quality) {
+    const nodes = state.nodes && typeof state.nodes === 'object' && !Array.isArray(state.nodes)
+      ? state.nodes as Record<string, unknown>
+      : {};
+    const graderNodeId = String(quality.graderNodeId ?? 'grader');
+    const workerNodeId = String(quality.workerNodeId ?? 'worker');
+    const revisionNodeId = String(quality.revisionNodeId ?? workerNodeId);
+    const grader = nodes[graderNodeId] && typeof nodes[graderNodeId] === 'object' && !Array.isArray(nodes[graderNodeId])
+      ? nodes[graderNodeId] as Record<string, unknown>
+      : {};
+    const verdict = grader.data && typeof grader.data === 'object' && !Array.isArray(grader.data)
+      ? grader.data as Record<string, unknown>
+      : null;
+    const historyRoot = state.qualityHistory && typeof state.qualityHistory === 'object' && !Array.isArray(state.qualityHistory)
+      ? state.qualityHistory as Record<string, unknown>
+      : {};
+    const history = Array.isArray(historyRoot[node.id]) ? historyRoot[node.id] as Array<Record<string, unknown>> : [];
+    if (loop.iteration > 0 && verdict && !history.some((entry) => entry.iteration === loop.iteration)) {
+      const candidateNodeId = loop.iteration === 1 ? workerNodeId : revisionNodeId;
+      history.push({ iteration: loop.iteration, candidate: nodes[candidateNodeId] ?? null, verdict, revisionAgentNodeId: candidateNodeId });
+      historyRoot[node.id] = history;
+      state.qualityHistory = historyRoot;
+    }
+    if (verdict) {
+      const passingScore = Number(node.config.passingScore ?? 0);
+      const passed = verdict.passed === true && typeof verdict.score === 'number' && verdict.score >= passingScore;
+      const latest = history.at(-1);
+      if (passed) return { branch: 'done', output: { iterations: loop.iteration, reason: 'quality_passed', candidate: latest?.candidate ?? null, verdict, history } };
+      if (loop.iteration >= maxIterations) {
+        if (onLimit === 'exit') return { branch: 'done', output: { iterations: loop.iteration, reason: 'limit_exit', candidate: latest?.candidate ?? null, verdict, history, warning: 'Quality threshold was not reached before the revision limit.' } };
+        throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
+      }
+      cursor.loops[node.id] = loop;
+      return { branch: 'body', output: { iteration: loop.iteration, condition: true, verdict } };
+    }
+  }
   const condition = node.config.condition;
   if (!condition || typeof condition !== 'object' || Array.isArray(condition)) throw new Error(`Loop ${node.id} has no valid while condition`);
   const shouldContinue = evaluateCondition(condition as Record<string, unknown>, state);
@@ -64,4 +103,3 @@ export async function executeLogicNode(context: WorkflowAdapterContext) {
   setNodeOutput(output);
   return { output, result: output };
 }
-

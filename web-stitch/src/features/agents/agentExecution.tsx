@@ -37,7 +37,7 @@ export type AgentExecutionView = {
   workflowRun?: WorkflowRun;
   steps: ExecutionStep[];
   events: UnifiedActivityEvent[];
-  status: Task['status'] | 'idle';
+  status: Task['status'] | 'ready';
   currentStepId?: string;
   completedSteps: number;
   progressPercent: number | null;
@@ -168,7 +168,7 @@ function buildExecution(agent: Agent, agents: Agent[], tasks: Task[], task: Task
     workflowRun,
     steps,
     events,
-    status: task?.status ?? 'idle',
+    status: task?.status ?? 'ready',
     currentStepId: currentStep?.id,
     completedSteps,
     progressPercent: steps.length ? Math.round((completedSteps / steps.length) * 100) : null,

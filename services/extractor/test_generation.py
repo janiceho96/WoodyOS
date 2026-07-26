@@ -9,7 +9,19 @@ from PIL import Image
 from pypdf import PdfReader
 from pptx import Presentation
 
-from main import generate_docx, generate_pdf, generate_pptx, generate_xlsx, markdown_blocks, normalize_avatar
+from main import (
+    extract_pdf_document,
+    extract_pptx_document,
+    extract_spreadsheet_document,
+    generate_docx,
+    generate_html,
+    generate_pdf,
+    generate_pptx,
+    generate_xlsx,
+    generate_csv,
+    markdown_blocks,
+    normalize_avatar,
+)
 
 
 SAMPLE = """# Quarterly Review
@@ -56,6 +68,41 @@ class ArtifactGenerationTests(unittest.TestCase):
         cell = workbook["Table 1"]["A2"]
         self.assertEqual(cell.data_type, "s")
         self.assertTrue(cell.value.startswith("'="))
+
+    def test_generated_html_is_static_sandbox_friendly_and_escapes_markup(self):
+        html = generate_html("Safe <Report>", markdown_blocks("# Result\n\n<script>alert('no')</script>")).decode("utf-8")
+        self.assertIn("Content-Security-Policy", html)
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<form", html)
+
+    def test_generated_html_applies_only_validated_theme_tokens(self):
+        html = generate_html("Theme", markdown_blocks("# Result"), {
+            "background": "#112233",
+            "accent": "#00FFAA",
+            "headingFont": "serif",
+            "bodyFont": "mono",
+            "density": "compact",
+        }).decode("utf-8")
+        self.assertIn("--bg:#112233", html)
+        self.assertIn("--accent:#00FFAA", html)
+        self.assertIn('Georgia,"Times New Roman",serif', html)
+        self.assertNotIn("<script", html)
+
+    def test_csv_neutralizes_formula_injection(self):
+        value = generate_csv(markdown_blocks("| Input |\n|---|\n| =2+2 |")).decode("utf-8-sig")
+        self.assertIn("'=2+2", value)
+
+    def test_extraction_preserves_pdf_slide_and_sheet_locations(self):
+        pdf = extract_pdf_document(generate_pdf("Report", markdown_blocks("# Finding\n\nVerified evidence.")))
+        self.assertTrue(pdf["sections"][0]["locator"].startswith("Page "))
+
+        pptx = extract_pptx_document(generate_pptx("Deck", markdown_blocks("# Finding\n\nVerified evidence.")))
+        self.assertTrue(pptx["sections"][0]["locator"].startswith("Slide "))
+
+        xlsx = extract_spreadsheet_document(generate_xlsx("Data", markdown_blocks("| Name | Value |\n|---|---|\n| A | 1 |")))
+        self.assertTrue(xlsx["sections"][0]["locator"].startswith("Sheet "))
+        self.assertIn("rows", xlsx["structured"]["sheets"][0])
 
     def test_avatar_is_cropped_and_normalized_to_webp(self):
         source = io.BytesIO()

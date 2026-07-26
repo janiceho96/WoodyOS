@@ -1,14 +1,18 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, AlertTriangle, ArrowUpRight, CalendarDays, CheckCircle2, CircleAlert, Download, Eye, FileArchive, FileSpreadsheet, FileText, LoaderCircle, Play, Presentation, RefreshCw, Search, Square, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, type Artifact, type ArtifactFormat, type Task, type TaskDetail } from '../../api';
+import { api, artifactFormats, type Artifact, type ArtifactFormat, type FileAsset, type Task, type TaskDetail } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { OutputViewer } from '../../components/OutputViewer';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
 import { compact, duration, relative, taskCost } from '../../lib/format';
-import { failureGuidance } from '../../lib/recovery';
+import { failureGuidance, outputText } from '../../lib/recovery';
 import { AgentAvatar } from '../../components/agents/AgentAvatar';
+import { AttachmentPicker } from '../../components/files/AttachmentPicker';
+import { HtmlArtifactPreview } from '../../components/files/HtmlArtifactPreview';
+import { OutputFormatPicker } from '../../components/files/OutputFormatPicker';
+import { EditableOutput } from '../../components/outputs/EditableOutput';
 
 const taskAgent = (task: Task) => ({ id: task.agent_id, name: task.agent_name ?? 'AI Agent', role: task.agent_role ?? 'AI agent', avatar_config: task.agent_avatar ?? {}, updated_at: task.updated_at });
 
@@ -29,6 +33,22 @@ function outputSummary(task: Task) {
   if (task.status === 'running') return { state: 'Generating output', action: 'View progress', tone: 'active' };
   if (task.status === 'queued') return { state: 'Waiting to start', action: 'View progress', tone: 'active' };
   return { state: 'Run cancelled', action: 'View details', tone: 'muted' };
+}
+
+function outputPreview(value: unknown) {
+  const text = outputText(value);
+  let preview = '';
+  if (text) preview = text;
+  if (value === null || value === undefined) return '';
+  if (!preview) {
+    try {
+      preview = JSON.stringify(value);
+    } catch {
+      preview = 'Saved structured result';
+    }
+  }
+  const normalized = preview.replace(/\s+/g, ' ').trim();
+  return normalized.length > 280 ? `${normalized.slice(0, 277)}…` : normalized;
 }
 
 export function ExecutionPage({ openTask }: { openTask: () => void }) {
@@ -66,9 +86,21 @@ export function ExecutionPage({ openTask }: { openTask: () => void }) {
           const formats = [...new Set((task.artifact_summary ?? []).filter((artifact) => artifact.status !== 'skipped').map((artifact) => artifact.format))];
           const origin = task.workflow_name ? `${task.workflow_name} · ${task.agent_name ?? 'AI Agent'}` : task.agent_name ?? 'AI Agent';
           const timing = task.completed_at ? `Completed ${relative(task.completed_at)}` : task.started_at ? `Started ${relative(task.started_at)}` : `Created ${relative(task.created_at)}`;
+          const agent = data.agents.find((item) => item.id === task.agent_id);
+          const agentDescription = agent?.goal?.trim() || task.agent_role?.trim() || 'General AI agent';
+          const preview = outputPreview(task.output);
           return <button className={taskId === task.id ? 'active' : ''} key={task.id} aria-label={`${summary.action}: ${task.title}`} onClick={() => navigate(`/agents/${task.agent_id}?section=workspace&task=${task.id}`)}>
             <AgentAvatar agent={taskAgent(task)} size="sm" status={task.status === 'failed' ? 'error' : task.status === 'running' ? 'busy' : undefined} decorative/>
-            <span className="run-card-copy"><span><strong title={task.title}>{task.title}</strong><Status value={task.status}/></span><small>{origin} · {timing}</small><span className="run-card-outcome"><em className={`run-output-state ${summary.tone}`}>{summary.state}</em>{formats.length > 0 && <span className="run-format-list" aria-label={`Requested files: ${formats.join(', ')}`}>{formats.map((format) => <i key={format}>{format.toUpperCase()}</i>)}</span>}</span></span>
+            <span className="run-card-copy">
+              <span><strong title={task.title}>{task.title}</strong><Status value={task.status}/></span>
+              <small>{origin} · {timing}</small>
+              <span className="run-agent-description" title={agentDescription}>{agentDescription}</span>
+              <span className="run-output-preview">
+                <span><b>Output</b><em className={`run-output-state ${summary.tone}`}>{summary.state}</em></span>
+                <span title={preview || summary.state}>{preview || summary.state}</span>
+              </span>
+              {formats.length > 0 && <span className="run-format-list" aria-label={`Requested files: ${formats.join(', ')}`}>{formats.map((format) => <i key={format}>{format.toUpperCase()}</i>)}</span>}
+            </span>
             <span className="run-card-result"><small>{cost.available ? cost.label : 'Pricing unavailable'}</small><b>{summary.action}<ArrowUpRight size={13}/></b></span>
           </button>;
         })}</div> : <EmptyState Icon={Activity} title="No outputs found" text={data.tasks.length ? 'No agent work matches these filters.' : 'Run a task to create the first output.'} action={!data.tasks.length && <button className="button primary" onClick={openTask}>Run task</button>}/>}
@@ -106,7 +138,9 @@ export function ExecutionDetail({ task, refresh }: { task: TaskDetail; refresh: 
     <div className="execution-stats"><span><small>Duration</small><strong>{task.duration_ms ? duration(task.duration_ms) : '—'}</strong></span><span><small>Input tokens</small><strong>{compact(task.token_input ?? 0)}</strong></span><span><small>Output tokens</small><strong>{compact(task.token_output ?? 0)}</strong></span><span><small>Cost</small><strong>{cost.label}</strong></span></div>
     {task.input && Object.keys(task.input).length > 0 && <section className="run-input-section"><div className="section-title"><div><span className="eyebrow">Request</span><h3>Input provided</h3></div></div><OutputViewer value={task.input}/></section>}
     <div className="trace-timeline"><h3>Event timeline</h3>{task.events.length ? task.events.map((event) => <div key={event.id}><i/><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><p>{event.message}</p>{event.payload && Object.keys(event.payload).length > 0 && <details className="event-data"><summary>Technical event data</summary><code>{JSON.stringify(event.payload)}</code></details>}</span></div>) : <p>No events recorded yet.</p>}</div>
-    {(task.output !== null && task.output !== undefined) && <section className="output-section"><h3>Agent result</h3><OutputViewer value={task.output}/></section>}
+    {(task.output !== null && task.output !== undefined) && (task.status === 'completed'
+      ? <EditableOutput task={task} refreshTask={refresh}/>
+      : <section className="output-section"><h3>Agent result</h3><OutputViewer value={task.output}/></section>)}
     <ArtifactPanel task={task} refresh={refresh}/>
     {(task.error !== null && task.error !== undefined) && <section className="output-section error"><h3>Execution error</h3><OutputViewer value={task.error} error/></section>}
     {task.status === 'completed' && (task.output === null || task.output === undefined) && <section className="output-section"><h3>Agent result</h3><p>This task completed without an output payload.</p></section>}
@@ -129,12 +163,20 @@ export function TaskDialogBody({ close, agentId, onCreated, submitLabel = 'Queue
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not queue task'),
   });
   const agents = data.agents.filter((agent) => agent.status === 'active' && (!agentId || agent.id === agentId));
+  const [attachments, setAttachments] = useState<FileAsset[]>([]);
+  const [artifactFormats, setArtifactFormats] = useState<ArtifactFormat[]>([]);
+  const attachmentsReady = attachments.every((file) => file.status === 'ready');
   const send = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    const artifactFormats = (['pdf', 'docx', 'pptx', 'xlsx'] as ArtifactFormat[]).filter((format) => form.get(`artifact-${format}`) === 'on');
-    mutation.mutate({ agentId: String(form.get('agentId')), title: String(form.get('title')), input: { request: String(form.get('request')) }, artifactFormats });
+    mutation.mutate({
+      agentId: String(form.get('agentId')),
+      title: String(form.get('title')),
+      input: { request: String(form.get('request')) },
+      artifactFormats,
+      attachmentIds: attachments.map((file) => file.id),
+    });
   };
-  return <form className="form-grid" onSubmit={send}>{agentId ? <input type="hidden" name="agentId" value={agentId}/> : <label>Active agent<select name="agentId" required defaultValue=""><option value="">Choose an agent</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} — {agent.role}</option>)}</select></label>}<label>Task title<input name="title" required minLength={2} maxLength={300} placeholder="Research current market"/></label><label>Desired outcome<textarea name="request" required placeholder="Describe exactly what the agent should deliver."/></label><fieldset className="artifact-format-picker"><legend>Downloadable output <small>Optional</small></legend><p>Woody keeps the Markdown result and generates selected files after the task completes.</p><div>{(['pdf', 'docx', 'pptx', 'xlsx'] as ArtifactFormat[]).map((format) => <label key={format}><input type="checkbox" name={`artifact-${format}`}/><span>{artifactIcon(format)}<strong>{format.toUpperCase()}</strong></span></label>)}</div></fieldset>{!agents.length && <div className="inline-error"><AlertTriangle size={15}/>This agent must be published and active before it can run tasks.</div>}<div className="form-actions"><button className="button" type="button" onClick={close}>Cancel</button><button className="button primary" disabled={!agents.length || mutation.isPending}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Play size={15}/>} {submitLabel}</button></div></form>;
+  return <form className="form-grid" onSubmit={send}>{agentId ? <input type="hidden" name="agentId" value={agentId}/> : <label>Active agent<select name="agentId" required defaultValue=""><option value="">Choose an agent</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} — {agent.role}</option>)}</select></label>}<label>Task title<input name="title" required minLength={2} maxLength={300} placeholder="Research current market"/></label><label>Desired outcome<textarea name="request" required placeholder="Describe exactly what the agent should deliver. Mention which attachment to use when several are selected."/></label><AttachmentPicker value={attachments} onChange={setAttachments}/><OutputFormatPicker value={artifactFormats} onChange={setArtifactFormats}/>{!agents.length && <div className="inline-error"><AlertTriangle size={15}/>This agent must be published and active before it can run tasks.</div>}{!attachmentsReady && <div className="security-note"><LoaderCircle className="spin" size={15}/>Wait for every attachment to finish scanning and extraction before starting.</div>}<div className="form-actions"><button className="button" type="button" onClick={close}>Cancel</button><button className="button primary" disabled={!agents.length || !attachmentsReady || mutation.isPending}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Play size={15}/>} {submitLabel}</button></div></form>;
 }
 
 function artifactIcon(format: ArtifactFormat) {
@@ -152,13 +194,33 @@ function bytes(value: string | number | null | undefined) {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function artifactRevisionLabel(artifact: Artifact, currentVersionId?: string) {
+  if (!artifact.output_document_version_id) return 'Original agent output';
+  return artifact.output_document_version_id === currentVersionId ? 'Current revision' : 'Older revision';
+}
+
 export function ArtifactPanel({ task, refresh }: { task: TaskDetail; refresh: () => void }) {
   const { session, report, reportError } = useWorkspace();
   const canDelete = !session.workspace.role || ['owner', 'admin'].includes(session.workspace.role);
   const [formats, setFormats] = useState<ArtifactFormat[]>([]);
+  const [htmlPreview, setHtmlPreview] = useState<{ title: string; html: string } | null>(null);
+  const [openingArtifactId, setOpeningArtifactId] = useState<string | null>(null);
+  const outputDocumentQuery = useQuery({
+    queryKey: ['output-document', task.id],
+    queryFn: () => api.outputDocumentForTask(task.id),
+    enabled: task.status === 'completed',
+  });
+  const outputDocument = outputDocumentQuery.data?.document ?? null;
+  const currentVersionId = outputDocument?.currentVersion.id;
   const requestFiles = useMutation({
-    mutationFn: () => api.requestArtifacts({ taskId: task.id, formats }),
-    onSuccess: async () => { report('Artifact generation requested'); setFormats([]); refresh(); },
+    mutationFn: () => outputDocument
+      ? api.requestOutputArtifacts(outputDocument.id, { versionId: outputDocument.currentVersion.id, formats })
+      : api.requestArtifacts({ taskId: task.id, formats }),
+    onSuccess: async () => {
+      report(outputDocument ? `File generation requested from version ${outputDocument.current_version_number}` : 'Artifact generation requested');
+      setFormats([]);
+      refresh();
+    },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not request artifacts'),
   });
   const remove = useMutation({
@@ -167,9 +229,15 @@ export function ArtifactPanel({ task, refresh }: { task: TaskDetail; refresh: ()
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not delete artifact'),
   });
   const openArtifact = async (artifact: Artifact, inline: boolean) => {
-    const pendingTab = inline ? window.open('', '_blank', 'noopener,noreferrer') : null;
+    const sandboxHtml = inline && artifact.format === 'html';
+    const pendingTab = inline && !sandboxHtml ? window.open('', '_blank', 'noopener,noreferrer') : null;
+    setOpeningArtifactId(artifact.id);
     try {
       const file = await api.artifactFile(artifact.id, inline);
+      if (sandboxHtml) {
+        setHtmlPreview({ title: file.filename, html: await file.blob.text() });
+        return;
+      }
       const url = URL.createObjectURL(file.blob);
       if (inline && pendingTab) pendingTab.location.href = url;
       else {
@@ -179,10 +247,17 @@ export function ArtifactPanel({ task, refresh }: { task: TaskDetail; refresh: ()
     } catch (cause) {
       pendingTab?.close();
       reportError(cause instanceof Error ? cause.message : 'Could not open artifact');
+    } finally {
+      setOpeningArtifactId(null);
     }
   };
-  const existing = new Set((task.artifacts ?? []).filter((artifact) => artifact.status !== 'failed').map((artifact) => artifact.format));
-  const available = (['pdf', 'docx', 'pptx', 'xlsx'] as ArtifactFormat[]).filter((format) => !existing.has(format));
+  const existing = new Set((task.artifacts ?? [])
+    .filter((artifact) => artifact.status !== 'failed')
+    .filter((artifact) => outputDocument
+      ? artifact.output_document_version_id === currentVersionId
+      : !artifact.output_document_version_id)
+    .map((artifact) => artifact.format));
+  const available = artifactFormats.filter((format) => !existing.has(format));
   if (!task.artifacts?.length && task.status !== 'completed') return null;
-  return <section className="artifact-section"><div className="section-title"><div><h3>Downloadable files</h3><small>Generated from the recorded agent result</small></div><button className="icon-button" onClick={refresh} aria-label="Refresh artifacts"><RefreshCw size={14}/></button></div>{task.artifacts?.length ? <div className="artifact-list">{task.artifacts.map((artifact) => <article key={artifact.id}><span className={`artifact-icon ${artifact.format}`}>{artifactIcon(artifact.format)}</span><span><strong>{artifact.filename}</strong><small>{artifact.format.toUpperCase()} · {artifact.status === 'ready' ? bytes(artifact.size_bytes) : artifact.status.replaceAll('_', ' ')}</small>{artifact.error_message && <em>{artifact.error_message}</em>}</span><Status value={artifact.status}/>{artifact.status === 'ready' && artifact.format === 'pdf' && <button className="icon-button" aria-label={`Preview ${artifact.filename}`} onClick={() => void openArtifact(artifact, true)}><Eye size={15}/></button>}{artifact.status === 'ready' && <button className="icon-button" aria-label={`Download ${artifact.filename}`} onClick={() => void openArtifact(artifact, false)}><Download size={15}/></button>}{canDelete && <button className="icon-button danger" aria-label={`Delete ${artifact.filename}`} disabled={remove.isPending} onClick={() => remove.mutate(artifact.id)}><Trash2 size={14}/></button>}</article>)}</div> : <p className="artifact-empty">No downloadable files were requested for this task.</p>}{task.status === 'completed' && available.length > 0 && <div className="artifact-request"><span>{available.map((format) => <label key={format}><input type="checkbox" checked={formats.includes(format)} onChange={(event) => setFormats((current) => event.target.checked ? [...current, format] : current.filter((item) => item !== format))}/>{format.toUpperCase()}</label>)}</span><button className="button" disabled={!formats.length || requestFiles.isPending} onClick={() => requestFiles.mutate()}>{requestFiles.isPending ? <LoaderCircle className="spin" size={14}/> : <Download size={14}/>}Generate selected</button></div>}</section>;
+  return <section className="artifact-section"><div className="section-title"><div><h3>Downloadable files</h3><small>{outputDocument ? `New files use saved version ${outputDocument.current_version_number}. Older files remain available below.` : "HTML files open in Woody's safe viewer. Other formats preview or download normally."}</small></div><button className="icon-button" onClick={refresh} aria-label="Refresh artifacts"><RefreshCw size={14}/></button></div>{outputDocumentQuery.error && <div className="inline-error"><AlertTriangle size={15}/><span>Woody could not verify which output version these files use.</span></div>}{task.artifacts?.length ? <div className="artifact-list">{task.artifacts.map((artifact) => <article key={artifact.id}><span className={`artifact-icon ${artifact.format}`}>{artifactIcon(artifact.format)}</span><span><strong>{artifact.filename}</strong><small>{artifact.format.toUpperCase()} · {artifact.status === 'ready' ? bytes(artifact.size_bytes) : artifact.status.replaceAll('_', ' ')}</small><small className={`artifact-revision ${artifact.output_document_version_id === currentVersionId ? 'current' : ''}`}>{artifactRevisionLabel(artifact, currentVersionId)}</small>{artifact.error_message && <em>{artifact.error_message}</em>}</span><Status value={artifact.status}/>{artifact.status === 'ready' && artifact.format === 'html' && <button className="button artifact-view-button" aria-label={`View HTML ${artifact.filename}`} disabled={openingArtifactId === artifact.id} onClick={() => void openArtifact(artifact, true)}>{openingArtifactId === artifact.id ? <LoaderCircle className="spin" size={14}/> : <Eye size={14}/>}View HTML</button>}{artifact.status === 'ready' && artifact.format === 'pdf' && <button className="icon-button" aria-label={`Preview ${artifact.filename}`} disabled={openingArtifactId === artifact.id} onClick={() => void openArtifact(artifact, true)}><Eye size={15}/></button>}{artifact.status === 'ready' && <button className="icon-button" aria-label={`Download ${artifact.filename}`} disabled={openingArtifactId === artifact.id} onClick={() => void openArtifact(artifact, false)}><Download size={15}/></button>}{canDelete && <button className="icon-button danger" aria-label={`Delete ${artifact.filename}`} disabled={remove.isPending} onClick={() => remove.mutate(artifact.id)}><Trash2 size={14}/></button>}</article>)}</div> : <p className="artifact-empty">No downloadable files were requested for this task.</p>}{task.status === 'completed' && available.length > 0 && <div className="artifact-request"><span>{available.map((format) => <label key={format}><input type="checkbox" checked={formats.includes(format)} onChange={(event) => setFormats((current) => event.target.checked ? [...current, format] : current.filter((item) => item !== format))}/>{format.toUpperCase()}</label>)}</span><button className="button" disabled={!formats.length || requestFiles.isPending || outputDocumentQuery.isLoading || Boolean(outputDocumentQuery.error)} onClick={() => requestFiles.mutate()}>{requestFiles.isPending ? <LoaderCircle className="spin" size={14}/> : <Download size={14}/>} {outputDocument ? 'Regenerate selected' : 'Generate selected'}</button></div>}{htmlPreview && <HtmlArtifactPreview title={htmlPreview.title} html={htmlPreview.html} close={() => setHtmlPreview(null)}/>}</section>;
 }

@@ -7,12 +7,14 @@ services:
       REDIS_URL: redis://redis:6379
       EXTRACTOR_URL: http://extractor:8000
       ARTIFACT_STORAGE_DIR: /data/artifacts
+      FILE_STORAGE_DIR: /data/files
       AGENT_AVATAR_STORAGE_DIR: /data/agent-avatars
       MCP_OAUTH_CALLBACK_URL: ${MCP_OAUTH_CALLBACK_URL:-http://localhost:3002/v1/mcp/oauth/callback}
       MCP_APP_URL: ${MCP_APP_URL:-http://localhost:3002}
     ports: ["3001:3001"]
     volumes:
       - artifact_data:/data/artifacts
+      - file_data:/data/files
       - agent_avatar_data:/data/agent-avatars
     depends_on:
       migrate: { condition: service_completed_successfully }
@@ -28,6 +30,7 @@ services:
       REDIS_URL: redis://redis:6379
       EXTRACTOR_URL: http://extractor:8000
       ARTIFACT_STORAGE_DIR: /data/artifacts
+      FILE_STORAGE_DIR: /data/files
       MCP_OAUTH_CALLBACK_URL: ${MCP_OAUTH_CALLBACK_URL:-http://localhost:3002/v1/mcp/oauth/callback}
       MCP_APP_URL: ${MCP_APP_URL:-http://localhost:3002}
     depends_on:
@@ -35,7 +38,9 @@ services:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
       extractor: { condition: service_healthy }
-    volumes: ["artifact_data:/data/artifacts"]
+    volumes:
+      - artifact_data:/data/artifacts
+      - file_data:/data/files
   migrate:
     build: .
     command: ["node", "dist/db/migrate.js"]
@@ -86,4 +91,5 @@ services:
 volumes:
   postgres_data:
   artifact_data:
+  file_data:
   agent_avatar_data:

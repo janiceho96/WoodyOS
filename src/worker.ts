@@ -5,7 +5,7 @@ import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { lookup } from 'node:dns/promises';
 import { query } from './db/client.js';
-import { ARTIFACT_QUEUE, TASK_QUEUE, WORKFLOW_QUEUE, KNOWLEDGE_QUEUE, enqueueWorkflowRun } from './queue/task-queue.js';
+import { ARTIFACT_QUEUE, TASK_QUEUE, WORKFLOW_QUEUE, KNOWLEDGE_QUEUE, FILE_QUEUE, enqueueWorkflowRun } from './queue/task-queue.js';
 import { definitionFor, invokeTool, toolRiskLevel, type ToolRecord } from './tools/runtime.js';
 import { embeddingFor } from './lib/embeddings.js';
 import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from './lib/ai-provider.js';
@@ -27,6 +27,9 @@ import { generateArtifact, releaseTaskArtifacts } from './artifacts/service.js';
 import { executeWorkflowStep } from './workflows/runtime.js';
 import { authorizeAction, beginAction, completeAction, failAction } from './policy/action-gateway.js';
 import { limitedActionResult, safeActionSummary } from './lib/action-safety.js';
+import { processFile, purgeExpiredFiles } from './files/service.js';
+import { retrieveTaskAttachmentContext } from './files/context.js';
+import { outputContractFromTaskInput, outputContractInstruction, parseAgentOutput } from './workflows/output-contracts.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
 type Agent = {
@@ -185,17 +188,26 @@ export async function executeAgentTask(taskId: string) {
     let finalText = checkpoint?.state.finalText ?? '';
     let toolCallCount = checkpoint?.state.toolCallCount ?? 0;
     const requestText = `${task.title}\n${JSON.stringify(task.input)}`;
-    const [knowledge, requestedArtifacts] = await Promise.all([
+    const [knowledge, attachments, requestedArtifacts] = await Promise.all([
       runtimePolicy.knowledgeEnabled ? retrieveAgentKnowledge(task.workspace_id, requestText) : Promise.resolve(''),
+      retrieveTaskAttachmentContext(task.id, requestText),
       query<{ format: string }>('SELECT format FROM artifacts WHERE task_id=$1 OR ($2::uuid IS NOT NULL AND workflow_run_id=$2) ORDER BY format', [task.id, task.workflow_run_id]),
     ]);
     const artifactInstruction = requestedArtifacts.rows.length
       ? `The server will convert your canonical Markdown result into: ${requestedArtifacts.rows.map((item) => item.format.toUpperCase()).join(', ')}. Do not emit base64 or pretend to create files. Use clear headings and concise sections; use Markdown tables for spreadsheet-ready data and slide-sized sections for presentation-ready content.`
       : '';
+    const outputContract = outputContractFromTaskInput(task.input);
+    if (attachments.citations.length) {
+      await taskEvent(task.workspace_id, task.id, 'attachments.retrieved', `${attachments.citations.length} relevant attachment passage${attachments.citations.length === 1 ? '' : 's'} selected`, {
+        citations: attachments.citations.map(({ content: _content, ...citation }) => citation),
+      });
+    }
     const system = checkpoint?.state.system ?? [
       `You are ${agent.name}, ${agent.role}. Your goal: ${agent.goal}.`,
       agent.instructions,
+      outputContractInstruction(outputContract),
       artifactInstruction,
+      attachments.text,
       knowledge ? `Use the following workspace knowledge when it is relevant. Do not invent facts beyond it:\n\n${knowledge}` : '',
     ].filter(Boolean).join('\n\n');
     if (anthropic) {
@@ -348,6 +360,7 @@ export async function executeAgentTask(taskId: string) {
           messages,
           tools: toolDefinitions.length ? toolDefinitions : undefined,
           parallel_tool_calls: toolDefinitions.length ? false : undefined,
+          response_format: outputContract === 'grader' ? { type: 'json_object' } : undefined,
         }).withResponse();
         const response = result.data;
         await recordAiUsage({
@@ -437,7 +450,7 @@ export async function executeAgentTask(taskId: string) {
     }
     const text = finalText.trim();
     const durationMs = Date.now() - started;
-    const output = { text, toolCallCount };
+    const output = parseAgentOutput(text, outputContract, toolCallCount);
     const estimatedCostUsd = await estimatedWorkspaceAiCost(task.workspace_id, agent.model, inputTokens, outputTokens);
     await query("UPDATE tasks SET status='completed',output=$1,token_input=$2,token_output=$3,estimated_cost_usd=$4,duration_ms=$5,completed_at=now(),updated_at=now() WHERE id=$6", [JSON.stringify(output), inputTokens, outputTokens, estimatedCostUsd, durationMs, task.id]);
     await query('DELETE FROM task_runtime_checkpoints WHERE task_id=$1', [task.id]);
@@ -474,6 +487,10 @@ new Worker<{ artifactId: string }>(ARTIFACT_QUEUE, async (job) => {
   await generateArtifact(job.data.artifactId);
 }, { connection, concurrency: 2 });
 
+new Worker<{ fileId: string }>(FILE_QUEUE, async (job) => {
+  await processFile(job.data.fileId);
+}, { connection, concurrency: 2 });
+
 new Worker<{ documentId: string }>(KNOWLEDGE_QUEUE, async (job) => {
   const document = (await query<{ id: string; workspace_id: string; source_type: string; source_uri: string | null; content: string | null }>("SELECT id,workspace_id,source_type,source_uri,content FROM knowledge_documents WHERE id=$1 AND status='queued'", [job.data.documentId])).rows[0];
   if (!document) return;
@@ -506,4 +523,6 @@ new Worker<{ documentId: string }>(KNOWLEDGE_QUEUE, async (job) => {
 new Worker<{ workflowRunId: string }>(WORKFLOW_QUEUE, (job) => executeWorkflowStep(job.data.workflowRunId, executeAgentTask), { connection, concurrency: 2 });
 
 startMcpMaintenance();
-console.log('Woody task, workflow, artifact, knowledge, and MCP maintenance workers started');
+const fileCleanup = setInterval(() => { void purgeExpiredFiles(); }, 60 * 60 * 1_000);
+fileCleanup.unref();
+console.log('Woody task, workflow, file, artifact, knowledge, and MCP maintenance workers started');

@@ -13,12 +13,16 @@ describe('artifact requests and storage', () => {
     expect(inferredArtifactFormats('Deliver the final report as PDF, PowerPoint and Excel.')).toEqual(['pdf', 'pptx', 'xlsx']);
     expect(inferredArtifactFormats('Read the attached PDF and summarize it.')).toEqual([]);
     expect(inferredArtifactFormats('Create a Word document for the client.')).toEqual(['docx']);
+    expect(inferredArtifactFormats('Deliver this as a safe HTML web page and Markdown file.')).toEqual(['html', 'md']);
+    expect(inferredArtifactFormats('Return the table as CSV and machine-readable JSON.')).toEqual(['csv', 'json']);
   });
 
   it('normalizes filenames and output text', () => {
     expect(artifactTitle('Quarterly / Review?', 'pdf')).toBe('Quarterly-Review.pdf');
     expect(outputText({ text: '# Result' })).toBe('# Result');
+    expect(outputText({ content: '# Content result' })).toBe('# Content result');
     expect(outputText({ value: 4 })).toContain('"value": 4');
+    expect(artifactTitle('Safe preview', 'html')).toBe('Safe-preview.html');
   });
 
   it('writes atomically under a workspace-scoped safe key', async () => {

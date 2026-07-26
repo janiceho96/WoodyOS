@@ -12,7 +12,8 @@ const taskInput = z.object({
   agentId: z.string().uuid(),
   title: z.string().min(2).max(300),
   input: z.record(z.unknown()).default({}),
-  artifactFormats: z.array(artifactFormatSchema).max(4).default([]),
+  artifactFormats: z.array(artifactFormatSchema).max(9).default([]),
+  attachmentIds: z.array(z.string().uuid()).max(10).default([]),
 });
 const feedbackInput = z.object({ rating: z.number().int().min(1).max(5), comment: z.string().max(4000).optional() });
 
@@ -27,7 +28,8 @@ export async function taskRoutes(app: FastifyInstance) {
           )
           FROM artifacts artifact
           WHERE artifact.task_id=t.id
-        ),'[]'::jsonb) artifact_summary
+        ),'[]'::jsonb) artifact_summary,
+        (SELECT count(*)::integer FROM task_attachments attachment WHERE attachment.task_id=t.id) attachment_count
        FROM tasks t
        JOIN agents a ON a.id=t.agent_id
        LEFT JOIN workflow_runs workflow_run ON workflow_run.id=t.workflow_run_id
@@ -44,8 +46,28 @@ export async function taskRoutes(app: FastifyInstance) {
     const agent = await query('SELECT id,status FROM agents WHERE id=$1 AND workspace_id=$2', [input.agentId, request.user.workspaceId]);
     if (!agent.rowCount) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
     if (agent.rows[0].status !== 'active') return reply.code(409).send({ error: 'AGENT_NOT_ACTIVE' });
+    const attachmentIds = [...new Set(input.attachmentIds)];
+    if (attachmentIds.length) {
+      const available = await query<{ id: string }>(
+        `SELECT id FROM files WHERE workspace_id=$1 AND id=ANY($2::uuid[]) AND status='ready'`,
+        [request.user.workspaceId, attachmentIds],
+      );
+      if (available.rowCount !== attachmentIds.length) return reply.code(409).send({ error: 'FILE_ATTACHMENTS_NOT_READY_OR_MISSING' });
+    }
     await assertWorkspaceAiBudgetAvailable(request.user.workspaceId);
     const task = (await query('INSERT INTO tasks(workspace_id,agent_id,title,input,requested_by) VALUES($1,$2,$3,$4,$5) RETURNING *', [request.user.workspaceId, input.agentId, input.title, JSON.stringify(input.input), request.user.sub])).rows[0];
+    if (attachmentIds.length) {
+      await query(
+        `INSERT INTO task_attachments(task_id,file_id,workspace_id,attached_by)
+         SELECT $1,id,$2,$3 FROM files WHERE workspace_id=$2 AND id=ANY($4::uuid[])
+         ON CONFLICT DO NOTHING`,
+        [task.id, request.user.workspaceId, request.user.sub, attachmentIds],
+      );
+      await query(
+        'INSERT INTO task_events(workspace_id,task_id,event_type,message,payload) VALUES($1,$2,$3,$4,$5)',
+        [request.user.workspaceId, task.id, 'attachments.ready', `${attachmentIds.length} attachment${attachmentIds.length === 1 ? '' : 's'} added`, JSON.stringify({ fileIds: attachmentIds })],
+      );
+    }
     const taskPayload = input.input ?? {};
     const requestText = typeof taskPayload.request === 'string' ? taskPayload.request : '';
     const artifactFormats = [...new Set([...(input.artifactFormats ?? []), ...inferredArtifactFormats(requestText)])];
@@ -54,8 +76,8 @@ export async function taskRoutes(app: FastifyInstance) {
     }
     await query('INSERT INTO task_events(workspace_id,task_id,event_type,message) VALUES($1,$2,$3,$4)', [request.user.workspaceId, task.id, 'task.queued', 'Task queued for execution']);
     await enqueueTask(task.id);
-    await audit(request.user.workspaceId, request.user.sub, 'task.created', 'task', task.id, { agentId: input.agentId });
-    return reply.code(202).send(task);
+    await audit(request.user.workspaceId, request.user.sub, 'task.created', 'task', task.id, { agentId: input.agentId, attachmentIds });
+    return reply.code(202).send({ ...task, attachmentIds });
   }));
   app.get('/:id/stream', { preHandler: app.authenticate }, async (request, reply) => {
     const id = (request.params as { id: string }).id;
@@ -85,14 +107,23 @@ export async function taskRoutes(app: FastifyInstance) {
     const id = (request.params as { id: string }).id;
     const task = await query('SELECT t.*,a.name agent_name,a.role agent_role,a.avatar_config agent_avatar FROM tasks t JOIN agents a ON a.id=t.agent_id WHERE t.id=$1 AND t.workspace_id=$2', [id, request.user.workspaceId]);
     if (!task.rowCount) return reply.code(404).send({ error: 'TASK_NOT_FOUND' });
-    const [events, artifacts, actionAuthorizations] = await Promise.all([
+    const [events, artifacts, actionAuthorizations, attachments] = await Promise.all([
       query('SELECT * FROM task_events WHERE task_id=$1 AND workspace_id=$2 ORDER BY created_at', [id, request.user.workspaceId]),
       query('SELECT * FROM artifacts WHERE task_id=$1 AND workspace_id=$2 ORDER BY created_at', [id, request.user.workspaceId]),
       query(`SELECT id,adapter,resource_id,operation,target_summary,risk_level,arguments_summary,arguments_hash,
              status,requested_at,expires_at,resolved_at,consumed_at,error_message
              FROM action_authorizations WHERE task_id=$1 AND workspace_id=$2 ORDER BY requested_at`, [id, request.user.workspaceId]),
+      query(
+        `SELECT file.id,file.original_name,file.extension,file.mime_type,file.size_bytes,file.status,file.scan_status,
+          file.scope,file.retention_policy,file.expires_at,file.error_message,file.metadata,
+          file.version_group_id,file.version_number,file.replaces_file_id,
+          file.created_at,file.updated_at,file.completed_at
+         FROM task_attachments attachment JOIN files file ON file.id=attachment.file_id
+         WHERE attachment.task_id=$1 AND attachment.workspace_id=$2 ORDER BY attachment.created_at`,
+        [id, request.user.workspaceId],
+      ),
     ]);
-    return { ...task.rows[0], events: events.rows, artifacts: artifacts.rows, actionAuthorizations: actionAuthorizations.rows };
+    return { ...task.rows[0], events: events.rows, artifacts: artifacts.rows, actionAuthorizations: actionAuthorizations.rows, attachments: attachments.rows };
   }));
   app.post('/:id/cancel', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const result = await query("UPDATE tasks SET status='cancelled',completed_at=now(),updated_at=now() WHERE id=$1 AND workspace_id=$2 AND status IN ('queued','running','awaiting_approval') RETURNING *", [(request.params as { id: string }).id, request.user.workspaceId]);

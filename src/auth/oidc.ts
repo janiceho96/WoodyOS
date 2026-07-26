@@ -6,6 +6,10 @@ import { db, query } from '../db/client.js';
 type OidcClient = { getAccessTokenFromAuthorizationCodeFlow: (request: unknown, reply: unknown) => Promise<{ token: { access_token: string } }>; userinfo: (token: string) => Promise<Record<string, unknown>> };
 
 export async function registerOidc(app: FastifyInstance) {
+  // Unit tests build the complete Fastify application with mocked persistence.
+  // OIDC discovery is an external network operation and must not make those
+  // deterministic tests depend on a configured developer `.env` or network.
+  if (process.env.NODE_ENV === 'test') return false;
   const issuer = process.env.OIDC_ISSUER;
   const clientId = process.env.OIDC_CLIENT_ID;
   const clientSecret = process.env.OIDC_CLIENT_SECRET;

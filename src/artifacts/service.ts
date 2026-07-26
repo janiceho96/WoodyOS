@@ -18,6 +18,19 @@ async function enqueuePreparedArtifacts(records: ArtifactRecord[]) {
 }
 
 async function sourceFor(artifact: ArtifactRecord): Promise<ArtifactSource> {
+  if (artifact.output_document_version_id && artifact.task_id) {
+    const row = (await query<ArtifactSource>(
+      `SELECT t.title,v.content output,t.requested_by created_by,t.status
+         FROM output_document_versions v
+         JOIN output_documents d ON d.id=v.document_id
+         JOIN tasks t ON t.id=d.task_id
+        WHERE v.id=$1 AND v.workspace_id=$2 AND t.id=$3`,
+      [artifact.output_document_version_id, artifact.workspace_id, artifact.task_id],
+    )).rows[0];
+    if (!row) throw new Error('ARTIFACT_OUTPUT_VERSION_SOURCE_MISSING');
+    if (row.status !== 'completed') throw new Error('ARTIFACT_TASK_NOT_COMPLETED');
+    return row;
+  }
   if (artifact.task_id) {
     const row = (await query<ArtifactSource>('SELECT title,output,requested_by created_by,status FROM tasks WHERE id=$1 AND workspace_id=$2', [artifact.task_id, artifact.workspace_id])).rows[0];
     if (!row) throw new Error('ARTIFACT_TASK_SOURCE_MISSING');
@@ -53,7 +66,12 @@ export async function generateArtifact(artifactId: string) {
     const sourceHash = createHash('sha256').update(content).digest('hex');
     const theme = artifact.format === 'pptx'
       ? (await query<{ theme: PresentationTheme }>('SELECT theme FROM presentation_themes WHERE workspace_id=$1 AND is_default=true LIMIT 1', [artifact.workspace_id])).rows[0]?.theme ?? null
-      : null;
+      : artifact.format === 'html'
+        ? (await query<{ theme: Record<string, unknown> }>(
+          "SELECT theme FROM artifact_templates WHERE workspace_id=$1 AND format='html' AND is_default=true LIMIT 1",
+          [artifact.workspace_id],
+        )).rows[0]?.theme ?? null
+        : null;
     const response = await fetch(generatorUrl(), {
       method: 'POST',
       signal: AbortSignal.timeout(90_000),
@@ -61,7 +79,7 @@ export async function generateArtifact(artifactId: string) {
         'content-type': 'application/json',
         ...(process.env.EXTRACTOR_TOKEN ? { authorization: `Bearer ${process.env.EXTRACTOR_TOKEN}` } : {}),
       },
-      body: JSON.stringify({ format: artifact.format, title: source.title, content, theme }),
+      body: JSON.stringify({ format: artifact.format, title: source.title, content, theme, structured: source.output }),
     });
     if (!response.ok) {
       const detail = await response.json().catch(() => null) as { detail?: string } | null;
@@ -94,6 +112,7 @@ async function requestArtifacts(input: {
   createdBy: string | null;
   taskId?: string;
   workflowRunId?: string;
+  outputVersionId?: string;
   title: string;
   formats: ArtifactFormat[];
   ready: boolean;
@@ -103,14 +122,20 @@ async function requestArtifacts(input: {
   for (const format of [...new Set(input.formats)]) {
     const info = artifactFormatInfo[format];
     const inserted = (await query<ArtifactRecord>(
-      `INSERT INTO artifacts(workspace_id,task_id,workflow_run_id,created_by,format,status,filename,mime_type)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING *`,
-      [input.workspaceId, input.taskId ?? null, input.workflowRunId ?? null, input.createdBy, format, input.ready ? 'queued' : 'pending', artifactTitle(input.title, format), info.mimeType],
+      `INSERT INTO artifacts(
+         workspace_id,task_id,workflow_run_id,output_document_version_id,created_by,format,status,filename,mime_type
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING RETURNING *`,
+      [
+        input.workspaceId, input.taskId ?? null, input.workflowRunId ?? null, input.outputVersionId ?? null,
+        input.createdBy, format, input.ready ? 'queued' : 'pending', artifactTitle(input.title, format), info.mimeType,
+      ],
     )).rows[0];
     const selected = inserted ?? (await query<ArtifactRecord>(
       `SELECT * FROM artifacts WHERE workspace_id=$1 AND format=$2 AND
-       (($3::uuid IS NOT NULL AND task_id=$3) OR ($4::uuid IS NOT NULL AND workflow_run_id=$4))`,
-      [input.workspaceId, format, input.taskId ?? null, input.workflowRunId ?? null],
+       (($5::uuid IS NOT NULL AND task_id=$3 AND output_document_version_id=$5)
+        OR ($5::uuid IS NULL AND output_document_version_id IS NULL AND
+          (($3::uuid IS NOT NULL AND task_id=$3) OR ($4::uuid IS NOT NULL AND workflow_run_id=$4))))`,
+      [input.workspaceId, format, input.taskId ?? null, input.workflowRunId ?? null, input.outputVersionId ?? null],
     )).rows[0];
     if (inserted && input.ready) enqueueIds.add(inserted.id);
     if (selected?.status === 'failed' || selected?.status === 'skipped' || (selected?.status === 'pending' && input.ready)) {
@@ -128,6 +153,29 @@ export function requestTaskArtifacts(input: { workspaceId: string; createdBy: st
 
 export function requestWorkflowArtifacts(input: { workspaceId: string; createdBy: string | null; workflowRunId: string; title: string; formats: ArtifactFormat[]; ready: boolean }) {
   return requestArtifacts(input);
+}
+
+export async function requestTaskVersionArtifacts(input: {
+  workspaceId: string;
+  createdBy: string | null;
+  taskId: string;
+  versionId: string;
+  title: string;
+  formats: ArtifactFormat[];
+}) {
+  try {
+    return await requestArtifacts({
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      taskId: input.taskId,
+      outputVersionId: input.versionId,
+      title: input.title,
+      formats: input.formats,
+      ready: true,
+    });
+  } catch (cause) {
+    throw Object.assign(new Error('OUTPUT_ARTIFACT_QUEUE_UNAVAILABLE'), { statusCode: 503, cause });
+  }
 }
 
 export async function releaseTaskArtifacts(taskId: string) {

@@ -10,7 +10,7 @@ import { artifactFormatSchema, type ArtifactRecord } from '../artifacts/types.js
 const requestInput = z.object({
   taskId: z.string().uuid().optional(),
   workflowRunId: z.string().uuid().optional(),
-  formats: z.array(artifactFormatSchema).min(1).max(4),
+  formats: z.array(artifactFormatSchema).min(1).max(9),
 }).refine((value) => Boolean(value.taskId) !== Boolean(value.workflowRunId), 'Choose exactly one task or workflow run');
 
 export async function artifactRoutes(app: FastifyInstance) {
@@ -49,11 +49,16 @@ export async function artifactRoutes(app: FastifyInstance) {
     if (!artifact) return reply.code(404).send({ error: 'ARTIFACT_NOT_FOUND' });
     if (artifact.status !== 'ready' || !artifact.storage_key) return reply.code(409).send({ error: 'ARTIFACT_NOT_READY' });
     const file = await artifactStorage().open(artifact.storage_key);
-    const disposition = artifact.format === 'pdf' && (request.query as { inline?: string }).inline === 'true' ? 'inline' : 'attachment';
+    const inline = (request.query as { inline?: string }).inline === 'true';
+    const disposition = inline && ['pdf', 'html', 'md', 'txt', 'csv', 'json'].includes(artifact.format) ? 'inline' : 'attachment';
     reply.header('content-type', artifact.mime_type);
     reply.header('content-length', String(file.size));
     reply.header('content-disposition', `${disposition}; filename*=UTF-8''${encodeURIComponent(artifact.filename)}`);
     reply.header('cache-control', 'private, no-store');
+    reply.header('x-content-type-options', 'nosniff');
+    if (artifact.format === 'html') {
+      reply.header('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'");
+    }
     return reply.send(file.stream);
   }));
 

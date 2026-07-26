@@ -32,7 +32,7 @@ export async function authRoutes(app: FastifyInstance) {
       await client.query('INSERT INTO workspace_memberships(workspace_id,user_id,role) VALUES($1,$2,$3)', [workspace.id, user.id, 'owner']);
       await client.query('COMMIT');
       const accessToken = app.jwt.sign({ sub: user.id, workspaceId: workspace.id, role: 'owner' });
-      return reply.code(201).send({ accessToken, user: { id: user.id, email: input.email, displayName: input.displayName, onboarding: { version: ONBOARDING_VERSION, completed: false, lastStep: 1, completedAt: null, skippedAt: null } }, workspace: { id: workspace.id, name: input.workspaceName } });
+      return reply.code(201).send({ accessToken, user: { id: user.id, email: input.email, displayName: input.displayName, onboarding: { version: ONBOARDING_VERSION, completed: false, lastStep: 1, completedAt: null, skippedAt: null } }, workspace: { id: workspace.id, name: input.workspaceName, role: 'owner' } });
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   }));
 

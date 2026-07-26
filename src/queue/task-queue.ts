@@ -6,10 +6,12 @@ export const TASK_QUEUE = 'agent-tasks';
 export const WORKFLOW_QUEUE = 'workflow-runs';
 export const KNOWLEDGE_QUEUE = 'knowledge-ingestion';
 export const ARTIFACT_QUEUE = 'artifact-generation';
+export const FILE_QUEUE = 'file-processing';
 let queue: Queue<{ taskId: string }> | undefined;
 let workflowQueue: Queue<{ workflowRunId: string }> | undefined;
 let knowledgeQueue: Queue<{ documentId: string }> | undefined;
 let artifactQueue: Queue<{ artifactId: string }> | undefined;
+let fileQueue: Queue<{ fileId: string }> | undefined;
 
 export function queueJobId(phaseId: string) {
   return createHash('sha256').update(phaseId).digest('hex');
@@ -51,10 +53,25 @@ export async function enqueueArtifact(artifactId: string, phaseId = artifactId) 
   await artifactQueue.add('generate', { artifactId }, { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1500 } });
 }
 
+export async function enqueueFile(fileId: string, phaseId = fileId) {
+  if (!fileQueue) {
+    const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
+    fileQueue = new Queue<{ fileId: string }>(FILE_QUEUE, { connection });
+  }
+  await fileQueue.add('process', { fileId }, {
+    jobId: queueJobId(phaseId),
+    removeOnComplete: 1000,
+    removeOnFail: 1000,
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1_500 },
+  });
+}
+
 export async function closeQueues() {
-  await Promise.all([queue?.close(), workflowQueue?.close(), knowledgeQueue?.close(), artifactQueue?.close()].filter((item): item is Promise<void> => Boolean(item)));
+  await Promise.all([queue?.close(), workflowQueue?.close(), knowledgeQueue?.close(), artifactQueue?.close(), fileQueue?.close()].filter((item): item is Promise<void> => Boolean(item)));
   queue = undefined;
   workflowQueue = undefined;
   knowledgeQueue = undefined;
   artifactQueue = undefined;
+  fileQueue = undefined;
 }

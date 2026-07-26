@@ -1,5 +1,6 @@
 import { query } from '../../db/client.js';
 import type { WorkflowAdapterContext } from './types.js';
+import { resolveNodeInput } from './templates.js';
 
 function json(value: unknown) {
   return JSON.stringify(value === undefined ? null : value);
@@ -15,9 +16,13 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
     [run.id, node.id, iterationKey, cursor.attempt],
   )).rows[0];
   if (!task) {
+    const inputMapping = node.config.inputMapping && typeof node.config.inputMapping === 'object' && !Array.isArray(node.config.inputMapping)
+      ? node.config.inputMapping as Record<string, unknown>
+      : undefined;
+    const mappedInput = resolveNodeInput(inputMapping, run.state);
     const agentInput = {
-      ...run.state,
-      workflow: { name: run.name, runId: run.id, nodeId: node.id, iterationKey, attempt: cursor.attempt, responsibility: node.config.responsibility ?? null, expectedOutput: node.config.expectedOutput ?? null },
+      ...mappedInput,
+      workflow: { name: run.name, runId: run.id, nodeId: node.id, iterationKey, attempt: cursor.attempt, responsibility: node.config.responsibility ?? null, expectedOutput: node.config.expectedOutput ?? null, outputContract: node.config.outputContract ?? 'text' },
     };
     task = (await query<{ id: string; status: string; output: unknown; error: unknown }>(
       `INSERT INTO tasks(workspace_id,agent_id,workflow_run_id,workflow_node_id,workflow_iteration_key,workflow_attempt,title,input,requested_by)
@@ -37,4 +42,3 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
   setNodeOutput(output);
   return { output, result: output };
 }
-

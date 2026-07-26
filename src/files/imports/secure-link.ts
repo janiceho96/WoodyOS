@@ -1,0 +1,116 @@
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
+import { basename } from 'node:path';
+import { Agent, fetch } from 'undici';
+import { safeOriginalName } from '../types.js';
+import type { CloudImportAdapter, CloudImportRequest, DownloadedCloudFile } from './types.js';
+
+const MAX_BYTES = 25 * 1024 * 1024;
+
+function isPrivateIpv4(address: string) {
+  const parts = address.split('.').map(Number);
+  return parts[0] === 0 || parts[0] === 10 || parts[0] === 127
+    || (parts[0] === 169 && parts[1] === 254)
+    || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+    || (parts[0] === 192 && parts[1] === 168)
+    || parts[0] >= 224;
+}
+
+function isPrivateAddress(address: string) {
+  if (isIP(address) === 4) return isPrivateIpv4(address);
+  const normalized = address.toLowerCase().split('%')[0];
+  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  if (mapped) return isPrivateIpv4(mapped);
+  // Public IPv6 unicast currently occupies 2000::/3. Reject every other range
+  // (loopback, link-local, unique-local, multicast, documentation and reserved).
+  return !/^[23][0-9a-f]{0,3}:/.test(normalized) || normalized.startsWith('2001:db8:');
+}
+
+async function validatedAddresses(hostname: string) {
+  const resolved = await lookup(hostname, { all: true, verbatim: true });
+  if (!resolved.length || resolved.some((entry) => isPrivateAddress(entry.address))) {
+    throw Object.assign(new Error('CLOUD_IMPORT_PRIVATE_ADDRESS_BLOCKED'), { statusCode: 400 });
+  }
+  return resolved;
+}
+
+function filenameFrom(response: { headers: Headers }, url: URL, requested?: string) {
+  if (requested?.trim()) return safeOriginalName(requested);
+  const disposition = response.headers.get('content-disposition') ?? '';
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const basic = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  return safeOriginalName(
+    (encoded ? decodeURIComponent(encoded) : basic)
+    ?? basename(decodeURIComponent(url.pathname))
+    ?? 'cloud-file',
+  );
+}
+
+async function fetchPinned(url: URL) {
+  if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) {
+    throw Object.assign(new Error('CLOUD_IMPORT_REQUIRES_PUBLIC_HTTPS'), { statusCode: 400 });
+  }
+  const addresses = await validatedAddresses(url.hostname);
+  let cursor = 0;
+  const dispatcher = new Agent({
+    connect: {
+      lookup(_hostname, _options, callback) {
+        const selected = addresses[cursor++ % addresses.length];
+        callback(null, selected.address, selected.family);
+      },
+    },
+  });
+  try {
+    const response = await fetch(url, {
+      dispatcher,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(30_000),
+      headers: { accept: '*/*', 'user-agent': 'Woody-File-Importer/1.0' },
+    });
+    return { response, dispatcher };
+  } catch (error) {
+    await dispatcher.close();
+    throw error;
+  }
+}
+
+export const secureLinkAdapter: CloudImportAdapter = {
+  provider: 'secure_link',
+  async download(input: CloudImportRequest): Promise<DownloadedCloudFile> {
+    let current = new URL(input.url);
+    let response;
+    for (let redirects = 0; redirects <= 3; redirects += 1) {
+      const fetched = await fetchPinned(current);
+      response = fetched.response;
+      if (![301, 302, 303, 307, 308].includes(response.status)) {
+        try {
+          if (!response.ok) {
+            await response.body?.cancel();
+            throw Object.assign(new Error(`CLOUD_IMPORT_DOWNLOAD_FAILED_${response.status}`), { statusCode: 422 });
+          }
+          const declaredLength = Number(response.headers.get('content-length') ?? 0);
+          if (declaredLength > MAX_BYTES) {
+            await response.body?.cancel();
+            throw Object.assign(new Error('FILE_TOO_LARGE'), { statusCode: 413 });
+          }
+          const buffer = Buffer.from(await response.arrayBuffer());
+          if (buffer.length > MAX_BYTES) throw Object.assign(new Error('FILE_TOO_LARGE'), { statusCode: 413 });
+          return {
+            filename: filenameFrom(response, current, input.filename),
+            mimetype: response.headers.get('content-type')?.split(';')[0] ?? 'application/octet-stream',
+            buffer,
+            provider: 'secure_link',
+          };
+        } finally {
+          await fetched.dispatcher.close();
+        }
+      }
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      await fetched.dispatcher.close();
+      if (!location || redirects === 3) throw Object.assign(new Error('CLOUD_IMPORT_TOO_MANY_REDIRECTS'), { statusCode: 400 });
+      current = new URL(location, current);
+    }
+    throw Object.assign(new Error('CLOUD_IMPORT_DOWNLOAD_FAILED'), { statusCode: 422 });
+  },
+};

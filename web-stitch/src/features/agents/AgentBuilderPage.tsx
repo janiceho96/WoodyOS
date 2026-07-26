@@ -1,8 +1,8 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
+import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, House, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, type Agent, type AgentAvatarConfig } from '../../api';
+import { api, type Agent, type AgentAvatarConfig, type AgentPromptTone } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { Status } from '../../components/ui';
 import { humanize } from '../../lib/format';
@@ -24,6 +24,14 @@ const steps: Array<{ id: BuilderStep; label: string; hint: string }> = [
   { id: 'resources', label: 'Resources', hint: 'Knowledge and access' },
   { id: 'model', label: 'Model', hint: 'Quality and budget' },
   { id: 'review', label: 'Review', hint: 'Safety and publish' },
+];
+
+const promptTones: Array<{ id: AgentPromptTone; label: string; description: string }> = [
+  { id: 'professional', label: 'Professional', description: 'Polished and dependable' },
+  { id: 'friendly', label: 'Friendly', description: 'Warm and approachable' },
+  { id: 'analytical', label: 'Analytical', description: 'Evidence-led and precise' },
+  { id: 'creative', label: 'Creative', description: 'Imaginative with boundaries' },
+  { id: 'concise', label: 'Concise', description: 'Direct and action-focused' },
 ];
 
 function fromAgent(agent?: Agent, defaultModel = ''): Draft {
@@ -48,6 +56,9 @@ export function AgentBuilderPage() {
   const [draft, setDraft] = useState<Draft>(() => fromAgent(agent, defaultModel));
   const [step, setStep] = useState<BuilderStep>('purpose');
   const [formError, setFormError] = useState('');
+  const [promptTone, setPromptTone] = useState<AgentPromptTone>('professional');
+  const [promptBackup, setPromptBackup] = useState<Draft | null>(null);
+  const [promptError, setPromptError] = useState('');
   useEffect(() => {
     setDraft((current) => {
       if (agent) return fromAgent(agent, defaultModel);
@@ -94,14 +105,64 @@ export function AgentBuilderPage() {
     },
   });
 
+  const promptMutation = useMutation({
+    mutationFn: () => api.generateAgentPrompt({
+      name: draft.name.trim(),
+      role: draft.role.trim(),
+      goal: draft.goal.trim(),
+      tone: promptTone,
+    }),
+    onSuccess: (generated) => {
+      setPromptBackup(draft);
+      setDraft((current) => ({
+        ...current,
+        goal: generated.goal,
+        personality: generated.personality,
+        instructions: generated.instructions,
+      }));
+      setPromptError('');
+      setStep('instructions');
+      report(`${promptTones.find((item) => item.id === generated.tone)?.label ?? 'Agent'} prompt generated for review`);
+    },
+    onError: (cause) => {
+      const message = cause instanceof Error ? cause.message : 'Could not generate the agent prompt';
+      setPromptError(message);
+      reportError(message);
+    },
+  });
+
   const toggleCapability = (key: keyof Draft['capabilities']) => setDraft((current) => ({ ...current, capabilities: { ...current.capabilities, [key]: !current.capabilities[key] } }));
   const toggleTool = (id: string) => setDraft((current) => ({ ...current, toolIds: current.toolIds.includes(id) ? current.toolIds.filter((toolId) => toolId !== id) : [...current.toolIds, id] }));
   const move = (direction: -1 | 1) => setStep(steps[Math.max(0, Math.min(steps.length - 1, currentIndex + direction))].id);
+  const hasUnsavedChanges = JSON.stringify(draft) !== JSON.stringify(fromAgent(agent, defaultModel));
+  const leaveBuilder = (path: string) => {
+    if (mutation.isPending || promptMutation.isPending) return;
+    if (hasUnsavedChanges && !window.confirm('Leave the agent editor? Unsaved changes will be lost.')) return;
+    navigate(path);
+  };
+  const canGeneratePrompt = draft.name.trim().length >= 2 || draft.role.trim().length >= 2;
+  const generatePrompt = () => {
+    if (!canGeneratePrompt || promptMutation.isPending) return;
+    if ((draft.goal.trim() || draft.personality.trim() || draft.instructions.trim())
+      && !window.confirm('Generate a new prompt? This will replace the current outcome, working style, and instructions after generation succeeds.')) return;
+    setPromptError('');
+    promptMutation.mutate();
+  };
+  const undoGeneratedPrompt = () => {
+    if (!promptBackup) return;
+    setDraft(promptBackup);
+    setPromptBackup(null);
+    report('Restored the prompt you had before generation');
+  };
 
   return <div className="builder-page guided-builder">
     <div className="builder-toolbar">
-      <div><span className="eyebrow">Agents <ChevronRight size={12}/></span><strong>{agent ? agent.name : 'New agent draft'}</strong><Status value={agent?.status ?? 'draft'}/></div>
-      <div>{!agent && <button className="button" onClick={() => navigate('/agents/library?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => navigate(agent ? `/agents/${agent.id}?section=configure` : '/agents')}>Close</button><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Publish agent</button></div>
+      <div className="builder-breadcrumbs">
+        <button type="button" onClick={() => leaveBuilder('/dashboard')}><House size={14}/>Home</button><ChevronRight size={12}/>
+        <button type="button" onClick={() => leaveBuilder('/agents')}>Agents</button><ChevronRight size={12}/>
+        <strong>{agent ? agent.name : 'New agent draft'}</strong><Status value={agent?.status ?? 'draft'}/>
+      </div>
+      <div>{!agent && <button className="button" onClick={() => leaveBuilder('/agents/library?tab=generate')}><Sparkles size={15}/>Generate from prompt</button>}<button className="button" onClick={() => leaveBuilder(agent ? `/agents/${agent.id}?section=configure` : '/agents')}><ChevronLeft size={15}/>{agent ? 'Back to agent' : 'Back to agents'}</button><button className="button" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('draft')}><Save size={15}/>Save draft</button><button className="button primary" disabled={mutation.isPending || !ready} onClick={() => mutation.mutate('active')}>{mutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Rocket size={15}/>}Publish agent</button></div>
     </div>
     {formError && <div className="inline-error builder-error"><AlertTriangle size={15}/><span><strong>Agent was not saved.</strong>{formError}</span></div>}
     <div className="guided-builder-layout">
@@ -114,13 +175,23 @@ export function AgentBuilderPage() {
       <main className="builder-step-content">
         {step === 'purpose' && <BuilderSection Icon={Bot} eyebrow="Step 1" title="Give this agent one clear responsibility" description="A focused agent is easier to test, safer to operate, and produces more consistent work.">
           <AgentAvatarPicker agent={agent} name={draft.name} role={draft.role} value={draft.avatar} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))}/>
-          <label>Agent name <span>*</span><input value={draft.name} maxLength={120} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="Research Analyst"/></label>
-          <label>Role <span>*</span><input value={draft.role} maxLength={240} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="Senior market researcher"/><small>Describe what kind of specialist this is.</small></label>
-          <label>Outcome this agent owns <span>*</span><textarea className="builder-large-field" value={draft.goal} maxLength={5000} onChange={(event) => setDraft({ ...draft, goal: event.target.value })} placeholder="Research a market and return a cited comparison of the strongest competitors."/><small>Write an observable result rather than a broad topic.</small></label>
-          <label>Working style <small>Optional</small><input value={draft.personality} maxLength={80} onChange={(event) => setDraft({ ...draft, personality: event.target.value })} placeholder="Analytical, concise, cautious"/></label>
+          <label>Agent name <span>*</span><input disabled={promptMutation.isPending} value={draft.name} maxLength={120} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="Research Analyst"/></label>
+          <label>Role <span>*</span><input disabled={promptMutation.isPending} value={draft.role} maxLength={240} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="Senior market researcher"/><small>Describe what kind of specialist this is.</small></label>
+          <section className="prompt-assistant" aria-labelledby="prompt-assistant-title">
+            <div className="prompt-assistant-head"><span><Sparkles size={17}/></span><div><h3 id="prompt-assistant-title">Generate the full agent prompt</h3><p>Choose a voice, then let Woody draft the outcome, working style, process, safety rules, and output format.</p></div></div>
+            <fieldset disabled={promptMutation.isPending}>
+              <legend>Default tone</legend>
+              <div className="prompt-tone-grid">{promptTones.map((tone) => <button type="button" key={tone.id} className={promptTone === tone.id ? 'active' : ''} aria-pressed={promptTone === tone.id} onClick={() => setPromptTone(tone.id)}><strong>{tone.label}</strong><small>{tone.description}</small></button>)}</div>
+            </fieldset>
+            {promptError && <div className="inline-error"><AlertTriangle size={15}/><span>{promptError}</span></div>}
+            <div className="prompt-assistant-action"><small>Uses one request from your configured AI provider. Nothing is saved automatically.</small><button type="button" className="button primary" disabled={!canGeneratePrompt || promptMutation.isPending} onClick={generatePrompt}>{promptMutation.isPending ? <LoaderCircle className="spin" size={15}/> : <Sparkles size={15}/>} {promptMutation.isPending ? 'Writing prompt…' : 'Generate full prompt'}</button></div>
+          </section>
+          <label>Outcome this agent owns <span>*</span><textarea disabled={promptMutation.isPending} className="builder-large-field" value={draft.goal} maxLength={5000} onChange={(event) => setDraft({ ...draft, goal: event.target.value })} placeholder="Research a market and return a cited comparison of the strongest competitors."/><small>Write an observable result rather than a broad topic.</small></label>
+          <label>Working style <small>Optional</small><input disabled={promptMutation.isPending} value={draft.personality} maxLength={80} onChange={(event) => setDraft({ ...draft, personality: event.target.value })} placeholder="Analytical, concise, cautious"/></label>
         </BuilderSection>}
 
         {step === 'instructions' && <BuilderSection Icon={FileText} eyebrow="Step 2" title="Set rules and an output contract" description="Tell the agent how to work, what to avoid, and how a successful answer should be structured.">
+          {promptBackup && <div className="generated-prompt-note"><Sparkles size={17}/><span><strong>AI-generated draft ready to review</strong><small>Edit anything below before saving. Your previous text is still available.</small></span><button type="button" className="button" onClick={undoGeneratedPrompt}>Undo generation</button></div>}
           <div className="instruction-prompts"><button onClick={() => setDraft({ ...draft, instructions: `${draft.instructions}${draft.instructions ? '\n\n' : ''}## Process\n1. Verify the request and available context.\n2. Complete the work step by step.\n3. Check the result against the goal.` })}>Add process</button><button onClick={() => setDraft({ ...draft, instructions: `${draft.instructions}${draft.instructions ? '\n\n' : ''}## Boundaries\n- Do not invent facts.\n- State uncertainty clearly.\n- Ask for approval before external write actions.` })}>Add safety rules</button><button onClick={() => setDraft({ ...draft, instructions: `${draft.instructions}${draft.instructions ? '\n\n' : ''}## Output\nReturn a concise Markdown report with a summary, findings, evidence, and recommended next actions.` })}>Add output format</button></div>
           <label>Agent instructions <small>Markdown supported</small><textarea className="instruction-editor" value={draft.instructions} maxLength={20000} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} placeholder="Describe the process, boundaries, quality checks, and required output…"/></label>
           <div className="field-foot"><span>≈ {Math.ceil(draft.instructions.length / 4)} prompt tokens</span><span>{draft.instructions.length.toLocaleString()} / 20,000 characters</span></div>

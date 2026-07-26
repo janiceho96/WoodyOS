@@ -25,7 +25,7 @@ const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 5_
 function RoutedApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [checking, setChecking] = useState(Boolean(auth.get()));
-  const { theme, setTheme, toggleTheme } = useTheme();
+  const { theme, setTheme, toggleTheme, accentColor, setAccentColor } = useTheme();
   useEffect(() => {
     if (!auth.get()) { setChecking(false); return; }
     api.me().then((me) => setSession({ accessToken: auth.get(), user: { id: me.id, email: me.email, displayName: me.display_name, onboarding: me.onboarding }, workspace: { id: me.workspace_id, name: me.workspace_name } })).catch(() => auth.clear()).finally(() => setChecking(false));
@@ -47,7 +47,7 @@ function RoutedApp() {
     <Route path="/tools" element={<ToolsRoute/>}/>
     <Route path="/mcp" element={<McpMarketplacePage/>}/>
     <Route path="/analytics" element={<AnalyticsPage/>}/>
-    <Route path="/settings" element={<SettingsRoute/>}/>
+    <Route path="/settings" element={<SettingsRoute accentColor={accentColor} setAccentColor={setAccentColor}/>}/>
     <Route path="/mascot-lab" element={<MascotLabPage/>}/>
     <Route path="*" element={<Navigate to="/dashboard" replace/>}/>
   </Route></Routes></Suspense>;
@@ -57,7 +57,7 @@ function DashboardRoute() { const { openDialog } = useOutletContext<ShellOutlet>
 function ExecutionRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ExecutionPage openTask={() => openDialog('task')}/>; }
 function KnowledgeRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <KnowledgePage openText={() => openDialog('document')}/>; }
 function ToolsRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ToolsPage openConnect={() => openDialog('tool')}/>; }
-function SettingsRoute() { const { theme, setTheme, onboarding, resumeOnboarding, restartOnboarding } = useOutletContext<ShellOutlet>(); return <SettingsPage theme={theme} setTheme={setTheme} onboarding={onboarding} resume={resumeOnboarding} restart={() => void restartOnboarding()}/>; }
+function SettingsRoute({ accentColor, setAccentColor }: { accentColor: string; setAccentColor: (color: string) => void }) { const { theme, setTheme, onboarding, resumeOnboarding, restartOnboarding } = useOutletContext<ShellOutlet>(); return <SettingsPage theme={theme} setTheme={setTheme} accentColor={accentColor} setAccentColor={setAccentColor} onboarding={onboarding} resume={resumeOnboarding} restart={() => void restartOnboarding()}/>; }
 
 export default function App() {
   return <QueryClientProvider client={queryClient}><BrowserRouter><RoutedApp/></BrowserRouter></QueryClientProvider>;

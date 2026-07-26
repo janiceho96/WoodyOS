@@ -5,7 +5,8 @@ import { EmptyState, Status } from '../../components/ui';
 import { compact, duration, relative, taskCost } from '../../lib/format';
 import { useWorkspace } from '../../app/workspace';
 import { AgentAvatar } from '../../components/agents/AgentAvatar';
-import type { Task } from '../../api';
+import { AttachmentPicker } from '../../components/files/AttachmentPicker';
+import type { FileAsset, Task } from '../../api';
 
 const taskAgent = (task: Task) => ({ id: task.agent_id, name: task.agent_name ?? 'AI agent', role: task.agent_role ?? 'AI agent', avatar_config: task.agent_avatar ?? {}, updated_at: task.updated_at });
 
@@ -20,6 +21,7 @@ export function DashboardPage({ openTask, openAgent }: { openTask: () => void; o
   const { data } = useWorkspace();
   const navigate = useNavigate();
   const [goal, setGoal] = useState('');
+  const [attachments, setAttachments] = useState<FileAsset[]>([]);
   const analytics = data.analytics;
   const quota = data.quota;
   const tokenTotal = Number(analytics?.usage.token_input ?? 0) + Number(analytics?.usage.token_output ?? 0);
@@ -27,11 +29,14 @@ export function DashboardPage({ openTask, openAgent }: { openTask: () => void; o
   const active = data.tasks.filter((task) => ['queued', 'running'].includes(task.status));
   const failed = data.tasks.filter((task) => task.status === 'failed');
   const completed = data.tasks.filter((task) => task.status === 'completed');
+  const attachmentsReady = attachments.every((file) => file.status === 'ready');
   const submitGoal = (event: FormEvent) => {
     event.preventDefault();
     const clean = goal.trim();
-    if (!clean) return;
-    navigate(`/agents/library?tab=generate&prompt=${encodeURIComponent(clean)}`);
+    if (clean.length < 20 || !attachmentsReady) return;
+    const params = new URLSearchParams({ tab: 'generate', prompt: clean });
+    if (attachments.length) params.set('files', attachments.map((file) => file.id).join(','));
+    navigate(`/agents/library?${params.toString()}`);
   };
   const metrics = [
     { label: 'Active agents', value: analytics?.agents.active_agents ?? '0', Icon: Bot, tone: 'indigo' },
@@ -44,7 +49,11 @@ export function DashboardPage({ openTask, openAgent }: { openTask: () => void; o
     <section className="goal-command panel">
       <div className="goal-command-copy"><span className="status-badge active"><i/>Woody is ready</span><h1>What would you like to accomplish?</h1><p>Describe an outcome. Woody will turn it into an editable agent and workflow proposal before anything runs.</p></div>
       <form className="goal-composer" onSubmit={submitGoal}>
-        <Sparkles size={20}/><textarea aria-label="Describe your goal" value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Describe a goal, paste a prompt, or explain a repeatable job…" rows={2}/><button className="button primary" type="submit" disabled={goal.trim().length < 10}><Send size={16}/>Plan it</button>
+        <Sparkles size={20}/><textarea aria-label="Describe your goal" value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="Describe a goal, paste a prompt, or explain a repeatable job…" rows={2}/><button className="button primary" type="submit" disabled={goal.trim().length < 20 || !attachmentsReady}><Send size={16}/>Plan it</button>
+        <div className="goal-attachments">
+          <AttachmentPicker value={attachments} onChange={setAttachments} defaultScope="saved" allowedScopes={['saved', 'knowledge']} compact uploadLabel="Attach files"/>
+          <small>{attachments.length ? `${attachments.length} file${attachments.length === 1 ? '' : 's'} will guide this proposal.` : 'Attach PDF, Word, PowerPoint, Excel, CSV, Markdown, text, HTML, or images.'}</small>
+        </div>
       </form>
       <div className="goal-examples">{goalExamples.map((example) => <button key={example} onClick={() => setGoal(example)}>{example}</button>)}</div>
       <div className="goal-boundary"><ShieldCheck size={15}/><span>Woody drafts first. You review agents, permissions, workflow and estimated usage before installation.</span></div>

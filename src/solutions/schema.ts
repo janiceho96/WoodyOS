@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { workflowDefinitionErrors } from '../workflows/definition.js';
 
 const slug = z.string().min(2).max(100).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const key = z.string().min(1).max(80).regex(/^[a-z][a-z0-9_-]*$/);
@@ -35,7 +36,7 @@ export const solutionAgentSchema = z.object({
 
 export const solutionWorkflowNodeSchema = z.object({
   id: key,
-  type: z.enum(['trigger', 'agent', 'approval', 'output']),
+  type: z.enum(['trigger', 'agent', 'condition', 'approval', 'loop', 'output']),
   agentKey: key.optional(),
   config: z.record(z.unknown()).default({}),
 });
@@ -70,7 +71,11 @@ export const agentSolutionSchema = z.object({
     name: z.string().min(2).max(120),
     description: z.string().max(2_000).default(''),
     nodes: z.array(solutionWorkflowNodeSchema).min(3).max(40),
-    edges: z.array(z.object({ source: key, target: key })).min(2).max(80),
+    edges: z.array(z.object({
+      source: key,
+      target: key,
+      condition: z.enum(['true', 'false', 'body', 'done', 'continue']).optional(),
+    })).min(2).max(80),
   }),
   expectedMarkdownOutput: z.string().min(10).max(10_000),
   recommendedIntegrations: z.array(z.object({
@@ -158,18 +163,22 @@ export function solutionValidationErrors(solution: AgentSolution) {
       }
     }
     if (reachable.size !== knownNodes.size) errors.push('Every workflow node must be reachable from the trigger');
-    const visiting = new Set<string>();
-    const visited = new Set<string>();
-    const cyclic = (id: string): boolean => {
-      if (visiting.has(id)) return true;
-      if (visited.has(id)) return false;
-      visiting.add(id);
-      const found = (outgoing.get(id) ?? []).some((edge) => cyclic(edge.target));
-      visiting.delete(id);
-      visited.add(id);
-      return found;
-    };
-    if (nodeIds.some(cyclic)) errors.push('Solution workflows cannot contain cycles');
+  }
+
+  const executableErrors = workflowDefinitionErrors({
+    nodes: solution.workflow.nodes.map((node) => ({
+      id: node.id,
+      type: node.type,
+      config: node.type === 'agent'
+        ? { ...node.config, agentId: '00000000-0000-4000-8000-000000000001' }
+        : node.config,
+    })),
+    edges: solution.workflow.edges,
+  });
+  for (const error of executableErrors) {
+    errors.push(error === 'Workflow cycles are allowed only through continue edges back to loop nodes'
+      ? 'Solution workflows cannot contain cycles'
+      : error);
   }
 
   const requiresApproval = solution.requiredPermissions.some((permission) =>

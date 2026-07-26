@@ -14,6 +14,20 @@ describe.runIf(enabled)('database-backed API flow', () => {
   let starterInstallationId = '';
   let jobToolId = '';
 
+  function multipartFile(filename: string, contentType: string, content: string | Buffer, fields: Record<string, string> = {}) {
+    const boundary = `----woody-integration-${suffix}`;
+    const parts = Object.entries(fields).map(([name, value]) => Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+    ));
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`));
+    parts.push(Buffer.isBuffer(content) ? content : Buffer.from(content));
+    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+    return {
+      payload: Buffer.concat(parts),
+      contentType: `multipart/form-data; boundary=${boundary}`,
+    };
+  }
+
   async function waitFor<T>(action: () => Promise<T>, predicate: (value: T) => boolean) {
     for (let attempt = 0; attempt < 75; attempt++) {
       const value = await action();
@@ -372,6 +386,21 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(response.json()).toMatchObject({ error: 'PROMPT_CONTAINS_POSSIBLE_SECRET' });
   });
 
+  it('rejects unavailable proposal attachments before invoking the prompt compiler', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/agent-solutions/compile',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        mode: 'automatic',
+        prompt: 'Create a research agent grounded in the attached reference document.',
+        attachmentIds: ['00000000-0000-4000-8000-000000000001'],
+      },
+    });
+    expect(response.statusCode, response.body).toBe(409);
+    expect(response.json()).toMatchObject({ error: 'FILE_ATTACHMENTS_NOT_READY_OR_MISSING' });
+  });
+
   it('installs a custom MCP connection without exposing credentials', async () => {
     const headers = { authorization: `Bearer ${token}` };
     const installed = await app.inject({
@@ -647,11 +676,175 @@ describe.runIf(enabled)('database-backed API flow', () => {
       (response) => response.statusCode === 200 && response.json().status === 'completed',
     );
     expect(completedApprovalWorkflow.json().output).toMatchObject({ subject: 'approval-resume', approved: true });
-    const task = await app.inject({ method: 'POST', url: '/v1/tasks', headers, payload: { agentId, title: 'Research current market', input: { topic: 'agent platforms' }, artifactFormats: ['pdf'] } });
+    const uploadBody = multipartFile('research-notes.md', 'text/markdown', '# Evidence\n\nAgents use bounded document context.', { scope: 'task' });
+    const uploadedFile = await app.inject({
+      method: 'POST',
+      url: '/v1/files',
+      headers: { ...headers, 'content-type': uploadBody.contentType },
+      payload: uploadBody.payload,
+    });
+    expect(uploadedFile.statusCode, uploadedFile.body).toBe(202);
+    const readyFile = await waitFor(
+      () => app.inject({ method: 'GET', url: `/v1/files/${uploadedFile.json().id}`, headers }),
+      (response) => response.statusCode === 200 && response.json().status === 'ready',
+    );
+    expect(readyFile.json()).not.toHaveProperty('storage_key');
+    expect(readyFile.json()).not.toHaveProperty('sha256');
+    const previewFile = await app.inject({ method: 'GET', url: `/v1/files/${uploadedFile.json().id}/preview`, headers });
+    expect(previewFile.statusCode, previewFile.body).toBe(200);
+    expect(previewFile.json().chunks).toEqual(expect.arrayContaining([expect.objectContaining({ locator: 'Document' })]));
+
+    const versionBody = multipartFile('research-notes-v2.md', 'text/markdown', '# Evidence\n\nAgents use bounded context with exact citations.');
+    const uploadedVersion = await app.inject({
+      method: 'POST',
+      url: `/v1/files/${uploadedFile.json().id}/versions`,
+      headers: { ...headers, 'content-type': versionBody.contentType },
+      payload: versionBody.payload,
+    });
+    expect(uploadedVersion.statusCode, uploadedVersion.body).toBe(202);
+    await waitFor(
+      () => app.inject({ method: 'GET', url: `/v1/files/${uploadedVersion.json().id}`, headers }),
+      (response) => response.statusCode === 200 && response.json().status === 'ready',
+    );
+    const versions = await app.inject({ method: 'GET', url: `/v1/files/${uploadedFile.json().id}/versions`, headers });
+    expect(versions.statusCode, versions.body).toBe(200);
+    expect(versions.json().data.map((item: { version_number: number }) => item.version_number)).toEqual([2, 1]);
+
+    const comparison = await app.inject({
+      method: 'POST',
+      url: '/v1/files/compare',
+      headers,
+      payload: { fileIds: [uploadedFile.json().id, uploadedVersion.json().id] },
+    });
+    expect(comparison.statusCode, comparison.body).toBe(200);
+    expect(comparison.json()).toMatchObject({
+      files: [{ id: uploadedFile.json().id }, { id: uploadedVersion.json().id }],
+      similarityPercent: expect.any(Number),
+      method: expect.stringContaining('no document content was sent'),
+    });
+
+    const csvBody = multipartFile('metrics.csv', 'text/csv', 'Metric,Value\nRequests,44\nTokens,211700\n', { scope: 'saved' });
+    const uploadedCsv = await app.inject({
+      method: 'POST',
+      url: '/v1/files',
+      headers: { ...headers, 'content-type': csvBody.contentType },
+      payload: csvBody.payload,
+    });
+    expect(uploadedCsv.statusCode, uploadedCsv.body).toBe(202);
+    await waitFor(
+      () => app.inject({ method: 'GET', url: `/v1/files/${uploadedCsv.json().id}`, headers }),
+      (response) => response.statusCode === 200 && response.json().status === 'ready',
+    );
+    const spreadsheet = await app.inject({ method: 'GET', url: `/v1/files/${uploadedCsv.json().id}/spreadsheet?limit=2`, headers });
+    expect(spreadsheet.statusCode, spreadsheet.body).toBe(200);
+    expect(spreadsheet.json()).toMatchObject({
+      sheet: 'CSV',
+      rows: [['Metric', 'Value'], ['Requests', '44']],
+      rowCount: 3,
+      hasMore: true,
+    });
+
+    const htmlTemplate = await app.inject({
+      method: 'POST',
+      url: '/v1/artifact-templates',
+      headers,
+      payload: {
+        name: `Integration HTML ${suffix}`,
+        format: 'html',
+        isDefault: true,
+        designMarkdown: '# HTML\n- Background: #101827\n- Accent: #22D3EE\n- Headings: serif\n- Body font: system',
+      },
+    });
+    expect(htmlTemplate.statusCode, htmlTemplate.body).toBe(201);
+    expect(htmlTemplate.json()).toMatchObject({
+      format: 'html',
+      is_default: true,
+      theme: { background: '#101827', accent: '#22D3EE', headingFont: 'serif' },
+    });
+    expect(JSON.stringify(htmlTemplate.json())).not.toContain('design_markdown');
+
+    const safeOutputWorkflow = await app.inject({
+      method: 'POST',
+      url: '/v1/workflows',
+      headers,
+      payload: {
+        name: `Safe output ${suffix}`,
+        definition: {
+          nodes: [
+            { id: 'start', type: 'trigger' },
+            {
+              id: 'finish',
+              type: 'output',
+              config: {
+                output: { report: '# Verified result\n\n<script>not executable</script>' },
+                artifactFormats: ['html', 'md', 'txt', 'csv', 'json'],
+              },
+            },
+          ],
+          edges: [{ source: 'start', target: 'finish' }],
+        },
+      },
+    });
+    expect(safeOutputWorkflow.statusCode, safeOutputWorkflow.body).toBe(201);
+    const safeOutputRun = await app.inject({
+      method: 'POST',
+      url: `/v1/workflows/${safeOutputWorkflow.json().id}/test-runs`,
+      headers,
+      payload: { input: { subject: 'safe artifact integration' } },
+    });
+    expect(safeOutputRun.statusCode, safeOutputRun.body).toBe(202);
+    const completedSafeOutput = await waitFor(
+      () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${safeOutputRun.json().id}`, headers }),
+      (response) => response.statusCode === 200
+        && response.json().status === 'completed'
+        && response.json().artifacts?.length === 5
+        && response.json().artifacts.every((item: { status: string }) => item.status === 'ready'),
+    );
+    const htmlArtifact = completedSafeOutput.json().artifacts.find((item: { format: string }) => item.format === 'html');
+    const htmlDownload = await fetch(
+      `${(process.env.INTEGRATION_API_URL ?? 'http://localhost:3001').replace(/\/$/, '')}/v1/artifacts/${htmlArtifact.id}/download?inline=true`,
+      { headers },
+    );
+    const htmlBody = await htmlDownload.text();
+    expect(htmlDownload.status, htmlBody.slice(0, 500)).toBe(200);
+    expect(htmlDownload.headers.get('content-security-policy')).toContain("default-src 'none'");
+    expect(htmlDownload.headers.get('content-type')).toContain('text/html');
+    expect(htmlBody).toContain('--bg:#101827');
+    expect(htmlBody).not.toContain('<script>');
+
+    const thread = await app.inject({ method: 'POST', url: '/v1/copilot/threads', headers, payload: { title: 'Persistent file chat' } });
+    expect(thread.statusCode, thread.body).toBe(201);
+    const restoredThread = await app.inject({ method: 'GET', url: `/v1/copilot/threads/${thread.json().id}`, headers });
+    expect(restoredThread.statusCode, restoredThread.body).toBe(200);
+    expect(restoredThread.json()).toMatchObject({ id: thread.json().id, title: 'Persistent file chat', messages: [] });
+
+    const isolatedRegistration = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/register',
+      payload: {
+        email: `isolated-${suffix}@example.test`,
+        password,
+        displayName: 'Isolated User',
+        workspaceName: `Isolated ${suffix}`,
+      },
+    });
+    const isolatedHeaders = { authorization: `Bearer ${isolatedRegistration.json().accessToken}` };
+    const isolatedRead = await app.inject({ method: 'GET', url: `/v1/files/${uploadedFile.json().id}`, headers: isolatedHeaders });
+    expect(isolatedRead.statusCode, isolatedRead.body).toBe(404);
+    const isolatedCompare = await app.inject({
+      method: 'POST',
+      url: '/v1/files/compare',
+      headers: isolatedHeaders,
+      payload: { fileIds: [uploadedFile.json().id, uploadedVersion.json().id] },
+    });
+    expect(isolatedCompare.statusCode, isolatedCompare.body).toBe(404);
+
+    const task = await app.inject({ method: 'POST', url: '/v1/tasks', headers, payload: { agentId, title: 'Research current market', input: { topic: 'agent platforms' }, artifactFormats: ['pdf', 'html'], attachmentIds: [uploadedFile.json().id] } });
     expect(task.statusCode, task.body).toBe(202);
     const taskWithArtifact = await app.inject({ method: 'GET', url: `/v1/tasks/${task.json().id}`, headers });
     expect(taskWithArtifact.statusCode, taskWithArtifact.body).toBe(200);
-    expect(taskWithArtifact.json().artifacts).toEqual(expect.arrayContaining([expect.objectContaining({ format: 'pdf', status: 'pending' })]));
+    expect(taskWithArtifact.json().artifacts).toEqual(expect.arrayContaining([expect.objectContaining({ format: 'pdf', status: 'pending' }), expect.objectContaining({ format: 'html', status: 'pending' })]));
+    expect(taskWithArtifact.json().attachments).toEqual(expect.arrayContaining([expect.objectContaining({ id: uploadedFile.json().id, original_name: 'research-notes.md', status: 'ready' })]));
     const taskIndex = await app.inject({ method: 'GET', url: '/v1/tasks', headers });
     expect(taskIndex.statusCode, taskIndex.body).toBe(200);
     expect(taskIndex.json().data).toEqual(expect.arrayContaining([
@@ -683,6 +876,123 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(rangedAnalytics.json()).toMatchObject({ range: { days: 7, timezone: 'UTC' } });
     expect(rangedAnalytics.json().daily).toEqual(expect.any(Array));
     expect(rangedAnalytics.json().agent_effectiveness).toEqual(expect.arrayContaining([expect.objectContaining({ agent_id: agentId })]));
+  }, 30_000);
+
+  it('versions a completed task output without mutating the original run evidence', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers });
+    expect(me.statusCode, me.body).toBe(200);
+    const { query } = await import('../src/db/client.js');
+    const task = (await query<{ id: string }>(
+      `INSERT INTO tasks(workspace_id,agent_id,title,input,output,status,requested_by,completed_at)
+       VALUES($1,$2,$3,'{}'::jsonb,$4,'completed',$5,now()) RETURNING id`,
+      [me.json().workspace_id, agentId, 'Editable output integration', JSON.stringify({ text: '# Original result', toolCallCount: 0 }), me.json().id],
+    )).rows[0];
+    const original = (await query<{ output: unknown }>('SELECT output FROM tasks WHERE id=$1', [task.id])).rows[0].output;
+    const {
+      getTaskOutputDocument,
+      initializeTaskOutputDocument,
+      revertOutputVersion,
+      saveOutputVersion,
+    } = await import('../src/outputs/service.js');
+
+    const initialized = await initializeTaskOutputDocument({
+      workspaceId: me.json().workspace_id,
+      taskId: task.id,
+      actorId: me.json().id,
+    });
+    expect(initialized.currentVersion).toMatchObject({ version_number: 1, content: '# Original result' });
+    expect((await getTaskOutputDocument(me.json().workspace_id, task.id))?.id).toBe(initialized.id);
+    expect((await initializeTaskOutputDocument({
+      workspaceId: me.json().workspace_id,
+      taskId: task.id,
+      actorId: me.json().id,
+    })).id).toBe(initialized.id);
+
+    const saved = await saveOutputVersion({
+      workspaceId: me.json().workspace_id,
+      documentId: initialized.id,
+      actorId: me.json().id,
+      content: '# Human revision',
+      baseVersionNumber: 1,
+    });
+    expect(saved.currentVersion).toMatchObject({ version_number: 2, content: '# Human revision' });
+    await expect(saveOutputVersion({
+      workspaceId: me.json().workspace_id,
+      documentId: initialized.id,
+      actorId: me.json().id,
+      content: '# Stale edit',
+      baseVersionNumber: 1,
+    })).rejects.toThrow('OUTPUT_VERSION_CONFLICT');
+
+    const reverted = await revertOutputVersion({
+      workspaceId: me.json().workspace_id,
+      documentId: initialized.id,
+      actorId: me.json().id,
+      versionId: initialized.currentVersion.id,
+      baseVersionNumber: 2,
+    });
+    expect(reverted.currentVersion).toMatchObject({ version_number: 3, content: '# Original result' });
+    const fetched = await app.inject({
+      method: 'GET',
+      url: `/v1/output-documents/tasks/${task.id}`,
+      headers,
+    });
+    expect(fetched.statusCode, fetched.body).toBe(200);
+    expect(fetched.json().document).toMatchObject({ id: initialized.id, current_version_number: 3 });
+    const routeSaved = await app.inject({
+      method: 'POST',
+      url: `/v1/output-documents/${initialized.id}/versions`,
+      headers,
+      payload: { content: '# Saved through the API', baseVersionNumber: 3 },
+    });
+    expect(routeSaved.statusCode, routeSaved.body).toBe(201);
+    expect(routeSaved.json().currentVersion).toMatchObject({ version_number: 4, content: '# Saved through the API' });
+    const olderArtifacts = await app.inject({
+      method: 'POST',
+      url: `/v1/output-documents/${initialized.id}/artifacts`,
+      headers,
+      payload: { versionId: reverted.currentVersion.id, formats: ['md'] },
+    });
+    expect(olderArtifacts.statusCode, olderArtifacts.body).toBe(202);
+    const currentArtifacts = await app.inject({
+      method: 'POST',
+      url: `/v1/output-documents/${initialized.id}/artifacts`,
+      headers,
+      payload: { versionId: routeSaved.json().currentVersion.id, formats: ['md', 'html'] },
+    });
+    expect(currentArtifacts.statusCode, currentArtifacts.body).toBe(202);
+    expect(currentArtifacts.json().data).toEqual(expect.arrayContaining([
+      expect.objectContaining({ format: 'md', output_document_version_id: routeSaved.json().currentVersion.id }),
+      expect.objectContaining({ format: 'html', output_document_version_id: routeSaved.json().currentVersion.id }),
+    ]));
+    const versionedArtifacts = await query<{ id: string; format: string; output_document_version_id: string }>(
+      `SELECT id,format,output_document_version_id FROM artifacts
+        WHERE task_id=$1 AND output_document_version_id IS NOT NULL`,
+      [task.id],
+    );
+    expect(versionedArtifacts.rows.filter((artifact) => artifact.format === 'md')).toHaveLength(2);
+
+    const isolated = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/register',
+      payload: {
+        email: `editable-isolated-${suffix}@example.test`,
+        password,
+        displayName: 'Isolated Editor',
+        workspaceName: `Editable Isolated ${suffix}`,
+      },
+    });
+    expect(isolated.statusCode, isolated.body).toBe(201);
+    const crossWorkspace = await app.inject({
+      method: 'POST',
+      url: `/v1/output-documents/${initialized.id}/versions`,
+      headers: { authorization: `Bearer ${isolated.json().accessToken}` },
+      payload: { content: '# Unauthorized edit', baseVersionNumber: 4 },
+    });
+    expect(crossWorkspace.statusCode, crossWorkspace.body).toBe(404);
+    expect(crossWorkspace.json()).toMatchObject({ error: 'OUTPUT_DOCUMENT_NOT_FOUND' });
+    expect((await query<{ output: unknown }>('SELECT output FROM tasks WHERE id=$1', [task.id])).rows[0].output).toEqual(original);
   }, 30_000);
 
   it('blocks new AI work after an enforced local budget is exhausted', async () => {

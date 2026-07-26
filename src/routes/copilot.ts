@@ -12,6 +12,7 @@ const chatInput = z.object({
     content: z.string().trim().min(1).max(8_000),
   })).min(1).max(20).refine((messages) => messages.at(-1)?.role === 'user', 'The last message must be from the user'),
 });
+export type WoodyChatMessage = z.infer<typeof chatInput>['messages'][number];
 
 type WorkspaceSummary = {
   workspace_name: string;
@@ -25,7 +26,7 @@ type WorkspaceSummary = {
   agent_names: string[] | null;
 };
 
-export function buildWoodySystemPrompt(summary: WorkspaceSummary) {
+export function buildWoodySystemPrompt(summary: WorkspaceSummary, attachmentContext = '') {
   const workspaceContext = JSON.stringify({
     workspaceName: summary.workspace_name,
     activeAgents: Number(summary.active_agents),
@@ -62,7 +63,9 @@ SAFETY AND ACCURACY:
 - Prefer read-only permissions. Call out external writes, destructive actions, costs, missing information, and human approvals.
 - Keep normal answers concise. Use Markdown when structure helps.
 
-<workspace_context>${workspaceContext}</workspace_context>`;
+<workspace_context>${workspaceContext}</workspace_context>
+
+${attachmentContext}`;
 }
 
 async function workspaceSummary(workspaceId: string) {
@@ -82,65 +85,68 @@ async function workspaceSummary(workspaceId: string) {
   )).rows[0];
 }
 
+export async function answerWoody(workspaceId: string, messages: WoodyChatMessage[], attachmentContext = '') {
+  const latest = messages.at(-1)?.content ?? '';
+  if (containsLikelySecret(latest)) throw Object.assign(new Error('MESSAGE_CONTAINS_POSSIBLE_SECRET'), { statusCode: 400 });
+  await assertWorkspaceAiBudgetAvailable(workspaceId);
+  const [summary, runtime] = await Promise.all([
+    workspaceSummary(workspaceId),
+    configuredAiProviderForWorkspace(workspaceId).then(assertConfiguredAiProvider),
+  ]);
+  if (!summary) throw Object.assign(new Error('WORKSPACE_NOT_FOUND'), { statusCode: 404 });
+
+  const system = buildWoodySystemPrompt(summary, attachmentContext);
+  const model = runtime.defaultModel;
+  let message = '';
+  let requestId: string | null = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let headers: { get(name: string): string | null } | null = null;
+
+  if (runtime.anthropic) {
+    const result = await runtime.anthropic.messages.create({
+      model,
+      system,
+      max_tokens: 1_500,
+      temperature: 0.3,
+      messages,
+    }).withResponse();
+    message = result.data.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
+    requestId = result.request_id ?? null;
+    inputTokens = result.data.usage.input_tokens;
+    outputTokens = result.data.usage.output_tokens;
+    headers = result.response.headers;
+  } else if (runtime.openAiCompatible) {
+    const result = await runtime.openAiCompatible.chat.completions.create({
+      model,
+      temperature: 0.3,
+      max_tokens: 1_500,
+      messages: [{ role: 'system', content: system }, ...messages],
+    }).withResponse();
+    message = result.data.choices[0]?.message?.content ?? '';
+    requestId = result.request_id;
+    inputTokens = result.data.usage?.prompt_tokens ?? 0;
+    outputTokens = result.data.usage?.completion_tokens ?? 0;
+    headers = result.response.headers;
+  }
+  if (!message.trim()) throw Object.assign(new Error('COPILOT_EMPTY_RESPONSE'), { statusCode: 502 });
+
+  const estimatedCostUsd = await recordAiUsage({
+    workspaceId,
+    source: 'copilot',
+    provider: runtime.provider,
+    model,
+    requestId,
+    inputTokens,
+    outputTokens,
+    headers,
+  });
+  return { message, provider: runtime.provider, model, usage: { inputTokens, outputTokens, estimatedCostUsd } };
+}
+
 export async function copilotRoutes(app: FastifyInstance) {
   app.post('/chat', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const input = parse(chatInput, request.body, reply); if (!input) return;
-    const latest = input.messages.at(-1)!.content;
-    if (containsLikelySecret(latest)) return reply.code(400).send({ error: 'MESSAGE_CONTAINS_POSSIBLE_SECRET' });
-
-    await assertWorkspaceAiBudgetAvailable(request.user.workspaceId);
-    const [summary, runtime] = await Promise.all([
-      workspaceSummary(request.user.workspaceId),
-      configuredAiProviderForWorkspace(request.user.workspaceId).then(assertConfiguredAiProvider),
-    ]);
-    if (!summary) return reply.code(404).send({ error: 'WORKSPACE_NOT_FOUND' });
-
-    const system = buildWoodySystemPrompt(summary);
-    const model = runtime.defaultModel;
-    let message = '';
-    let requestId: string | null = null;
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let headers: { get(name: string): string | null } | null = null;
-
-    if (runtime.anthropic) {
-      const result = await runtime.anthropic.messages.create({
-        model,
-        system,
-        max_tokens: 1_500,
-        temperature: 0.3,
-        messages: input.messages,
-      }).withResponse();
-      message = result.data.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
-      requestId = result.request_id ?? null;
-      inputTokens = result.data.usage.input_tokens;
-      outputTokens = result.data.usage.output_tokens;
-      headers = result.response.headers;
-    } else if (runtime.openAiCompatible) {
-      const result = await runtime.openAiCompatible.chat.completions.create({
-        model,
-        temperature: 0.3,
-        max_tokens: 1_500,
-        messages: [{ role: 'system', content: system }, ...input.messages],
-      }).withResponse();
-      message = result.data.choices[0]?.message?.content ?? '';
-      requestId = result.request_id;
-      inputTokens = result.data.usage?.prompt_tokens ?? 0;
-      outputTokens = result.data.usage?.completion_tokens ?? 0;
-      headers = result.response.headers;
-    }
-    if (!message.trim()) throw Object.assign(new Error('COPILOT_EMPTY_RESPONSE'), { statusCode: 502 });
-
-    const estimatedCostUsd = await recordAiUsage({
-      workspaceId: request.user.workspaceId,
-      source: 'copilot',
-      provider: runtime.provider,
-      model,
-      requestId,
-      inputTokens,
-      outputTokens,
-      headers,
-    });
-    return { message, provider: runtime.provider, model, usage: { inputTokens, outputTokens, estimatedCostUsd } };
+    return answerWoody(request.user.workspaceId, input.messages);
   }));
 }

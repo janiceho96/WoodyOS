@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ARTIFACT_FORMATS, artifactFormatSchema, artifactRegistry } from '../artifacts/registry.js';
 
 export const workflowNodeTypes = [
   'trigger',
@@ -20,6 +21,14 @@ export type WorkflowNodeType = z.infer<typeof workflowNodeTypeSchema>;
 export type WorkflowNodeCategory = 'trigger' | 'ai' | 'integration' | 'knowledge' | 'logic' | 'human' | 'output';
 export type WorkflowNodeRisk = 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
 export type WorkflowNodeAdapter = 'logic' | 'agent' | 'legacy_tool' | 'api' | 'mcp' | 'knowledge' | 'file' | 'browser';
+export const workflowInspectorSections = ['inputs', 'configuration', 'conditions', 'execution', 'input_collection', 'variables'] as const;
+export type WorkflowInspectorSection = typeof workflowInspectorSections[number];
+export type WorkflowNodeCapability = {
+  inspectorSections: WorkflowInspectorSection[];
+  supportsInputMapping: boolean;
+  supportsStructuredOutput: boolean;
+  supportsDynamicHandles: boolean;
+};
 export type WorkflowPort = {
   id: string;
   label: string;
@@ -36,7 +45,7 @@ export type WorkflowConfigField = {
   help?: string;
 };
 
-type RegistryEntry = {
+type RegistryEntry = WorkflowNodeCapability & {
   type: WorkflowNodeType;
   category: WorkflowNodeCategory;
   title: string;
@@ -61,26 +70,45 @@ const retrySchema = z.object({
 }).passthrough();
 
 const recordSchema = z.record(z.unknown());
+export const workflowInputFieldSchema = z.object({
+  key: z.string().min(1).max(80).regex(/^[A-Za-z][A-Za-z0-9_]*$/),
+  label: z.string().min(1).max(120),
+  type: z.enum(['text', 'number', 'boolean', 'object', 'collection', 'file']),
+  required: z.boolean().optional(),
+  default: z.unknown().optional(),
+  example: z.unknown().optional(),
+  description: z.string().max(500).optional(),
+});
 const normalInput: WorkflowPort[] = [{ id: 'input', label: 'Input', dataType: 'any' }];
 const normalOutput: WorkflowPort[] = [{ id: 'output', label: 'Output', dataType: 'any' }];
 
 const entries = [
   {
     type: 'trigger', category: 'trigger', title: 'Manual trigger', description: 'Starts a workflow with input provided by the user or API.', icon: 'zap', adapter: 'logic', risk: 'read', available: true, retryable: false,
-    inputPorts: [], outputPorts: [{ id: 'output', label: 'Input data', dataType: 'object', required: true }], configFields: [], configSchema: z.object({}).passthrough(),
+    inspectorSections: ['input_collection', 'variables'], supportsInputMapping: false, supportsStructuredOutput: false, supportsDynamicHandles: false,
+    inputPorts: [], outputPorts: [{ id: 'output', label: 'Input data', dataType: 'object', required: true }],
+    configFields: [
+      { key: 'inputSchema', label: 'Input collection', control: 'json' },
+      { key: 'variables', label: 'Initial variables', control: 'json' },
+    ],
+    configSchema: z.object({ inputSchema: z.array(workflowInputFieldSchema).max(50).optional(), variables: recordSchema.optional() }).passthrough(),
   },
   {
     type: 'agent', category: 'ai', title: 'Agent', description: 'Assigns a bounded piece of work to an active Woody agent.', icon: 'bot', adapter: 'agent', risk: 'unknown', available: true, retryable: true,
+    inspectorSections: ['inputs', 'configuration', 'execution'], supportsInputMapping: true, supportsStructuredOutput: true, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: normalOutput,
     configFields: [
       { key: 'agentId', label: 'Agent', control: 'resource', resource: 'agent', required: true },
       { key: 'responsibility', label: 'Responsibility', control: 'textarea' },
       { key: 'expectedOutput', label: 'Expected output', control: 'textarea' },
+      { key: 'inputMapping', label: 'Input mapping', control: 'json' },
+      { key: 'outputContract', label: 'Output contract', control: 'select', options: [{ value: 'text', label: 'Text' }, { value: 'grader', label: 'Quality grader' }] },
     ],
-    configSchema: z.object({ agentId: z.string().uuid(), title: z.string().max(200).optional(), responsibility: z.string().max(5_000).optional(), expectedOutput: z.string().max(5_000).optional(), retry: retrySchema.optional() }).passthrough(),
+    configSchema: z.object({ agentId: z.string().uuid(), title: z.string().max(200).optional(), responsibility: z.string().max(5_000).optional(), expectedOutput: z.string().max(5_000).optional(), inputMapping: recordSchema.optional(), outputContract: z.enum(['text', 'grader']).optional(), retry: retrySchema.optional() }).passthrough(),
   },
   {
     type: 'action', category: 'integration', title: 'Legacy tool action', description: 'Calls an existing encrypted API tool. Kept for saved workflow compatibility.', icon: 'wrench', adapter: 'legacy_tool', risk: 'unknown', available: true, retryable: true,
+    inspectorSections: ['inputs', 'configuration', 'execution'], supportsInputMapping: true, supportsStructuredOutput: false, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: normalOutput,
     configFields: [
       { key: 'toolId', label: 'Tool', control: 'resource', resource: 'api_tool', required: true },
@@ -90,6 +118,7 @@ const entries = [
   },
   {
     type: 'condition', category: 'logic', title: 'Condition', description: 'Chooses a true or false path using a safe state reference.', icon: 'split', adapter: 'logic', risk: 'read', available: true, retryable: false,
+    inspectorSections: ['inputs', 'conditions'], supportsInputMapping: false, supportsStructuredOutput: false, supportsDynamicHandles: true,
     inputPorts: normalInput,
     outputPorts: [{ id: 'true', label: 'True', dataType: 'boolean', required: true }, { id: 'false', label: 'False', dataType: 'boolean', required: true }],
     configFields: [
@@ -101,12 +130,14 @@ const entries = [
   },
   {
     type: 'approval', category: 'human', title: 'Human approval', description: 'Pauses the workflow for a business decision. External writes still require action-bound confirmation.', icon: 'shield-check', adapter: 'logic', risk: 'read', available: true, retryable: false,
+    inspectorSections: ['inputs', 'configuration'], supportsInputMapping: false, supportsStructuredOutput: false, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: normalOutput,
     configFields: [{ key: 'prompt', label: 'Approval prompt', control: 'textarea' }],
     configSchema: z.object({ prompt: z.string().max(2_000).optional() }).passthrough(),
   },
   {
     type: 'loop', category: 'logic', title: 'Controlled loop', description: 'Repeats a path with an enforced maximum iteration count.', icon: 'repeat-2', adapter: 'logic', risk: 'read', available: true, retryable: false,
+    inspectorSections: ['inputs', 'conditions', 'configuration', 'variables'], supportsInputMapping: false, supportsStructuredOutput: false, supportsDynamicHandles: true,
     inputPorts: normalInput,
     outputPorts: [{ id: 'body', label: 'Loop body', dataType: 'any', required: true }, { id: 'done', label: 'Done', dataType: 'any', required: true }],
     configFields: [
@@ -122,21 +153,24 @@ const entries = [
   },
   {
     type: 'output', category: 'output', title: 'Return output', description: 'Completes the workflow and optionally generates downloadable files.', icon: 'file-output', adapter: 'file', risk: 'read', available: true, retryable: false,
+    inspectorSections: ['inputs', 'configuration'], supportsInputMapping: false, supportsStructuredOutput: false, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: [],
     configFields: [
       { key: 'fromNodeId', label: 'Result source', control: 'resource', resource: 'node' },
-      { key: 'artifactFormats', label: 'Generate files', control: 'multiselect', options: ['pdf', 'docx', 'pptx', 'xlsx'].map((value) => ({ value, label: value.toUpperCase() })) },
+      { key: 'artifactFormats', label: 'Generate files', control: 'multiselect', options: ARTIFACT_FORMATS.map((value) => ({ value, label: artifactRegistry[value].label })) },
     ],
-    configSchema: z.object({ fromNodeId: z.string().max(100).optional(), artifactFormats: z.array(z.enum(['pdf', 'docx', 'pptx', 'xlsx'])).max(4).optional(), output: recordSchema.optional() }).passthrough(),
+    configSchema: z.object({ fromNodeId: z.string().max(100).optional(), artifactFormats: z.array(artifactFormatSchema).max(9).optional(), output: recordSchema.optional() }).passthrough(),
   },
   {
     type: 'api_action', category: 'integration', title: 'API action', description: 'Calls an enabled custom API through the workflow action policy gateway.', icon: 'plug-zap', adapter: 'api', risk: 'unknown', available: true, retryable: false,
+    inspectorSections: ['inputs', 'configuration', 'execution'], supportsInputMapping: true, supportsStructuredOutput: false, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: normalOutput,
     configFields: [{ key: 'toolId', label: 'API action', control: 'resource', resource: 'api_tool', required: true }, { key: 'input', label: 'Input mapping', control: 'json' }],
     configSchema: z.object({ toolId: z.string().uuid(), input: recordSchema.optional() }).passthrough(),
   },
   {
     type: 'mcp_action', category: 'integration', title: 'App action', description: 'Calls an exact discovered MCP tool using a selected agent’s allowlist.', icon: 'blocks', adapter: 'mcp', risk: 'unknown', available: true, retryable: false,
+    inspectorSections: ['inputs', 'configuration', 'execution'], supportsInputMapping: true, supportsStructuredOutput: false, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: normalOutput,
     configFields: [
       { key: 'agentId', label: 'Permission agent', control: 'resource', resource: 'agent', required: true },
@@ -147,12 +181,14 @@ const entries = [
   },
   {
     type: 'knowledge_search', category: 'knowledge', title: 'Search knowledge', description: 'Retrieves relevant workspace Knowledge for later nodes.', icon: 'library', adapter: 'knowledge', risk: 'read', available: true, retryable: false,
+    inspectorSections: ['inputs', 'configuration', 'execution'], supportsInputMapping: true, supportsStructuredOutput: false, supportsDynamicHandles: false,
     inputPorts: normalInput, outputPorts: [{ id: 'results', label: 'Search results', dataType: 'collection', required: true }],
     configFields: [{ key: 'query', label: 'Query mapping', control: 'text', required: true }, { key: 'limit', label: 'Maximum results', control: 'number' }],
     configSchema: z.object({ query: z.string().min(1).max(5_000), limit: z.number().int().min(1).max(20).optional() }).passthrough(),
   },
   {
     type: 'browser', category: 'integration', title: 'Browser', description: 'Open pages and interact with websites in a controlled browser session.', icon: 'globe-2', adapter: 'browser', risk: 'unknown', available: false,
+    inspectorSections: ['inputs', 'configuration', 'execution'], supportsInputMapping: true, supportsStructuredOutput: false, supportsDynamicHandles: false,
     availabilityReason: 'Browser automation needs an isolated, policy-enforced runtime before it can be enabled safely.',
     retryable: false, inputPorts: normalInput, outputPorts: normalOutput, configFields: [], configSchema: z.object({}).passthrough(),
   },

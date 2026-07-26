@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import re
 import subprocess
 import tempfile
+import zipfile
 from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -38,10 +41,11 @@ Image.MAX_IMAGE_PIXELS = 25_000_000
 
 
 class GenerateRequest(BaseModel):
-    format: Literal["pdf", "docx", "pptx", "xlsx"]
+    format: Literal["pdf", "docx", "pptx", "xlsx", "html", "md", "txt", "csv", "json"]
     title: str = Field(min_length=1, max_length=300)
     content: str = Field(min_length=1, max_length=2_000_000)
     theme: dict | None = None
+    structured: Any | None = None
 
 
 def safe_filename(title: str, suffix: str) -> str:
@@ -432,39 +436,386 @@ def generate_xlsx(title: str, blocks: list[dict]) -> bytes:
     return target.getvalue()
 
 
+def html_theme(raw_theme: dict | None) -> dict:
+    defaults = {
+        "background": "#0B1020", "surface": "#121A30", "text": "#F5F7FF",
+        "muted": "#AAB3CC", "accent": "#8B7CFF", "border": "#2B3657",
+        "headingFont": "system", "bodyFont": "system", "density": "comfortable",
+    }
+    value = {**defaults, **(raw_theme or {})}
+    for key in ("background", "surface", "text", "muted", "accent", "border"):
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(value.get(key, ""))):
+            value[key] = defaults[key]
+    for key in ("headingFont", "bodyFont"):
+        if value.get(key) not in {"system", "serif", "mono"}:
+            value[key] = defaults[key]
+    if value.get("density") not in {"comfortable", "compact"}:
+        value["density"] = defaults["density"]
+    return value
+
+
+def generate_html(title: str, blocks: list[dict], raw_theme: dict | None = None) -> bytes:
+    theme = html_theme(raw_theme)
+    font_stacks = {
+        "system": 'system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+        "serif": 'Georgia,"Times New Roman",serif',
+        "mono": '"SFMono-Regular",Consolas,"Liberation Mono",monospace',
+    }
+    heading_font = font_stacks[theme["headingFont"]]
+    body_font = font_stacks[theme["bodyFont"]]
+    main_padding = "40px 0 64px" if theme["density"] == "compact" else "64px 0 96px"
+    body = []
+    for block in blocks:
+        kind = block["type"]
+        if kind == "heading":
+            level = max(1, min(6, int(block["level"])))
+            body.append(f"<h{level}>{escape(strip_markdown(block['text']))}</h{level}>")
+        elif kind == "paragraph":
+            body.append(f"<p>{escape(strip_markdown(block['text']))}</p>")
+        elif kind == "code":
+            language = escape(str(block.get("language", "")))
+            body.append(f'<pre><code data-language="{language}">{escape(block["text"])}</code></pre>')
+        elif kind == "list":
+            tag = "ol" if block["ordered"] else "ul"
+            items = "".join(f"<li>{escape(strip_markdown(item))}</li>" for item in block["items"])
+            body.append(f"<{tag}>{items}</{tag}>")
+        elif kind == "table":
+            rows = block["rows"]
+            if rows:
+                head = "".join(f"<th>{escape(strip_markdown(value))}</th>" for value in rows[0])
+                remaining = "".join(
+                    "<tr>" + "".join(f"<td>{escape(strip_markdown(value))}</td>" for value in row) + "</tr>"
+                    for row in rows[1:]
+                )
+                body.append(f"<div class=\"table-wrap\"><table><thead><tr>{head}</tr></thead><tbody>{remaining}</tbody></table></div>")
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>{escape(title)}</title>
+  <style>
+    :root {{ color-scheme:light dark; --bg:{theme["background"]}; --surface:{theme["surface"]}; --text:{theme["text"]}; --muted:{theme["muted"]}; --accent:{theme["accent"]}; --line:{theme["border"]}; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--text); font:16px/1.65 {body_font}; }}
+    main {{ width:min(960px,calc(100% - 32px)); margin:0 auto; padding:{main_padding}; }}
+    header {{ padding:28px 32px; margin-bottom:32px; border:1px solid var(--line); border-radius:18px; background:var(--surface); box-shadow:inset 4px 0 var(--accent); }}
+    h1,h2,h3,h4,h5,h6 {{ font-family:{heading_font}; }}
+    h1 {{ margin:0; font-size:clamp(2rem,5vw,3.4rem); line-height:1.05; letter-spacing:-.04em; }}
+    h2 {{ margin-top:2.2em; border-bottom:1px solid var(--line); padding-bottom:.35em; }}
+    h3,h4,h5,h6 {{ margin-top:1.8em; }}
+    p,li {{ color:var(--muted); }}
+    pre {{ overflow:auto; padding:18px; border:1px solid var(--line); border-radius:12px; background:#070b16; }}
+    code {{ font-family:"SFMono-Regular",Consolas,monospace; color:#90e7ff; }}
+    .table-wrap {{ overflow:auto; margin:24px 0; border:1px solid var(--line); border-radius:12px; }}
+    table {{ width:100%; border-collapse:collapse; background:var(--surface); }}
+    th,td {{ padding:12px 14px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
+    th {{ color:#fff; background:#302665; }}
+    @media print {{ :root {{ --bg:#fff; --surface:#fff; --text:#111827; --muted:#374151; --line:#d1d5db; }} main {{ width:100%; padding:0; }} }}
+  </style>
+</head>
+<body><main><header><h1>{escape(title)}</h1></header>{''.join(body)}</main></body>
+</html>"""
+    return document.encode("utf-8")
+
+
+def generate_plain_text(title: str, blocks: list[dict]) -> bytes:
+    lines = [title, "=" * min(80, len(title)), ""]
+    for block in blocks:
+        if block["type"] == "heading":
+            lines.extend([strip_markdown(block["text"]), ""])
+        elif block["type"] in {"paragraph", "code"}:
+            lines.extend([strip_markdown(block["text"]), ""])
+        elif block["type"] == "list":
+            lines.extend([f"{index + 1}. {strip_markdown(item)}" if block["ordered"] else f"- {strip_markdown(item)}" for index, item in enumerate(block["items"])])
+            lines.append("")
+        elif block["type"] == "table":
+            lines.extend(["\t".join(strip_markdown(cell) for cell in row) for row in block["rows"]])
+            lines.append("")
+    return "\n".join(lines).strip().encode("utf-8")
+
+
+def generate_csv(blocks: list[dict]) -> bytes:
+    target = io.StringIO()
+    writer = csv.writer(target)
+    table = next((block for block in blocks if block["type"] == "table"), None)
+    if table:
+        for row in table["rows"]:
+            writer.writerow([spreadsheet_text(value) for value in row])
+    else:
+        writer.writerow(["Type", "Content"])
+        for block in blocks:
+            if block["type"] == "list":
+                for item in block["items"]:
+                    writer.writerow(["List item", spreadsheet_text(item)])
+            else:
+                writer.writerow([block["type"].title(), spreadsheet_text(block.get("text", ""))])
+    return target.getvalue().encode("utf-8-sig")
+
+
+def generate_json(content: str, structured: Any | None) -> bytes:
+    value = structured if isinstance(structured, (dict, list)) else {"content": content}
+    return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+
+
 def require_token(value: str | None) -> None:
     expected = os.getenv("EXTRACTOR_TOKEN")
     if expected and value != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def validate_office_package(data: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 10_000:
+                raise ValueError("Office package contains too many entries")
+            total = sum(entry.file_size for entry in entries)
+            compressed = sum(max(1, entry.compress_size) for entry in entries)
+            if total > 200 * 1024 * 1024 or total / compressed > 200:
+                raise ValueError("Office package exceeds safe decompression limits")
+    except zipfile.BadZipFile as error:
+        raise ValueError("The uploaded Office document is not a valid package") from error
+
+
+def pdf_ocr(data: bytes, page_count: int) -> list[str]:
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "source.pdf"
+        source.write_bytes(data)
+        prefix = Path(directory) / "page"
+        limit = min(page_count, 30)
+        subprocess.run(
+            ["pdftoppm", "-f", "1", "-l", str(limit), "-png", "-r", "150", str(source), str(prefix)],
+            check=True, capture_output=True, timeout=90,
+        )
+        pages = []
+        for image in sorted(Path(directory).glob("page-*.png")):
+            result = subprocess.run(
+                ["tesseract", str(image), "stdout", "-l", "eng"],
+                check=True, capture_output=True, text=True, timeout=60,
+            )
+            pages.append(result.stdout.strip())
+        return pages
+
+
+def extract_pdf_document(data: bytes) -> dict:
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        try:
+            unlocked = reader.decrypt("")
+        except Exception as error:
+            raise ValueError("Password-protected PDFs are not supported") from error
+        if not unlocked:
+            raise ValueError("Password-protected PDFs are not supported")
+    if len(reader.pages) > 500:
+        raise ValueError("PDFs are limited to 500 pages")
+    page_text = [(page.extract_text() or "").strip() for page in reader.pages]
+    used_ocr = False
+    if not any(page_text):
+        page_text = pdf_ocr(data, len(reader.pages))
+        used_ocr = True
+    sections = [
+        {"locator": f"Page {index}", "content": text, "metadata": {"page": index, "ocr": used_ocr}}
+        for index, text in enumerate(page_text, 1) if text
+    ]
+    content = "\n\n".join(f"## Page {index}\n\n{text}" for index, text in enumerate(page_text, 1) if text).strip()
+    return {
+        "content": content,
+        "sections": sections,
+        "structured": {"type": "pdf", "pages": len(reader.pages), "ocr": used_ocr},
+        "metadata": {"pages": len(reader.pages), "ocr": used_ocr, "ocrPageLimit": 30 if used_ocr else None},
+    }
+
+
 def extract_pdf(data: bytes) -> str:
-    return "\n\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(data)).pages).strip()
+    return extract_pdf_document(data)["content"]
+
+
+def extract_docx_document(data: bytes) -> dict:
+    validate_office_package(data)
+    document = Document(io.BytesIO(data))
+    sections = []
+    parts = []
+    paragraph_number = 0
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        paragraph_number += 1
+        locator = f"Paragraph {paragraph_number}"
+        parts.append(text)
+        sections.append({"locator": locator, "content": text, "metadata": {"paragraph": paragraph_number}})
+    for table_number, table in enumerate(document.tables, 1):
+        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        rendered = "\n".join("| " + " | ".join(value.replace("|", "\\|") for value in row) + " |" for row in rows)
+        if rendered:
+            parts.append(f"### Table {table_number}\n\n{rendered}")
+            sections.append({"locator": f"Table {table_number}", "content": rendered, "metadata": {"table": table_number}})
+    return {
+        "content": "\n\n".join(parts).strip(),
+        "sections": sections,
+        "structured": {"type": "docx", "paragraphs": paragraph_number, "tables": len(document.tables)},
+        "metadata": {"paragraphs": paragraph_number, "tables": len(document.tables)},
+    }
 
 
 def extract_docx(data: bytes) -> str:
-    document = Document(io.BytesIO(data))
-    parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
-    for table in document.tables:
-        parts.extend(" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows)
-    return "\n".join(parts).strip()
+    return extract_docx_document(data)["content"]
+
+
+def extract_spreadsheet_document(data: bytes) -> dict:
+    validate_office_package(data)
+    workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    parts: list[str] = []
+    sections = []
+    sheets = []
+    total_cells = 0
+    if len(workbook.worksheets) > 20:
+        raise ValueError("Workbooks are limited to 20 sheets")
+    for worksheet in workbook.worksheets:
+        rows: list[list[str]] = []
+        truncated = False
+        for row_number, row in enumerate(worksheet.iter_rows(values_only=True), 1):
+            if row_number > 10_000:
+                truncated = True
+                break
+            values = [str(value) if value is not None else "" for value in row[:200]]
+            if any(values):
+                rows.append(values)
+                total_cells += len(values)
+                if total_cells > 200_000:
+                    raise ValueError("Workbook exceeds the 200,000-cell extraction limit")
+        width = max((len(row) for row in rows), default=0)
+        normalized = [row + [""] * (width - len(row)) for row in rows]
+        rendered = "\n".join("| " + " | ".join(value.replace("|", "\\|") for value in row) + " |" for row in normalized)
+        parts.append(f"# Sheet: {worksheet.title}\n\n{rendered}".strip())
+        sections.append({
+            "locator": f"Sheet {worksheet.title}",
+            "content": rendered,
+            "metadata": {"sheet": worksheet.title, "rows": len(normalized), "columns": width, "truncated": truncated},
+        })
+        sheets.append({
+            "name": worksheet.title,
+            "range": worksheet.calculate_dimension(),
+            "rows": normalized,
+            "rowCount": len(normalized),
+            "columnCount": width,
+            "truncated": truncated,
+        })
+    return {
+        "content": "\n\n".join(parts).strip(),
+        "sections": sections,
+        "structured": {"type": "spreadsheet", "sheets": sheets},
+        "metadata": {"sheets": len(sheets), "cells": total_cells},
+    }
 
 
 def extract_spreadsheet(data: bytes) -> str:
-    workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    parts: list[str] = []
-    for worksheet in workbook.worksheets:
-        parts.append(f"# {worksheet.title}")
-        for row in worksheet.iter_rows(values_only=True):
-            values = [str(value) if value is not None else "" for value in row]
-            if any(values):
-                parts.append(" | ".join(values))
-    return "\n".join(parts).strip()
+    return extract_spreadsheet_document(data)["content"]
+
+
+def extract_csv_document(data: bytes) -> dict:
+    text = data.decode("utf-8-sig", errors="replace")
+    rows = []
+    for row_number, row in enumerate(csv.reader(io.StringIO(text)), 1):
+        if row_number > 10_000:
+            break
+        rows.append(row[:200])
+    if sum(len(row) for row in rows) > 200_000:
+        raise ValueError("CSV exceeds the 200,000-cell extraction limit")
+    width = max((len(row) for row in rows), default=0)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    rendered = "\n".join("| " + " | ".join(value.replace("|", "\\|") for value in row) + " |" for row in normalized).strip()
+    return {
+        "content": rendered,
+        "sections": [{"locator": "CSV rows", "content": rendered, "metadata": {"rows": len(normalized), "columns": width}}],
+        "structured": {"type": "csv", "rows": normalized, "rowCount": len(normalized), "columnCount": width},
+        "metadata": {"rows": len(normalized), "columns": width},
+    }
 
 
 def extract_csv(data: bytes) -> str:
-    text = data.decode("utf-8-sig", errors="replace")
-    return "\n".join(" | ".join(row) for row in csv.reader(io.StringIO(text))).strip()
+    return extract_csv_document(data)["content"]
+
+
+def extract_pptx_document(data: bytes) -> dict:
+    validate_office_package(data)
+    presentation = Presentation(io.BytesIO(data))
+    if len(presentation.slides) > 300:
+        raise ValueError("PowerPoint files are limited to 300 slides")
+    sections = []
+    slide_details = []
+    for slide_number, slide in enumerate(presentation.slides, 1):
+        parts = []
+        title = ""
+        for shape in slide.shapes:
+            if getattr(shape, "has_text_frame", False):
+                text = shape.text.strip()
+                if text:
+                    if not title:
+                        title = text.splitlines()[0][:300]
+                    parts.append(text)
+            if getattr(shape, "has_table", False):
+                rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
+                rendered = "\n".join("| " + " | ".join(value.replace("|", "\\|") for value in row) + " |" for row in rows)
+                if rendered:
+                    parts.append(rendered)
+        notes = ""
+        try:
+            if slide.has_notes_slide:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+        except (AttributeError, ValueError):
+            notes = ""
+        if notes:
+            parts.append(f"Speaker notes:\n{notes}")
+        content = "\n\n".join(parts).strip()
+        locator = f"Slide {slide_number}" + (f": {title}" if title else "")
+        if content:
+            sections.append({"locator": locator, "content": content, "metadata": {"slide": slide_number, "title": title}})
+        slide_details.append({"number": slide_number, "title": title, "hasNotes": bool(notes)})
+    content = "\n\n".join(f"## {section['locator']}\n\n{section['content']}" for section in sections)
+    return {
+        "content": content,
+        "sections": sections,
+        "structured": {"type": "pptx", "slides": slide_details},
+        "metadata": {"slides": len(presentation.slides)},
+    }
+
+
+class SafeHtmlTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.blocked = 0
+
+    def handle_starttag(self, tag: str, attrs):
+        if tag.lower() in {"script", "style", "iframe", "form", "object", "embed"}:
+            self.blocked += 1
+        elif not self.blocked and tag.lower() in {"p", "div", "section", "article", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str):
+        if tag.lower() in {"script", "style", "iframe", "form", "object", "embed"} and self.blocked:
+            self.blocked -= 1
+        elif not self.blocked and tag.lower() in {"p", "div", "section", "article", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str):
+        if not self.blocked:
+            self.parts.append(data)
+
+
+def extract_html_document(data: bytes) -> dict:
+    parser = SafeHtmlTextExtractor()
+    parser.feed(data.decode("utf-8", errors="replace"))
+    content = re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+    return {
+        "content": content,
+        "sections": [{"locator": "HTML document", "content": content, "metadata": {"sanitized": True}}],
+        "structured": {"type": "html", "sanitized": True},
+        "metadata": {"sanitized": True},
+    }
 
 
 def extract_image(data: bytes, suffix: str) -> str:
@@ -511,20 +862,44 @@ async def extract(file: UploadFile = File(...), authorization: str | None = Head
     name = file.filename or "upload"
     suffix = Path(name).suffix.lower()
     try:
-        if suffix == ".pdf": content = extract_pdf(data)
-        elif suffix == ".docx": content = extract_docx(data)
-        elif suffix in {".xlsx", ".xlsm"}: content = extract_spreadsheet(data)
-        elif suffix == ".csv": content = extract_csv(data)
-        elif suffix in {".txt", ".md"}: content = data.decode("utf-8", errors="replace").strip()
-        elif suffix in {".png", ".jpg", ".jpeg", ".webp"}: content = extract_image(data, suffix)
+        if suffix == ".pdf": result = extract_pdf_document(data)
+        elif suffix == ".docx": result = extract_docx_document(data)
+        elif suffix == ".pptx": result = extract_pptx_document(data)
+        elif suffix in {".xlsx", ".xlsm"}: result = extract_spreadsheet_document(data)
+        elif suffix == ".csv": result = extract_csv_document(data)
+        elif suffix in {".txt", ".md"}:
+            content = data.decode("utf-8", errors="replace").strip()
+            result = {
+                "content": content,
+                "sections": [{"locator": "Document", "content": content, "metadata": {"format": suffix[1:]}}],
+                "structured": {"type": suffix[1:]},
+                "metadata": {},
+            }
+        elif suffix == ".html": result = extract_html_document(data)
+        elif suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            content = extract_image(data, suffix)
+            result = {
+                "content": content,
+                "sections": [{"locator": "Image OCR", "content": content, "metadata": {"ocr": True}}],
+                "structured": {"type": "image", "ocr": True},
+                "metadata": {"ocr": True},
+            }
         else: raise HTTPException(status_code=415, detail=f"Unsupported file type: {suffix or 'unknown'}")
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(status_code=422, detail=f"Could not extract {name}: {error}") from error
+    content = result["content"]
     if not content:
         raise HTTPException(status_code=422, detail="No text could be extracted from this file")
-    return {"name": name, "content": content, "characters": len(content)}
+    return {
+        "name": name,
+        "content": content,
+        "characters": len(content),
+        "sections": result.get("sections", []),
+        "structured": result.get("structured", {}),
+        "metadata": result.get("metadata", {}),
+    }
 
 
 @app.post("/avatar")
@@ -562,9 +937,24 @@ def generate(request: GenerateRequest, authorization: str | None = Header(defaul
         elif request.format == "pptx":
             data = generate_pptx(request.title, blocks, request.theme)
             media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        else:
+        elif request.format == "xlsx":
             data = generate_xlsx(request.title, blocks)
             media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif request.format == "html":
+            data = generate_html(request.title, blocks, request.theme)
+            media_type = "text/html; charset=utf-8"
+        elif request.format == "md":
+            data = request.content.encode("utf-8")
+            media_type = "text/markdown; charset=utf-8"
+        elif request.format == "txt":
+            data = generate_plain_text(request.title, blocks)
+            media_type = "text/plain; charset=utf-8"
+        elif request.format == "csv":
+            data = generate_csv(blocks)
+            media_type = "text/csv; charset=utf-8"
+        else:
+            data = generate_json(request.content, request.structured)
+            media_type = "application/json; charset=utf-8"
     except Exception as error:
         raise HTTPException(status_code=422, detail=f"Could not generate {request.format}: {error}") from error
     if not data:

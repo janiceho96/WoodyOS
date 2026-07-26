@@ -2,7 +2,27 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ImagePlus, LoaderCircle, RotateCcw, Type } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { api, type Agent, type AgentAvatarConfig, type AgentAvatarIcon } from '../../api';
-import { AgentAvatar, agentAvatarIcons, agentAvatarPalettes, defaultAgentAvatar, initialsFor } from './AgentAvatar';
+import { BrandIcon, brandIconLabel, type BrandIconKey } from '../BrandIcon';
+import { AgentAvatar, agentAvatarBrands, agentAvatarIcons, agentAvatarPalettes, defaultAgentAvatar, initialsFor } from './AgentAvatar';
+
+const roleIconLabels: Record<AgentAvatarIcon, string> = {
+  agent: 'AI agent',
+  network: 'Coordinator',
+  search: 'Research',
+  route: 'Workflow',
+  code: 'Engineering',
+  pen: 'Writing',
+  megaphone: 'Marketing',
+  chart: 'Analytics',
+  check: 'Quality',
+  brain: 'Strategy',
+  zap: 'Automation',
+  users: 'Team',
+  coins: 'Finance',
+  palette: 'Creative',
+  shield: 'Security',
+  sparkles: 'General AI',
+};
 
 export function AgentAvatarPicker({ agent, name, role, value, onChange, onAgentUpdated }: {
   agent?: Agent;
@@ -32,10 +52,11 @@ export function AgentAvatarPicker({ agent, name, role, value, onChange, onAgentU
     onError: (cause) => setError(cause instanceof Error ? cause.message : 'Could not reset avatar'),
   });
   const chooseIcon = (icon: AgentAvatarIcon) => onChange({ type: 'icon', value: icon, backgroundColor: shown.type !== 'image' ? shown.backgroundColor : undefined, accentColor: shown.type !== 'image' ? shown.accentColor : undefined });
-  const chooseColors = (backgroundColor: string, accentColor: string) => onChange(shown.type === 'image' ? { type: 'icon', value: 'sparkles', backgroundColor, accentColor } : { ...shown, backgroundColor, accentColor });
+  const chooseBrand = (brand: BrandIconKey) => onChange({ type: 'brand', value: brand, backgroundColor: shown.type !== 'image' ? shown.backgroundColor : undefined, accentColor: shown.type !== 'image' ? shown.accentColor : undefined });
+  const chooseColors = (backgroundColor: string, accentColor: string) => onChange(shown.type === 'image' ? { type: 'icon', value: 'agent', backgroundColor, accentColor } : { ...shown, backgroundColor, accentColor });
 
   return <div className="agent-avatar-picker">
-    <div className="avatar-picker-preview"><AgentAvatar agent={preview} size="xl"/><span><strong>Agent picture</strong><small>Used anywhere this agent appears.</small></span></div>
+    <div className="avatar-picker-preview"><AgentAvatar agent={preview} size="xl"/><span><strong>Agent identity</strong><small>Choose a role symbol, connected brand, or custom picture.</small></span></div>
     <div className="avatar-picker-modes">
       <button type="button" className={shown.type === 'initials' ? 'active' : ''} onClick={() => onChange({ type: 'initials', value: initialsFor(name) })}><Type size={15}/>Initials</button>
       <button type="button" onClick={() => input.current?.click()} disabled={!agent || upload.isPending}>{upload.isPending ? <LoaderCircle className="spin" size={15}/> : <ImagePlus size={15}/>}Upload image</button>
@@ -44,7 +65,10 @@ export function AgentAvatarPicker({ agent, name, role, value, onChange, onAgentU
     </div>
     {!agent && <small className="avatar-picker-help">Save this agent as a draft before uploading a custom image. Icons and initials can be chosen now.</small>}
     {shown.type === 'initials' && <label className="avatar-initials-field">Initials<input value={shown.value} maxLength={3} onChange={(event) => onChange({ ...shown, value: event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3) || 'A' })}/></label>}
-    <div className="avatar-icon-grid" aria-label="Choose an agent icon">{(Object.entries(agentAvatarIcons) as Array<[AgentAvatarIcon, typeof agentAvatarIcons[AgentAvatarIcon]]>).map(([key, Icon]) => <button type="button" aria-label={key} title={key} className={shown.type === 'icon' && shown.value === key ? 'active' : ''} key={key} onClick={() => chooseIcon(key)}><Icon size={18}/></button>)}</div>
+    <small className="avatar-picker-label">Role icons</small>
+    <div className="avatar-icon-grid" aria-label="Choose an agent icon">{(Object.entries(agentAvatarIcons) as Array<[AgentAvatarIcon, typeof agentAvatarIcons[AgentAvatarIcon]]>).map(([key, Icon]) => <button type="button" aria-label={roleIconLabels[key]} title={roleIconLabels[key]} className={shown.type === 'icon' && shown.value === key ? 'active' : ''} key={key} onClick={() => chooseIcon(key)}><Icon width={18} height={18}/></button>)}</div>
+    <small className="avatar-picker-label">AI and app brands</small>
+    <div className="avatar-icon-grid avatar-brand-grid" aria-label="Choose an AI or app brand">{agentAvatarBrands.map((key) => <button type="button" aria-label={brandIconLabel(key)} title={brandIconLabel(key)} className={shown.type === 'brand' && shown.value === key ? 'active' : ''} key={key} onClick={() => chooseBrand(key)}><BrandIcon iconKey={key} size={19}/></button>)}</div>
     <div className="avatar-palette-row" aria-label="Choose avatar colors">{agentAvatarPalettes.map(([background, accent]) => <button type="button" aria-label={`Use ${background} and ${accent}`} key={background} className={shown.type !== 'image' && shown.backgroundColor === background ? 'active' : ''} style={{ background, color: accent }} onClick={() => chooseColors(background, accent)}><i/></button>)}</div>
     {error && <small className="avatar-picker-error">{error}</small>}
   </div>;

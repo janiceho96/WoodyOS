@@ -14,3 +14,7 @@ export function resolveWorkflowTemplates(value: unknown, state: Record<string, u
   return value;
 }
 
+export function resolveNodeInput(mapping: Record<string, unknown> | undefined, state: Record<string, unknown>) {
+  if (!mapping) return state;
+  return resolveWorkflowTemplates(mapping, state) as Record<string, unknown>;
+}

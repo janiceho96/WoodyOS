@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveAgentRuntimePolicy } from '../src/lib/agent-runtime.js';
 import { materializeWebTool, webResearchCatalog, webToolInstallSchema } from '../src/tools/web/catalog.js';
-import { safeHttpRequest, validatedPublicHttpsUrl } from '../src/tools/web/http.js';
+import { createPinnedLookup, safeHttpRequest, validatedPublicHttpsUrl } from '../src/tools/web/http.js';
 import { isWebToolConfig, invokeWebTool } from '../src/tools/web/index.js';
 import { extractReadableHtml } from '../src/tools/web/page-reader.js';
 import type { ToolRecord } from '../src/tools/runtime.js';
@@ -42,6 +42,24 @@ describe('web research security and configuration', () => {
     expect(() => validatedPublicHttpsUrl('http://example.com')).toThrow(/HTTPS/);
     expect(() => validatedPublicHttpsUrl('https://user:pass@example.com')).toThrow(/Credentials/);
     await expect(safeHttpRequest('https://127.0.0.1/private')).rejects.toThrow(/Private|reserved/);
+  });
+
+  it('returns a pinned address in both Node lookup modes', async () => {
+    const lookup = createPinnedLookup({ address: '203.0.113.10', family: 4 });
+    const single = await new Promise<{ address: string; family?: number }>((resolve, reject) => {
+      lookup('example.com', { all: false }, (error, address, family) => {
+        if (error) reject(error);
+        else resolve({ address: String(address), family });
+      });
+    });
+    const all = await new Promise<unknown>((resolve, reject) => {
+      lookup('example.com', { all: true }, (error, addresses) => {
+        if (error) reject(error);
+        else resolve(addresses);
+      });
+    });
+    expect(single).toEqual({ address: '203.0.113.10', family: 4 });
+    expect(all).toEqual([{ address: '203.0.113.10', family: 4 }]);
   });
 
   it('requires Web access before a web tool reaches an agent runtime', () => {

@@ -1,3 +1,5 @@
+import type { BrandIconKey } from './components/BrandIcon';
+
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
 
 export type Onboarding = {
@@ -31,6 +33,16 @@ const errorMessages: Record<string, string> = {
   AI_PROVIDER_REDIRECT_BLOCKED: 'The provider redirected outside its configured origin, so Woody blocked the request.',
   AI_PROVIDER_CHANGED_DURING_RUN: 'The AI provider changed while this run was paused. Start a new run with the current provider.',
   PROMPT_COMPILER_INVALID_RESPONSE: 'The AI provider returned a response Woody could not safely turn into an agent proposal. Try again or use a stronger JSON-capable model.',
+  AGENT_PROMPT_INVALID_RESPONSE: 'The AI provider returned an incomplete agent prompt. Try again or choose a stronger JSON-capable model.',
+  AGENT_PROMPT_RETURNED_SECRET: 'Woody blocked the generated prompt because it may contain a secret.',
+  OUTPUT_TASK_NOT_FOUND: 'This task output could not be found.',
+  OUTPUT_TASK_NOT_COMPLETED: 'Only completed task outputs can be edited.',
+  OUTPUT_SOURCE_EMPTY: 'This task does not contain editable output text.',
+  OUTPUT_DOCUMENT_NOT_FOUND: 'This editable output could not be found.',
+  OUTPUT_VERSION_NOT_FOUND: 'This output version could not be found.',
+  OUTPUT_VERSION_CONFLICT: 'Another editor saved a newer version. Your draft is still safe.',
+  OUTPUT_CONTENT_INVALID: 'Output must contain between 1 and 100,000 characters.',
+  OUTPUT_ARTIFACT_QUEUE_UNAVAILABLE: 'The revision was saved, but Woody could not start file generation.',
   WORKFLOW_QUEUE_UNAVAILABLE: 'The workflow queue is unavailable. Ensure the Woody worker and Redis are running, then try the test again.',
   WORKFLOW_PUBLISH_REQUIRED: 'Save this workflow as a draft, test it successfully, then publish it.',
   WORKFLOW_SUCCESSFUL_TEST_REQUIRED: 'The current draft must complete a successful test before it can be published.',
@@ -40,6 +52,18 @@ const errorMessages: Record<string, string> = {
   AGENT_AVATAR_TYPE_UNSUPPORTED: 'Use a PNG, JPEG, or WebP image for the agent picture.',
   AGENT_AVATAR_TOO_LARGE: 'Agent pictures must be no larger than 2 MB.',
   AGENT_AVATAR_PROCESSING_FAILED: 'Woody could not safely process this picture. Try another PNG, JPEG, or WebP image.',
+  FILE_REQUIRED: 'Choose a supported file to upload.',
+  FILE_EMPTY: 'This file is empty.',
+  FILE_TOO_LARGE: 'Files must be 25 MB or smaller.',
+  FILE_TYPE_UNSUPPORTED: 'Use PDF, DOCX, PPTX, Excel, CSV, Markdown, TXT, HTML, PNG, JPEG, or WebP.',
+  FILE_SIGNATURE_MISMATCH: 'The file contents do not match its filename. Export it again and retry.',
+  FILE_MIME_MISMATCH: 'The browser reported a different file type than the selected filename.',
+  FILE_QUEUE_UNAVAILABLE: 'Woody saved the file but could not start extraction. Check the worker and Redis.',
+  FILE_NOT_READY: 'Wait for Woody to finish extracting this file.',
+  FILE_ATTACHMENTS_NOT_READY_OR_MISSING: 'One or more attachments are still processing or unavailable.',
+  CHAT_ATTACHMENTS_NOT_READY_OR_SCOPED: 'One or more chat attachments are still processing or unavailable.',
+  FILE_MALWARE_DETECTED: 'The malware scanner rejected this file.',
+  FILE_IS_KNOWLEDGE_SOURCE: 'Remove this document from Knowledge before deleting its source file.',
 };
 export const auth = {
   get: () => token,
@@ -85,9 +109,20 @@ async function requestBlob(path: string): Promise<Blob> {
 
 export type AgentModelConfig = { temperature: number; maxTokens: number; topP: number };
 export type AgentCapabilities = { webBrowser: boolean; codeInterpreter: boolean; knowledgeBase: boolean };
-export type AgentAvatarIcon = 'network' | 'search' | 'route' | 'code' | 'pen' | 'megaphone' | 'chart' | 'check' | 'brain' | 'zap' | 'users' | 'coins' | 'palette' | 'shield' | 'sparkles';
+export type AgentPromptTone = 'professional' | 'friendly' | 'analytical' | 'creative' | 'concise';
+export type GeneratedAgentPrompt = {
+  goal: string;
+  personality: string;
+  instructions: string;
+  tone: AgentPromptTone;
+  provider: string;
+  model: string;
+  usage: { inputTokens: number; outputTokens: number; estimatedCostUsd: number };
+};
+export type AgentAvatarIcon = 'agent' | 'network' | 'search' | 'route' | 'code' | 'pen' | 'megaphone' | 'chart' | 'check' | 'brain' | 'zap' | 'users' | 'coins' | 'palette' | 'shield' | 'sparkles';
 export type AgentAvatarConfig =
   | { type: 'icon'; value: AgentAvatarIcon; backgroundColor?: string; accentColor?: string; alt?: string }
+  | { type: 'brand'; value: BrandIconKey; backgroundColor?: string; accentColor?: string; alt?: string }
   | { type: 'initials'; value: string; backgroundColor?: string; accentColor?: string; alt?: string }
   | { type: 'image'; value: 'uploaded'; alt?: string };
 export type Agent = {
@@ -152,7 +187,8 @@ export type ActionAuthorization = {
   consumed_at?: string | null;
   error_message?: string | null;
 };
-export type ArtifactFormat = 'pdf' | 'docx' | 'pptx' | 'xlsx';
+export const artifactFormats = ['pdf', 'docx', 'pptx', 'xlsx', 'html', 'md', 'txt', 'csv', 'json'] as const;
+export type ArtifactFormat = typeof artifactFormats[number];
 export type PresentationTheme = {
   id: string;
   name: string;
@@ -161,10 +197,30 @@ export type PresentationTheme = {
   created_at: string;
   updated_at: string;
 };
+export type HtmlArtifactTemplate = {
+  id: string;
+  name: string;
+  format: 'html';
+  theme: {
+    background: string;
+    surface: string;
+    text: string;
+    muted: string;
+    accent: string;
+    border: string;
+    headingFont: 'system' | 'serif' | 'mono';
+    bodyFont: 'system' | 'serif' | 'mono';
+    density: 'comfortable' | 'compact';
+  };
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+};
 export type Artifact = {
   id: string;
   task_id?: string | null;
   workflow_run_id?: string | null;
+  output_document_version_id?: string | null;
   format: ArtifactFormat;
   status: 'pending' | 'queued' | 'generating' | 'ready' | 'failed' | 'skipped';
   filename: string;
@@ -175,7 +231,107 @@ export type Artifact = {
   created_at: string;
   completed_at?: string | null;
 };
-export type TaskDetail = Task & { input?: Record<string, unknown>; events: TaskEvent[]; artifacts: Artifact[]; actionAuthorizations?: ActionAuthorization[] };
+export type OutputVersion = {
+  id: string;
+  workspace_id: string;
+  document_id: string;
+  version_number: number;
+  content: string;
+  content_hash: string;
+  created_by: string | null;
+  created_by_name?: string | null;
+  created_at: string;
+};
+export type OutputDocumentDetail = {
+  id: string;
+  workspace_id: string;
+  task_id: string;
+  current_version_number: number;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  currentVersion: OutputVersion;
+  versions: OutputVersion[];
+};
+export type FileAsset = {
+  id: string;
+  original_name: string;
+  extension: 'pdf' | 'docx' | 'pptx' | 'xlsx' | 'xlsm' | 'csv' | 'md' | 'txt' | 'html' | 'png' | 'jpg' | 'jpeg' | 'webp';
+  mime_type: string;
+  size_bytes: string | number;
+  status: 'scanning' | 'extracting' | 'ready' | 'failed';
+  scan_status: 'pending' | 'not_configured' | 'clean' | 'infected' | 'failed';
+  scope: 'task' | 'conversation' | 'saved' | 'knowledge';
+  retention_policy: 'keep' | '30_days' | 'delete_after_task' | 'delete_after_conversation';
+  error_message?: string | null;
+  metadata?: Record<string, unknown>;
+  version_group_id: string;
+  version_number: number;
+  replaces_file_id?: string | null;
+  created_at: string;
+  updated_at?: string;
+  completed_at?: string | null;
+  deduplicated?: boolean;
+  extraction?: {
+    status: string;
+    summary?: string | null;
+    characters?: number;
+    structured_content?: Record<string, unknown>;
+    error_message?: string | null;
+  } | null;
+};
+export type FilePreview = {
+  file: FileAsset;
+  extraction: {
+    content: string;
+    summary: string;
+    characters: number;
+    structured_content: Record<string, unknown>;
+    truncated: boolean;
+  } | null;
+  chunks: Array<{ ordinal: number; locator: string; content: string; metadata: Record<string, unknown> }>;
+};
+export type SpreadsheetPreview = {
+  file: { id: string; original_name: string; extension: string };
+  sheets: Array<{ name?: string; range?: string; rowCount?: number; columnCount?: number; truncated?: boolean }>;
+  sheet?: string;
+  startRow: number;
+  rows: unknown[][];
+  rowCount: number;
+  columnCount: number;
+  truncated: boolean;
+  hasMore: boolean;
+};
+export type FileComparison = {
+  files: Array<{ id: string; original_name: string; status: string }>;
+  similarityPercent: number;
+  sharedTerms: string[];
+  distinctiveTerms: Record<string, string[]>;
+  sharedPassages: Array<{ fileId: string; locator: string; excerpt: string }>;
+  samples: Record<string, Array<{ locator: string; excerpt: string }>>;
+  method: string;
+};
+export type ChatThread = {
+  id: string;
+  title: string;
+  status: 'active' | 'archived';
+  created_at: string;
+  updated_at: string;
+  last_message?: string | null;
+  message_count?: number;
+  messages?: ChatThreadMessage[];
+};
+export type ChatThreadMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  attachments?: FileAsset[];
+  metadata?: {
+    citations?: Array<{ fileId: string; filename: string; locator: string; score: number }>;
+  };
+  created_at: string;
+};
+export type TaskDetail = Task & { input?: Record<string, unknown>; events: TaskEvent[]; artifacts: Artifact[]; attachments: FileAsset[]; actionAuthorizations?: ActionAuthorization[] };
 export type WorkflowNode = {
   id: string;
   type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output' | 'api_action' | 'mcp_action' | 'knowledge_search' | 'browser';
@@ -232,6 +388,10 @@ export type WorkflowNodeCatalogEntry = {
   available: boolean;
   availabilityReason?: string;
   retryable: boolean;
+  inspectorSections: Array<'inputs' | 'configuration' | 'conditions' | 'execution' | 'input_collection' | 'variables'>;
+  supportsInputMapping: boolean;
+  supportsStructuredOutput: boolean;
+  supportsDynamicHandles: boolean;
   inputPorts: Array<{ id: string; label: string; dataType: string; required?: boolean }>;
   outputPorts: Array<{ id: string; label: string; dataType: string; required?: boolean }>;
   configFields: Array<{ key: string; label: string; control: 'text' | 'textarea' | 'number' | 'select' | 'json' | 'resource' | 'multiselect'; required?: boolean; resource?: 'agent' | 'api_tool' | 'mcp_tool' | 'node'; options?: Array<{ value: string; label: string }>; help?: string }>;
@@ -620,6 +780,8 @@ export const api = {
     request<Agent>('/v1/agents', { method: 'POST', body: JSON.stringify(body) }),
   updateAgent: (id: string, body: Record<string, unknown>) =>
     request<Agent>(`/v1/agents/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  generateAgentPrompt: (body: { name?: string; role?: string; goal?: string; tone: AgentPromptTone }) =>
+    request<GeneratedAgentPrompt>('/v1/agents/generate-prompt', { method: 'POST', body: JSON.stringify(body) }),
   uploadAgentAvatar: (id: string, file: File) => {
     const form = new FormData();
     form.append('file', file);
@@ -630,7 +792,7 @@ export const api = {
 
   tasks: () => request<{ data: Task[] }>('/v1/tasks'),
   task: (id: string) => request<TaskDetail>(`/v1/tasks/${id}`),
-  createTask: (body: { agentId: string; title: string; input: Record<string, unknown>; artifactFormats?: ArtifactFormat[] }) =>
+  createTask: (body: { agentId: string; title: string; input: Record<string, unknown>; artifactFormats?: ArtifactFormat[]; attachmentIds?: string[] }) =>
     request<Task>('/v1/tasks', { method: 'POST', body: JSON.stringify(body) }),
   cancelTask: (id: string) => request<Task>(`/v1/tasks/${id}/cancel`, { method: 'POST' }),
   decideActionAuthorization: (id: string, decision: 'approved' | 'rejected', comment = '') =>
@@ -642,6 +804,16 @@ export const api = {
     request(`/v1/tasks/${id}/feedback`, { method: 'PUT', body: JSON.stringify(body) }),
   requestArtifacts: (body: { taskId?: string; workflowRunId?: string; formats: ArtifactFormat[] }) =>
     request<{ data: Artifact[] }>('/v1/artifacts', { method: 'POST', body: JSON.stringify(body) }),
+  outputDocumentForTask: (taskId: string) =>
+    request<{ document: OutputDocumentDetail | null }>(`/v1/output-documents/tasks/${taskId}`),
+  initializeOutputDocument: (taskId: string) =>
+    request<OutputDocumentDetail>(`/v1/output-documents/tasks/${taskId}`, { method: 'POST' }),
+  saveOutputVersion: (documentId: string, body: { content: string; baseVersionNumber: number }) =>
+    request<OutputDocumentDetail>(`/v1/output-documents/${documentId}/versions`, { method: 'POST', body: JSON.stringify(body) }),
+  revertOutputVersion: (documentId: string, body: { versionId: string; baseVersionNumber: number }) =>
+    request<OutputDocumentDetail>(`/v1/output-documents/${documentId}/revert`, { method: 'POST', body: JSON.stringify(body) }),
+  requestOutputArtifacts: (documentId: string, body: { versionId: string; formats: ArtifactFormat[] }) =>
+    request<{ data: Artifact[] }>(`/v1/output-documents/${documentId}/artifacts`, { method: 'POST', body: JSON.stringify(body) }),
   deleteArtifact: (id: string) => request<void>(`/v1/artifacts/${id}`, { method: 'DELETE' }),
   artifactFile: async (id: string, inline = false) => {
     const response = await fetch(`${API_URL}/v1/artifacts/${id}/download${inline ? '?inline=true' : ''}`, { headers: token ? { authorization: `Bearer ${token}` } : {} });
@@ -654,8 +826,67 @@ export const api = {
     return { blob: await response.blob(), filename: encoded ? decodeURIComponent(encoded) : `woody-artifact-${id}` };
   },
 
+  files: () => request<{ data: FileAsset[] }>('/v1/files'),
+  file: (id: string) => request<FileAsset>(`/v1/files/${id}`),
+  filePreview: (id: string) => request<FilePreview>(`/v1/files/${id}/preview`),
+  uploadFile: (file: File, scope: FileAsset['scope']) => {
+    const form = new FormData();
+    form.append('scope', scope);
+    form.append('file', file);
+    return request<FileAsset>('/v1/files', { method: 'POST', body: form });
+  },
+  importFileFromSecureLink: (url: string, scope: FileAsset['scope'], filename?: string) =>
+    request<FileAsset>('/v1/files/import', {
+      method: 'POST',
+      body: JSON.stringify({ provider: 'secure_link', url, scope, ...(filename ? { filename } : {}) }),
+    }),
+  fileVersions: (id: string) => request<{ data: FileAsset[] }>(`/v1/files/${id}/versions`),
+  uploadFileVersion: (id: string, file: File) => {
+    const form = new FormData();
+    form.append('file', file);
+    return request<FileAsset>(`/v1/files/${id}/versions`, { method: 'POST', body: form });
+  },
+  spreadsheetPreview: (id: string, sheet?: string, startRow = 1, limit = 100) =>
+    request<SpreadsheetPreview>(`/v1/files/${id}/spreadsheet?${new URLSearchParams({
+      ...(sheet ? { sheet } : {}), startRow: String(startRow), limit: String(limit),
+    })}`),
+  compareFiles: (fileIds: [string, string]) =>
+    request<FileComparison>('/v1/files/compare', { method: 'POST', body: JSON.stringify({ fileIds }) }),
+  promoteFileToKnowledge: (id: string) =>
+    request<Document>(`/v1/files/${id}/add-to-knowledge`, { method: 'POST', body: JSON.stringify({ confirmed: true }) }),
+  updateFileRetention: (id: string, retentionPolicy: FileAsset['retention_policy']) =>
+    request<FileAsset>(`/v1/files/${id}`, { method: 'PATCH', body: JSON.stringify({ retentionPolicy }) }),
+  deleteFile: (id: string) => request<void>(`/v1/files/${id}`, { method: 'DELETE' }),
+  chatThreads: () => request<{ data: ChatThread[] }>('/v1/copilot/threads'),
+  createChatThread: (title?: string) => request<ChatThread>('/v1/copilot/threads', {
+    method: 'POST',
+    body: JSON.stringify(title ? { title } : {}),
+  }),
+  chatThread: (id: string) => request<ChatThread>(`/v1/copilot/threads/${id}`),
+  sendChatThreadMessage: (id: string, content: string, attachmentIds: string[] = []) =>
+    request<{ user: ChatThreadMessage; assistant: ChatThreadMessage; citations: Array<{ fileId: string; filename: string; locator: string; score: number }> }>(`/v1/copilot/threads/${id}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content, attachmentIds }),
+    }),
+  deleteChatThread: (id: string) => request<void>(`/v1/copilot/threads/${id}`, { method: 'DELETE' }),
+
+  artifactTemplates: () => request<{ data: HtmlArtifactTemplate[] }>('/v1/artifact-templates'),
+  createArtifactTemplate: (body: { name: string; format: 'html'; designMarkdown: string; isDefault?: boolean }) =>
+    request<HtmlArtifactTemplate>('/v1/artifact-templates', { method: 'POST', body: JSON.stringify(body) }),
+  updateArtifactTemplate: (id: string, body: Partial<{ name: string; format: 'html'; designMarkdown: string; isDefault: boolean }>) =>
+    request<HtmlArtifactTemplate>(`/v1/artifact-templates/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+
   workflows: () => request<{ data: Workflow[] }>('/v1/workflows'),
   workflowNodeCatalog: () => request<{ version: number; data: WorkflowNodeCatalogEntry[] }>('/v1/workflow-nodes'),
+  workflowQualityLoopTemplate: (body: {
+    workerAgentId: string;
+    graderAgentId: string;
+    revisionStrategy: 'same_worker' | 'dedicated_agent';
+    revisionAgentId?: string;
+    maximumRevisions: number;
+    passingScore: number;
+    onLimit: 'return_best' | 'human_review' | 'fail';
+  }) => request<WorkflowDefinition>('/v1/workflow-nodes/quality-loop-template', { method: 'POST', body: JSON.stringify(body) }),
   workflowResources: () => request<WorkflowResources>('/v1/workflow-resources'),
   workflowLayout: (id: string) => request<WorkflowEditorLayout>(`/v1/workflows/${id}/layout`),
   saveWorkflowLayout: (id: string, layout: Omit<WorkflowEditorLayout, 'workflowId' | 'updatedAt'>) => request<WorkflowEditorLayout>(`/v1/workflows/${id}/layout`, { method: 'PUT', body: JSON.stringify(layout) }),
@@ -692,6 +923,7 @@ export const api = {
     mode: 'automatic' | 'single' | 'multi';
     saveDraft?: boolean;
     persistPrompt?: boolean;
+    attachmentIds?: string[];
   }) => request<{ solution: AgentSolution; draftId: string | null }>('/v1/agent-solutions/compile', {
     method: 'POST',
     body: JSON.stringify(body),

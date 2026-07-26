@@ -17,6 +17,12 @@ afterEach(async () => {
 describe('agent avatars', () => {
   it('accepts only bounded built-in configurations', () => {
     expect(agentAvatarSchema.parse({ type: 'icon', value: 'search', backgroundColor: '#312e81' })).toMatchObject({ value: 'search' });
+    expect(agentAvatarSchema.parse({ type: 'icon', value: 'agent' })).toMatchObject({ type: 'icon', value: 'agent' });
+    expect(agentAvatarSchema.parse({ type: 'brand', value: 'notion', backgroundColor: '#312e81' })).toMatchObject({ type: 'brand', value: 'notion' });
+    for (const value of ['linear', 'stripe', 'google-drive', 'gmail', 'reddit']) {
+      expect(agentAvatarSchema.parse({ type: 'brand', value })).toMatchObject({ type: 'brand', value });
+    }
+    expect(() => agentAvatarSchema.parse({ type: 'brand', value: 'remote-provider' })).toThrow();
     expect(() => agentAvatarSchema.parse({ type: 'icon', value: 'remote-script' })).toThrow();
     expect(() => agentAvatarSchema.parse({ type: 'initials', value: '<img>' })).toThrow();
     expect(() => agentAvatarSchema.parse({ type: 'image', value: 'https://example.com/tracker.png' })).toThrow();

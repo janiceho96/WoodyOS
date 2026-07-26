@@ -5,9 +5,13 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { api, type Task } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { AgentAvatar } from '../../components/agents/AgentAvatar';
+import { AttachmentChip } from '../../components/files/AttachmentChip';
+import { FilePreviewDialog } from '../../components/files/FilePreviewDialog';
 import { OutputViewer } from '../../components/OutputViewer';
+import { EditableOutput } from '../../components/outputs/EditableOutput';
 import { EmptyState, Status } from '../../components/ui';
 import { compact, duration, humanize, relative, taskCost } from '../../lib/format';
+import { thinkingOrbStateForContext } from '../../lib/thinkingOrb';
 import { ArtifactPanel, TaskDialogBody } from '../execution/ExecutionPage';
 import { AgentActivityPanel } from './AgentActivityPanel';
 import { AgentExecutionProvider, useAgentExecution } from './agentExecution';
@@ -25,6 +29,7 @@ export function AgentWorkspacePage() {
 function AgentWorkspace() {
   const execution = useAgentExecution();
   const [activityOpen, setActivityOpen] = useState(() => window.matchMedia('(min-width: 1180px)').matches);
+  const currentStep = execution.steps.find((item) => item.id === execution.currentStepId);
   useEffect(() => {
     const media = window.matchMedia('(min-width: 1180px)');
     const change = (event: MediaQueryListEvent) => { if (event.matches) setActivityOpen(true); };
@@ -33,8 +38,8 @@ function AgentWorkspace() {
   return <div className={`agent-workspace-shell ${activityOpen ? 'activity-open' : 'activity-closed'}`}>
     <div className="agent-workspace-main">
       <header className="agent-workspace-header">
-        <div className="agent-workspace-identity"><AgentAvatar agent={execution.agent} size="md" status={execution.status === 'failed' ? 'error' : execution.status === 'running' ? 'busy' : undefined}/><div><span className="eyebrow">{execution.agent.role}</span><h1>{execution.agent.name}</h1><p>{sectionDescription(execution.section)}</p></div></div>
-        <div><Status value={execution.status === 'idle' ? execution.agent.status : execution.status}/><button className="button" onClick={() => setActivityOpen((value) => !value)} aria-expanded={activityOpen}><Activity size={15}/>{activityOpen ? 'Hide activity' : 'Show activity'}{execution.pendingApprovals > 0 && <b className="attention-count">{execution.pendingApprovals}</b>}</button></div>
+        <div className="agent-workspace-identity"><AgentAvatar agent={execution.agent} size="md" status={execution.status === 'failed' ? 'error' : execution.status === 'running' ? 'busy' : undefined} thinkingState={thinkingOrbStateForContext(currentStep?.kind, currentStep?.label)}/><div><span className="eyebrow">{execution.agent.role}</span><h1>{execution.agent.name}</h1><p>{sectionDescription(execution.section)}</p></div></div>
+        <div><Status value={execution.status}/><button className="button" onClick={() => setActivityOpen((value) => !value)} aria-expanded={activityOpen}><Activity size={15}/>{activityOpen ? 'Hide activity' : 'Show activity'}{execution.pendingApprovals > 0 && <b className="attention-count">{execution.pendingApprovals}</b>}</button></div>
       </header>
       <div className="agent-section-content">
         {execution.section === 'overview' && <AgentOverview/>}
@@ -79,6 +84,8 @@ function AgentTaskWorkspace() {
   const queryClient = useQueryClient();
   const { report, reportError } = useWorkspace();
   const [composing, setComposing] = useState(!execution.task);
+  const [previewAttachment, setPreviewAttachment] = useState<NonNullable<typeof execution.task>['attachments'][number] | null>(null);
+  const retrievedSources = ([...(execution.task?.events ?? [])].reverse().find((event) => event.event_type === 'attachments.retrieved')?.payload?.citations ?? []) as Array<{ fileId: string; filename: string; locator: string }>;
   const rerun = useMutation({
     mutationFn: () => api.createTask({ agentId: execution.agent.id, title: `${execution.task!.title} — retry`, input: execution.task?.input ?? {} }),
     onSuccess: async (task) => { report('New task queued'); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); execution.selectTask(task.id); },
@@ -93,9 +100,14 @@ function AgentTaskWorkspace() {
     {!execution.taskLoading && execution.task && <>
       <section className={`panel task-focus-card ${execution.task.status}`}><div><span className="eyebrow">Selected run · {relative(execution.task.created_at)}</span><h2>{execution.task.title}</h2><p>{statusMessage(execution.task.status)}</p></div><div><Status value={execution.task.status}/>{['completed', 'failed', 'cancelled'].includes(execution.task.status) && <button className="button" disabled={rerun.isPending} onClick={() => rerun.mutate()}><RotateCcw size={14}/>Run again</button>}</div></section>
       {execution.task.input && Object.keys(execution.task.input).length > 0 && <section className="panel run-input-section"><div className="section-title"><div><span className="eyebrow">Request</span><h2>Task context</h2></div></div><OutputViewer value={execution.task.input}/></section>}
-      {execution.task.output !== undefined && execution.task.output !== null && <section className="panel output-section primary-result"><div className="section-title"><div><span className="eyebrow">Saved automatically</span><h2>Agent result</h2></div><FileOutput size={20}/></div><OutputViewer value={execution.task.output}/></section>}
+      {execution.task.attachments?.length > 0 && <section className="panel run-input-section"><div className="section-title"><div><span className="eyebrow">Scoped evidence</span><h2>Task attachments</h2></div><small>{execution.task.attachments.length} file{execution.task.attachments.length === 1 ? '' : 's'}</small></div><div className="attachment-list">{execution.task.attachments.map((file) => <AttachmentChip key={file.id} file={file} onPreview={() => setPreviewAttachment(file)}/>)}</div></section>}
+      {execution.task.output !== undefined && execution.task.output !== null && (execution.task.status === 'completed'
+        ? <section className="panel editable-output-panel"><EditableOutput task={execution.task} refreshTask={() => void execution.refresh()}/></section>
+        : <section className="panel output-section primary-result"><div className="section-title"><div><span className="eyebrow">Saved automatically</span><h2>Agent result</h2></div><FileOutput size={20}/></div><OutputViewer value={execution.task.output}/></section>)}
+      {retrievedSources.length > 0 && <section className="panel run-input-section"><div className="section-title"><div><span className="eyebrow">Grounding</span><h2>Attachment sources used</h2></div></div><div className="capability-tags">{retrievedSources.map((source, index) => <span key={`${source.fileId}-${source.locator}-${index}`}>{source.filename} · {source.locator}</span>)}</div></section>}
       {execution.task.error !== undefined && execution.task.error !== null && <section className="panel output-section error"><h2>Execution error</h2><OutputViewer value={execution.task.error} error/></section>}
       {(execution.task.status === 'completed' || execution.task.artifacts?.length > 0) && <section className="panel"><ArtifactPanel task={execution.task} refresh={() => void execution.refresh()}/></section>}
+      {previewAttachment && <FilePreviewDialog file={previewAttachment} close={() => setPreviewAttachment(null)}/>}
     </>}
     {!execution.taskLoading && !execution.task && !composing && <EmptyState Icon={Play} title="Ready for the first task" text="Start a task to create an execution timeline and saved result." action={<button className="button primary" onClick={() => setComposing(true)}>Start a task</button>}/>} 
   </div>;

@@ -11,7 +11,7 @@ export interface ArtifactStorage {
 }
 
 function safeKey(key: string) {
-  if (!/^[a-f0-9-]+\/[a-f0-9-]+\.(pdf|docx|pptx|xlsx)$/.test(key)) throw new Error('INVALID_ARTIFACT_STORAGE_KEY');
+  if (!/^[a-f0-9-]+\/[a-f0-9-]+\.(pdf|docx|pptx|xlsx|html|md|txt|csv|json)$/.test(key)) throw new Error('INVALID_ARTIFACT_STORAGE_KEY');
   return key;
 }
 

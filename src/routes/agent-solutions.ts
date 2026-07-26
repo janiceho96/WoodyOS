@@ -11,12 +11,14 @@ import { installAgentSolution } from '../solutions/installer.js';
 import { agentSolutionSchema, parseAgentSolution } from '../solutions/schema.js';
 import { assertWorkspaceAiBudgetAvailable } from '../lib/ai-usage.js';
 import type { WorkflowDefinition } from '../workflows/definition.js';
+import { retrieveExplicitFileContext } from '../files/context.js';
 
 const compileInput = z.object({
   prompt: z.string().min(20).max(50_000),
   mode: z.enum(['automatic', 'single', 'multi']).default('automatic'),
   saveDraft: z.boolean().default(false),
   persistPrompt: z.boolean().default(false),
+  attachmentIds: z.array(z.string().uuid()).max(10).default([]),
 });
 const installInput = z.object({
   solution: agentSolutionSchema,
@@ -35,7 +37,20 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     if (input.persistPrompt && !input.saveDraft) {
       return reply.code(400).send({ error: 'PROMPT_PERSISTENCE_REQUIRES_SAVED_DRAFT' });
     }
-    const solution = await compileAgentSolution(input.prompt, input.mode ?? 'automatic', request.user.workspaceId);
+    const attachmentIds = [...new Set(input.attachmentIds)];
+    if (attachmentIds.length) {
+      const available = await query<{ id: string }>(
+        `SELECT id FROM files WHERE workspace_id=$1 AND id=ANY($2::uuid[]) AND status='ready'`,
+        [request.user.workspaceId, attachmentIds],
+      );
+      if (available.rowCount !== attachmentIds.length) {
+        return reply.code(409).send({ error: 'FILE_ATTACHMENTS_NOT_READY_OR_MISSING' });
+      }
+    }
+    const reference = attachmentIds.length
+      ? await retrieveExplicitFileContext(request.user.workspaceId, attachmentIds, input.prompt)
+      : { text: '', citations: [] };
+    const solution = await compileAgentSolution(input.prompt, input.mode ?? 'automatic', request.user.workspaceId, reference.text);
     let draftId: string | null = null;
     if (input.saveDraft) {
       draftId = randomUUID();
@@ -57,6 +72,8 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
       mode: input.mode,
       agentCount: solution.agents.length,
       promptPersisted: Boolean(input.persistPrompt && input.saveDraft),
+      attachmentCount: attachmentIds.length,
+      attachmentCitationCount: reference.citations.length,
     });
     return { solution, draftId };
   }));

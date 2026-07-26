@@ -1,22 +1,14 @@
-import { z } from 'zod';
+import { ARTIFACT_FORMATS, artifactFormatSchema, artifactRegistry, type ArtifactFormat } from './registry.js';
+export { ARTIFACT_FORMATS, artifactFormatSchema, artifactRegistry, type ArtifactFormat } from './registry.js';
 
-export const artifactFormatSchema = z.enum(['pdf', 'docx', 'pptx', 'xlsx']);
-export type ArtifactFormat = z.infer<typeof artifactFormatSchema>;
-
-export const ARTIFACT_FORMATS = artifactFormatSchema.options;
-
-export const artifactFormatInfo: Record<ArtifactFormat, { mimeType: string; label: string }> = {
-  pdf: { mimeType: 'application/pdf', label: 'PDF' },
-  docx: { mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', label: 'Word' },
-  pptx: { mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', label: 'PowerPoint' },
-  xlsx: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', label: 'Excel' },
-};
+export const artifactFormatInfo = artifactRegistry;
 
 export type ArtifactRecord = {
   id: string;
   workspace_id: string;
   task_id: string | null;
   workflow_run_id: string | null;
+  output_document_version_id: string | null;
   created_by: string | null;
   format: ArtifactFormat;
   status: 'pending' | 'queued' | 'generating' | 'ready' | 'failed' | 'skipped';
@@ -39,6 +31,7 @@ export function outputText(value: unknown): string {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const record = value as Record<string, unknown>;
     if (typeof record.text === 'string') return record.text;
+    if (typeof record.content === 'string') return record.content;
   }
   return JSON.stringify(value ?? {}, null, 2);
 }
@@ -64,5 +57,10 @@ export function inferredArtifactFormats(text: string): ArtifactFormat[] {
   if (/\b(docx|word document|microsoft word)\b/.test(normalized)) formats.push('docx');
   if (/\b(pptx|powerpoint|slide deck|presentation)\b/.test(normalized)) formats.push('pptx');
   if (/\b(xlsx|excel|spreadsheet|workbook)\b/.test(normalized)) formats.push('xlsx');
+  if (/\b(html|web page|static webpage)\b/.test(normalized)) formats.push('html');
+  if (/\b(markdown file|\\.md file)\b/.test(normalized)) formats.push('md');
+  if (/\b(plain text|\\.txt file|text file)\b/.test(normalized)) formats.push('txt');
+  if (/\b(csv|comma[- ]separated)\b/.test(normalized)) formats.push('csv');
+  if (/\b(json|machine[- ]readable json)\b/.test(normalized)) formats.push('json');
   return formats;
 }

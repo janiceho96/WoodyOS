@@ -50,6 +50,7 @@ export type WorkflowCanvasProps = {
   onMoveNode: (id: string, position: { x: number; y: number }) => void;
   onViewportChange: (viewport: { x: number; y: number; zoom: number }) => void;
   onConnect: (connection: Connection) => void;
+  onReconnectEdge: (edge: WorkflowDefinition['edges'][number], connection: Connection) => void;
   onDeleteNodes: (ids: string[]) => void;
   onDeleteEdges: (edges: WorkflowDefinition['edges']) => void;
   onDropNode: (type: WorkflowNode['type'], position: { x: number; y: number }) => void;
@@ -58,6 +59,7 @@ export type WorkflowCanvasProps = {
   onRedo: () => void;
   onSetMode: (simple: boolean) => void;
   onToggleInspector: () => void;
+  onToggleFullscreen: () => Promise<void>;
 };
 
 function iconFor(type: WorkflowNode['type']) {
@@ -97,6 +99,7 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
   const { catalog, positions, nodes, selectedNodeId, activeNodeIds, labelFor, brandFor, agentFor, viewport } = props;
   const wrapper = useRef<HTMLDivElement>(null);
   const [instance, setInstance] = useState<ReactFlowInstance<CanvasNode, Edge> | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const catalogByType = useMemo(() => new Map(catalog.map((entry) => [entry.type, entry])), [catalog]);
   const positionById = useMemo(() => new Map(positions.map((position) => [position.nodeId, position])), [positions]);
   const derivedNodes = useMemo<CanvasNode[]>(() => nodes.flatMap((workflowNode, index) => {
@@ -117,7 +120,13 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
     animated: props.activeNodeIds?.has(edge.target) ?? false,
     markerEnd: { type: MarkerType.ArrowClosed },
     className: edge.condition ? `flow-edge ${edge.condition}` : 'flow-edge',
-  })), [props.edges, props.activeNodeIds]);
+    selected: selectedEdgeId === edgeId(edge, index),
+    deletable: true,
+    reconnectable: true,
+  })), [props.edges, props.activeNodeIds, selectedEdgeId]);
+  const selectedEdge = selectedEdgeId
+    ? props.edges.find((edge, index) => edgeId(edge, index) === selectedEdgeId)
+    : undefined;
 
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -125,15 +134,7 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
     if (!type || !instance) return;
     props.onDropNode(type, instance.screenToFlowPosition({ x: event.clientX, y: event.clientY }));
   };
-  const fullscreen = async () => {
-    if (!wrapper.current) return;
-    if (document.fullscreenElement) await document.exitFullscreen();
-    else await wrapper.current.requestFullscreen();
-  };
-  const toggleInspector = async () => {
-    if (document.fullscreenElement) await document.exitFullscreen();
-    props.onToggleInspector();
-  };
+  const toggleInspector = () => props.onToggleInspector();
 
   return <div className="visual-workflow-canvas" ref={wrapper} onDrop={onDrop} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }}>
     <div className="canvas-toolbar" aria-label="Workflow canvas controls">
@@ -144,8 +145,9 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
       <button type="button" onClick={props.onUndo} disabled={!props.canUndo} aria-label="Undo"><Undo2 size={14}/></button>
       <button type="button" onClick={props.onRedo} disabled={!props.canRedo} aria-label="Redo"><Redo2 size={14}/></button>
       <button type="button" onClick={props.onAutoLayout}>Auto layout</button>
-      <button type="button" className={`inspector-toggle ${props.inspectorOpen ? 'active' : ''}`} aria-pressed={props.inspectorOpen} onClick={() => void toggleInspector()}><PanelRightOpen size={14}/>Inspector</button>
-      <button type="button" onClick={() => void fullscreen()} aria-label="Toggle full screen"><Maximize2 size={14}/></button>
+      <button type="button" className={`inspector-toggle ${props.inspectorOpen ? 'active' : ''}`} aria-pressed={props.inspectorOpen} onClick={toggleInspector}><PanelRightOpen size={14}/>Inspector</button>
+      <button type="button" onClick={() => void props.onToggleFullscreen()} aria-label="Toggle full screen"><Maximize2 size={14}/></button>
+      {selectedEdge && <div className="edge-toolbar" aria-label="Selected connection controls"><span>{selectedEdge.source} → {selectedEdge.target}</span><button type="button" className="danger" onClick={() => { props.onDeleteEdges([selectedEdge]); setSelectedEdgeId(null); }}>Delete connection</button></div>}
     </div>
     <ReactFlow<CanvasNode, Edge>
       nodes={flowNodes}
@@ -154,14 +156,21 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
       onInit={setInstance}
       onNodesChange={onNodesChange}
       onNodeClick={(_, node) => props.onSelectNode(node.id)}
+      onEdgeClick={(_, edge) => setSelectedEdgeId(edge.id)}
+      onPaneClick={() => setSelectedEdgeId(null)}
       onNodeDragStop={(_, node) => props.onMoveNode(node.id, node.position)}
       onMoveEnd={(_, viewport) => props.onViewportChange(viewport)}
       onNodesDelete={(removed) => props.onDeleteNodes(removed.filter((node) => !['trigger', 'output'].includes(node.data.workflowNode.type)).map((node) => node.id))}
       onEdgesDelete={(removed) => props.onDeleteEdges(removed.map((edge) => props.edges.find((candidate, index) => edge.id === edgeId(candidate, index))).filter((edge): edge is WorkflowDefinition['edges'][number] => Boolean(edge)))}
       onConnect={props.onConnect}
+      onReconnect={(oldEdge, connection) => {
+        const original = props.edges.find((candidate, index) => oldEdge.id === edgeId(candidate, index));
+        if (original) props.onReconnectEdge(original, connection);
+      }}
       nodesConnectable
       nodesDraggable
-      edgesReconnectable={false}
+      edgesReconnectable
+      reconnectRadius={24}
       fitView
       defaultViewport={viewport}
       minZoom={0.15}
