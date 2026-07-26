@@ -11,6 +11,7 @@ import { ToolDialogBody } from '../features/tools/ToolsPage';
 import { WoodyChat } from '../features/copilot/WoodyChat';
 import { AgentWorkspaceNav } from '../features/agents/AgentWorkspaceNav';
 import type { Theme } from './theme';
+import { primaryNavigation } from './navigation';
 import { WorkspaceContext, useWorkspaceData, type NoticeAction, type WorkspaceData } from './workspace';
 
 export type AppDialog = 'task' | 'document' | 'tool' | 'search' | null;
@@ -23,15 +24,6 @@ const nav = [
   { path: '/tools', label: 'Integrations', Icon: PlugZap, group: 'Resources' },
   { path: '/executions', label: 'Outputs', Icon: Activity, group: 'Activity' },
   { path: '/analytics', label: 'Analytics', Icon: BarChart3, group: 'Activity' },
-];
-
-const primaryNav = [
-  { id: 'home', path: '/dashboard', label: 'Home', Icon: LayoutDashboard },
-  { id: 'agents', path: '/agents', label: 'Agents', Icon: Bot },
-  { id: 'workflows', path: '/workflows', label: 'Workflows', Icon: Workflow },
-  { id: 'outputs', path: '/executions', label: 'Outputs', Icon: Activity },
-  { id: 'knowledge', path: '/knowledge', label: 'Knowledge', Icon: BookOpen },
-  { id: 'integrations', path: '/tools', label: 'Integrations', Icon: PlugZap },
 ];
 
 const emptyWorkspaceData: WorkspaceData = { agents: [], tasks: [], workflows: [], documents: [], tools: [] };
@@ -65,7 +57,7 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
   const data = workspace.data ?? emptyWorkspaceData;
   const agentWorkspaceMatch = location.pathname === '/agents/library' ? null : location.pathname.match(/^\/agents\/([^/]+)$/);
   const workspaceAgent = agentWorkspaceMatch ? data.agents.find((agent) => agent.id === agentWorkspaceMatch[1]) : undefined;
-  const label = workspaceAgent?.name ?? nav.find((item) => location.pathname === item.path || (item.path === '/agents' && location.pathname.startsWith('/agents/')))?.label ?? (location.pathname === '/solutions' ? 'Create' : location.pathname === '/mcp' ? 'Integrations' : location.pathname === '/settings' ? 'Settings' : location.pathname === '/mascot-lab' ? 'Mascot Lab' : 'Woody Workspace');
+  const label = workspaceAgent?.name ?? nav.find((item) => location.pathname === item.path || (item.path === '/agents' && location.pathname.startsWith('/agents/')))?.label ?? primaryNavigation.find((item) => location.pathname === item.path)?.label ?? (location.pathname === '/solutions' ? 'Create' : location.pathname === '/settings' ? 'Settings' : location.pathname === '/mascot-lab' ? 'Mascot Lab' : 'Woody Workspace');
   const liveWork = data.tasks.filter((task) => ['queued', 'running'].includes(task.status));
   const report = useCallback((message: string, action?: NoticeAction) => { setNotice(message); setNoticeAction(action); setError(''); }, []);
   const reportError = useCallback((message: string) => { setError(message); setNotice(''); setNoticeAction(undefined); }, []);
@@ -105,8 +97,8 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
           </button>
           <button className="icon-button mobile-only" onClick={() => setMobileOpen(false)} aria-label="Close navigation"><X size={19}/></button>
         </div>
-        {agentWorkspaceMatch ? <AgentWorkspaceNav agentId={agentWorkspaceMatch[1]} close={() => setMobileOpen(false)}/> : <nav className="primary-nav simplified" aria-label="Primary navigation">{primaryNav.map((item) => {
-          const active = location.pathname === item.path || (item.id === 'agents' && location.pathname.startsWith('/agents/')) || (item.id === 'integrations' && location.pathname === '/mcp');
+        {agentWorkspaceMatch ? <AgentWorkspaceNav agentId={agentWorkspaceMatch[1]} close={() => setMobileOpen(false)}/> : <nav className="primary-nav simplified" aria-label="Primary navigation">{primaryNavigation.map((item) => {
+          const active = location.pathname === item.path || (item.id === 'agents' && location.pathname.startsWith('/agents/'));
           return <div className="primary-nav-item" key={item.id}><button className={active ? 'active' : ''} aria-current={active ? 'page' : undefined} onClick={() => go(item.path)}><item.Icon size={18}/><span>{item.label}</span>{item.id === 'outputs' && liveWork.length > 0 && <b>{liveWork.length}</b>}</button></div>;
         })}</nav>}
         <div className="rail-footer"><button className={location.pathname === '/analytics' ? 'active' : ''} aria-current={location.pathname === '/analytics' ? 'page' : undefined} onClick={() => go('/analytics')}><BarChart3 size={19}/><span>Analytics</span></button><button className={location.pathname === '/settings' ? 'active' : ''} aria-current={location.pathname === '/settings' ? 'page' : undefined} onClick={() => go('/settings')}><Settings size={19}/><span>Settings</span></button><div className="identity-card"><span className="avatar">{session.user.displayName.slice(0, 1).toUpperCase()}</span><div><strong>{session.user.displayName}</strong><small>{session.workspace.name}</small></div><button className="icon-button" aria-label="Sign out" title="Sign out" onClick={() => value.signOut()}><LogOut size={16}/></button></div></div>

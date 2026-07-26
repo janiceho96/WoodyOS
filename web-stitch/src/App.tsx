@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { BrowserRouter, Navigate, Route, Routes, useNavigate, useOutletContext } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate, useOutletContext } from 'react-router-dom';
 import { api, auth, type Session } from './api';
 import { AppShell, type ShellOutlet } from './app/AppShell';
+import { resolveLegacyResourcePath } from './app/navigation';
 import { useTheme } from './app/theme';
 import { BrandMark } from './components/BrandMark';
 import { AuthPage } from './features/auth/AuthPage';
@@ -44,7 +45,8 @@ function RoutedApp() {
     <Route path="/workflows" element={<WorkflowsPage/>}/>
     <Route path="/solutions" element={<StarterSolutionsPage/>}/>
     <Route path="/knowledge" element={<KnowledgeRoute/>}/>
-    <Route path="/tools" element={<ToolsRoute/>}/>
+    <Route path="/api-tools" element={<ApiToolsRoute/>}/>
+    <Route path="/tools" element={<LegacyToolsRedirect/>}/>
     <Route path="/mcp" element={<McpMarketplacePage/>}/>
     <Route path="/analytics" element={<AnalyticsPage/>}/>
     <Route path="/settings" element={<SettingsRoute accentColor={accentColor} setAccentColor={setAccentColor}/>}/>
@@ -56,7 +58,8 @@ function RoutedApp() {
 function DashboardRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); const navigate = useNavigate(); return <DashboardPage openTask={() => openDialog('task')} openAgent={() => navigate('/agents/new')}/>; }
 function ExecutionRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ExecutionPage openTask={() => openDialog('task')}/>; }
 function KnowledgeRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <KnowledgePage openText={() => openDialog('document')}/>; }
-function ToolsRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ToolsPage openConnect={() => openDialog('tool')}/>; }
+function ApiToolsRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ToolsPage openConnect={() => openDialog('tool')}/>; }
+function LegacyToolsRedirect() { const location = useLocation(); return <Navigate to={resolveLegacyResourcePath(`${location.pathname}${location.search}${location.hash}`)} replace/>; }
 function SettingsRoute({ accentColor, setAccentColor }: { accentColor: string; setAccentColor: (color: string) => void }) { const { theme, setTheme, onboarding, resumeOnboarding, restartOnboarding } = useOutletContext<ShellOutlet>(); return <SettingsPage theme={theme} setTheme={setTheme} accentColor={accentColor} setAccentColor={setAccentColor} onboarding={onboarding} resume={resumeOnboarding} restart={() => void restartOnboarding()}/>; }
 
 export default function App() {
