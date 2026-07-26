@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { primaryNavigation, resolveLegacyResourcePath } from '../../app/navigation';
+import providers from './ToolsPage.tsx?raw';
 
 vi.mock('../../api', () => ({ api: {} }));
 
@@ -31,5 +32,10 @@ describe('resource navigation', () => {
       'activity',
     ]);
     expect(API_TOOL_SECTIONS.map((section) => section.label)).not.toContain('MCP');
+  });
+
+  it('does not nest provider panels under removed integration tabs', () => {
+    expect(providers).not.toContain('role="tabpanel"');
+    expect(providers).not.toMatch(/integrations-(panel|tab)-(web|jobs)/);
   });
 });
