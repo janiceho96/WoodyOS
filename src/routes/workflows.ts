@@ -11,6 +11,11 @@ import { artifactFormatSchema } from '../artifacts/types.js';
 import { retryPolicy } from '../workflows/definition.js';
 import { toolRequiresApproval, type ToolRecord } from '../tools/runtime.js';
 import { workflowLayoutErrors, workflowLayoutInputSchema } from '../workflows/layout.js';
+import {
+  buildWorkflowManifest,
+  validateManifestCompatibility,
+  type ExecutionManifest,
+} from '../runtime/manifest.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -127,16 +132,36 @@ async function createQueuedRun(input: {
   if (!trigger) return { error: 'WORKFLOW_TRIGGER_MISSING' as const };
   const initialState = { ...input.runInput, input: input.runInput, nodes: {}, variables: {} };
   const cursor = { nodeId: trigger.id, loops: {}, attempt: 1 };
-  const run = await query(
-    `INSERT INTO workflow_runs(
-       workspace_id,workflow_id,input,definition_snapshot,state,cursor,workflow_version_id,run_mode,draft_revision,test_target_node_id
-     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-    [
-      input.workspaceId, input.workflow.id, JSON.stringify(input.runInput), JSON.stringify(input.definition),
-      JSON.stringify(initialState), JSON.stringify(cursor), input.workflowVersionId ?? null, input.mode,
-      input.mode === 'test' ? input.workflow.draft_revision : null, input.testTargetNodeId ?? null,
-    ],
-  );
+  const client = await db.connect();
+  let run: { rows: Array<{ id: string; [key: string]: unknown }> };
+  try {
+    await client.query('BEGIN');
+    const manifest = input.mode === 'production'
+      ? await buildWorkflowManifest({
+        workspaceId: input.workspaceId,
+        workflowVersionId: input.workflowVersionId ?? '',
+        definition: input.definition,
+      }, client)
+      : null;
+    run = await client.query<{ id: string; [key: string]: unknown }>(
+      `INSERT INTO workflow_runs(
+         workspace_id,workflow_id,input,definition_snapshot,state,cursor,workflow_version_id,run_mode,
+         draft_revision,test_target_node_id,manifest_version,execution_manifest
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [
+        input.workspaceId, input.workflow.id, JSON.stringify(input.runInput), JSON.stringify(input.definition),
+        JSON.stringify(initialState), JSON.stringify(cursor), input.workflowVersionId ?? null, input.mode,
+        input.mode === 'test' ? input.workflow.draft_revision : null, input.testTargetNodeId ?? null,
+        manifest?.manifestVersion ?? 1, manifest ? JSON.stringify(manifest) : null,
+      ],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
   const formats = input.testTargetNodeId ? [] : [...new Set(input.definition.nodes
     .filter((node) => node.type === 'output' && Array.isArray(node.config.artifactFormats))
     .flatMap((node) => (node.config.artifactFormats as unknown[]).map((item) => artifactFormatSchema.safeParse(item)).filter((item) => item.success).map((item) => item.data)))];
@@ -463,6 +488,21 @@ export async function workflowRoutes(app: FastifyInstance) {
   app.post('/runs/:runId/approvals/:approvalId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;
     const params = request.params as { runId: string; approvalId: string };
+    if (input.decision === 'approved') {
+      const run = (await query<{ run_mode: 'test' | 'production'; execution_manifest: ExecutionManifest | null }>(
+        'SELECT run_mode,execution_manifest FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
+        [params.runId, request.user.workspaceId],
+      )).rows[0];
+      const compatibility = run?.run_mode === 'production'
+        ? validateManifestCompatibility(run.execution_manifest)
+        : { ok: true, reasons: [] };
+      if (!run || !compatibility.ok) {
+        return reply.code(409).send({
+          error: 'RUN_MANIFEST_INCOMPATIBLE',
+          details: { reasons: run ? compatibility.reasons : ['Execution run is missing'] },
+        });
+      }
+    }
     const approval = await query("UPDATE workflow_approvals SET status=$1,resolved_at=now(),resolved_by=$2,comment=$3 WHERE id=$4 AND workflow_run_id=$5 AND workspace_id=$6 AND status='pending' RETURNING *", [input.decision, request.user.sub, input.comment ?? null, params.approvalId, params.runId, request.user.workspaceId]);
     if (!approval.rowCount) return reply.code(409).send({ error: 'APPROVAL_NOT_PENDING' });
     if (input.decision === 'rejected') {

@@ -11,7 +11,7 @@ import { embeddingFor } from './lib/embeddings.js';
 import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from './lib/ai-provider.js';
 import { assertWorkspaceAiBudgetAvailable, estimatedWorkspaceAiCost, recordAiUsage } from './lib/ai-usage.js';
 import { isPublicIp } from './lib/network.js';
-import { resolveAgentRuntimePolicy, retrieveAgentKnowledge } from './lib/agent-runtime.js';
+import { agentRuntimeSourceFromSnapshot, resolveAgentRuntimePolicy, retrieveAgentKnowledge } from './lib/agent-runtime.js';
 import {
   anthropicMcpDefinition,
   authorizedMcpTools,
@@ -30,6 +30,12 @@ import { limitedActionResult, safeActionSummary } from './lib/action-safety.js';
 import { processFile, purgeExpiredFiles } from './files/service.js';
 import { retrieveTaskAttachmentContext } from './files/context.js';
 import { outputContractFromTaskInput, outputContractInstruction, parseAgentOutput } from './workflows/output-contracts.js';
+import {
+  assertManifestCompatible,
+  validateManifestCompatibility,
+  type ExecutionManifest,
+} from './runtime/manifest.js';
+import type { AgentVersionSnapshot } from './agents/versions.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
 type Agent = {
@@ -52,6 +58,8 @@ type Task = {
   requested_by: string;
   workflow_run_id: string | null;
   workflow_node_id: string | null;
+  agent_version_id: string | null;
+  execution_manifest: ExecutionManifest | null;
 };
 type WorkflowNode = { id: string; type: 'trigger' | 'agent' | 'action' | 'condition' | 'approval' | 'loop' | 'output'; config: Record<string, unknown> };
 type WorkflowDefinition = { nodes: WorkflowNode[]; edges: Array<{ source: string; target: string; condition?: string }> };
@@ -151,6 +159,47 @@ async function executeTaskToolAction(input: {
   }
 }
 
+async function runtimeAgentForTask(task: Task): Promise<{ agent: Agent; exactManifest: boolean }> {
+  const compatibility = validateManifestCompatibility(task.execution_manifest);
+  if (compatibility.ok) {
+    const manifest = assertManifestCompatible(task.execution_manifest);
+    const expectedVersionId = manifest.agents[task.agent_id]?.versionId;
+    if (!expectedVersionId || expectedVersionId !== task.agent_version_id) {
+      throw Object.assign(new Error('Task agent version does not match its execution manifest'), {
+        code: 'RUN_MANIFEST_INCOMPATIBLE',
+        retryable: false,
+      });
+    }
+    const version = (await query<{ snapshot: AgentVersionSnapshot }>(
+      `SELECT snapshot FROM agent_versions
+        WHERE id=$1 AND agent_id=$2 AND workspace_id=$3`,
+      [expectedVersionId, task.agent_id, task.workspace_id],
+    )).rows[0];
+    if (!version) {
+      throw Object.assign(new Error('Published task agent version is missing'), {
+        code: 'RUN_MANIFEST_INCOMPATIBLE',
+        retryable: false,
+      });
+    }
+    return { agent: agentRuntimeSourceFromSnapshot(version.snapshot), exactManifest: true };
+  }
+  if (task.workflow_run_id) {
+    const testRun = (await query<{ test_run: boolean }>(
+      "SELECT run_mode='test' AS test_run FROM workflow_runs WHERE id=$1 AND workspace_id=$2",
+      [task.workflow_run_id, task.workspace_id],
+    )).rows[0]?.test_run;
+    if (testRun) {
+      const agent = (await query<Agent>(
+        'SELECT name,role,goal,instructions,model,model_config,capabilities,memory_config,tool_ids FROM agents WHERE id=$1 AND workspace_id=$2',
+        [task.agent_id, task.workspace_id],
+      )).rows[0];
+      if (agent) return { agent, exactManifest: false };
+    }
+  }
+  assertManifestCompatible(task.execution_manifest);
+  throw new Error('Agent is missing');
+}
+
 export async function executeAgentTask(taskId: string) {
   const task = (await query<Task>(
     `UPDATE tasks SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
@@ -158,11 +207,10 @@ export async function executeAgentTask(taskId: string) {
     [taskId],
   )).rows[0];
   if (!task) return null;
-  const agent = (await query<Agent>('SELECT name,role,goal,instructions,model,model_config,capabilities,memory_config,tool_ids FROM agents WHERE id=$1', [task.agent_id])).rows[0];
-  if (!agent) throw new Error('Agent is missing');
-  const checkpoint = await loadTaskActionCheckpoint(task.workspace_id, task.id);
-  await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`);
   try {
+    const { agent, exactManifest } = await runtimeAgentForTask(task);
+    const checkpoint = await loadTaskActionCheckpoint(task.workspace_id, task.id);
+    await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`);
     await assertWorkspaceAiBudgetAvailable(task.workspace_id);
     const runtime = assertConfiguredAiProvider(await configuredAiProviderForWorkspace(task.workspace_id));
     const { provider, anthropic, openAiCompatible } = runtime;
@@ -171,8 +219,13 @@ export async function executeAgentTask(taskId: string) {
     const toolIds = Array.isArray(agent.tool_ids) ? agent.tool_ids.filter((id): id is string => typeof id === 'string') : [];
     const assignedTools = toolIds.length ? (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE workspace_id=$1 AND enabled=true AND id = ANY($2::uuid[])', [task.workspace_id, toolIds])).rows : [];
     const runtimePolicy = resolveAgentRuntimePolicy(agent, assignedTools);
-    const configuredTools = runtimePolicy.tools;
-    const configuredMcpTools = await authorizedMcpTools(task.workspace_id, task.agent_id);
+    const configuredTools = exactManifest
+      ? runtimePolicy.tools.filter((tool) => Boolean(task.execution_manifest?.apiTools[tool.id]))
+      : runtimePolicy.tools;
+    const authorizedMcp = await authorizedMcpTools(task.workspace_id, task.agent_id);
+    const configuredMcpTools = exactManifest
+      ? authorizedMcp.filter((tool) => Boolean(task.execution_manifest?.mcpActions[tool.id]))
+      : authorizedMcp;
     if (runtimePolicy.deniedTools.length) {
       await taskEvent(task.workspace_id, task.id, 'capability.enforced', 'Some assigned tools were unavailable under the agent capability policy', {
         deniedToolIds: runtimePolicy.deniedTools.map((tool) => tool.id),
@@ -520,7 +573,31 @@ new Worker<{ documentId: string }>(KNOWLEDGE_QUEUE, async (job) => {
   }
 }, { connection, concurrency: 2 });
 
-new Worker<{ workflowRunId: string }>(WORKFLOW_QUEUE, (job) => executeWorkflowStep(job.data.workflowRunId, executeAgentTask), { connection, concurrency: 2 });
+new Worker<{ workflowRunId: string }>(WORKFLOW_QUEUE, async (job) => {
+  const run = (await query<{ run_mode: 'test' | 'production'; execution_manifest: ExecutionManifest | null }>(
+    'SELECT run_mode,execution_manifest FROM workflow_runs WHERE id=$1',
+    [job.data.workflowRunId],
+  )).rows[0];
+  if (run?.run_mode === 'production') {
+    try {
+      assertManifestCompatible(run.execution_manifest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'RUN_MANIFEST_INCOMPATIBLE';
+      await query(
+        `UPDATE workflow_runs
+            SET status='failed',output=$1,completed_at=now(),updated_at=now()
+          WHERE id=$2 AND status IN ('queued','awaiting_approval')`,
+        [JSON.stringify({ error: message }), job.data.workflowRunId],
+      );
+      await query(
+        "UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'",
+        [job.data.workflowRunId],
+      );
+      throw error;
+    }
+  }
+  return executeWorkflowStep(job.data.workflowRunId, executeAgentTask);
+}, { connection, concurrency: 2 });
 
 startMcpMaintenance();
 const fileCleanup = setInterval(() => { void purgeExpiredFiles(); }, 60 * 60 * 1_000);

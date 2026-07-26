@@ -24,10 +24,32 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
       ...mappedInput,
       workflow: { name: run.name, runId: run.id, nodeId: node.id, iterationKey, attempt: cursor.attempt, responsibility: node.config.responsibility ?? null, expectedOutput: node.config.expectedOutput ?? null, outputContract: node.config.outputContract ?? 'text' },
     };
+    const agentVersionId = run.execution_manifest?.agents[agentId]?.versionId ?? null;
+    if (run.run_mode === 'production' && !agentVersionId) {
+      throw Object.assign(new Error('AGENT_VERSION_REQUIRED'), {
+        code: 'AGENT_VERSION_REQUIRED',
+        retryable: false,
+      });
+    }
     task = (await query<{ id: string; status: string; output: unknown; error: unknown }>(
-      `INSERT INTO tasks(workspace_id,agent_id,workflow_run_id,workflow_node_id,workflow_iteration_key,workflow_attempt,title,input,requested_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,status,output,error`,
-      [run.workspace_id, agentId, run.id, node.id, iterationKey, cursor.attempt, String(node.config.title ?? `Workflow ${run.name}`), json(agentInput), run.created_by],
+      `INSERT INTO tasks(
+         workspace_id,agent_id,agent_version_id,workflow_run_id,workflow_node_id,workflow_iteration_key,
+         workflow_attempt,title,input,requested_by,manifest_version,execution_manifest
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,status,output,error`,
+      [
+        run.workspace_id,
+        agentId,
+        agentVersionId,
+        run.id,
+        node.id,
+        iterationKey,
+        cursor.attempt,
+        String(node.config.title ?? `Workflow ${run.name}`),
+        json(agentInput),
+        run.created_by,
+        run.execution_manifest?.manifestVersion ?? 1,
+        run.execution_manifest ? json(run.execution_manifest) : null,
+      ],
     )).rows[0];
   }
   if (task.status === 'failed') throw new Error(typeof task.error === 'object' && task.error && 'message' in task.error ? String((task.error as { message: unknown }).message) : `Agent node ${node.id} failed`);

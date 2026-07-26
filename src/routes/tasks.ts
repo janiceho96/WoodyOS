@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { query } from '../db/client.js';
+import { db, query } from '../db/client.js';
 import { audit } from '../lib/audit.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { enqueueTask } from '../queue/task-queue.js';
 import { assertWorkspaceAiBudgetAvailable } from '../lib/ai-usage.js';
 import { requestTaskArtifacts } from '../artifacts/service.js';
 import { artifactFormatSchema, inferredArtifactFormats } from '../artifacts/types.js';
+import { buildTaskManifest } from '../runtime/manifest.js';
 
 const taskInput = z.object({
   agentId: z.string().uuid(),
@@ -43,7 +44,7 @@ export async function taskRoutes(app: FastifyInstance) {
   }));
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(taskInput, request.body, reply); if (!input) return;
-    const agent = await query('SELECT id,status FROM agents WHERE id=$1 AND workspace_id=$2', [input.agentId, request.user.workspaceId]);
+    const agent = await query('SELECT id,status,published_version_id FROM agents WHERE id=$1 AND workspace_id=$2', [input.agentId, request.user.workspaceId]);
     if (!agent.rowCount) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
     if (agent.rows[0].status !== 'active') return reply.code(409).send({ error: 'AGENT_NOT_ACTIVE' });
     const attachmentIds = [...new Set(input.attachmentIds)];
@@ -55,7 +56,38 @@ export async function taskRoutes(app: FastifyInstance) {
       if (available.rowCount !== attachmentIds.length) return reply.code(409).send({ error: 'FILE_ATTACHMENTS_NOT_READY_OR_MISSING' });
     }
     await assertWorkspaceAiBudgetAvailable(request.user.workspaceId);
-    const task = (await query('INSERT INTO tasks(workspace_id,agent_id,title,input,requested_by) VALUES($1,$2,$3,$4,$5) RETURNING *', [request.user.workspaceId, input.agentId, input.title, JSON.stringify(input.input), request.user.sub])).rows[0];
+    const client = await db.connect();
+    let task: { id: string; title: string; [key: string]: unknown };
+    try {
+      await client.query('BEGIN');
+      const manifest = await buildTaskManifest({
+        workspaceId: request.user.workspaceId,
+        agentId: input.agentId,
+      }, client);
+      const versionId = manifest.agents[input.agentId]?.versionId;
+      if (!versionId) throw Object.assign(new Error('AGENT_VERSION_REQUIRED'), { statusCode: 409 });
+      task = (await client.query<{ id: string; title: string; [key: string]: unknown }>(
+        `INSERT INTO tasks(
+           workspace_id,agent_id,agent_version_id,title,input,requested_by,manifest_version,execution_manifest
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [
+          request.user.workspaceId,
+          input.agentId,
+          versionId,
+          input.title,
+          JSON.stringify(input.input),
+          request.user.sub,
+          manifest.manifestVersion,
+          JSON.stringify(manifest),
+        ],
+      )).rows[0];
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     if (attachmentIds.length) {
       await query(
         `INSERT INTO task_attachments(task_id,file_id,workspace_id,attached_by)

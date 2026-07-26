@@ -8,6 +8,7 @@ import { agentPromptRequestSchema, generateAgentPrompt } from '../agents/prompt-
 import { agentAvatarStorage } from '../avatars/storage.js';
 import { deleteAgentAvatar, findAgentAvatar, saveAgentAvatar } from '../avatars/service.js';
 import { loadAgentMcpAccess } from '../agents/mcp-access.js';
+import { publishAgent } from '../agents/versions.js';
 
 const defaultModel = process.env.LLM_DEFAULT_MODEL ?? 'claude-sonnet-4-20250514';
 const modelConfig = z.object({
@@ -70,6 +71,37 @@ export async function agentRoutes(app: FastifyInstance) {
     const access = await loadAgentMcpAccess(request.user.workspaceId, params.id);
     if (!access) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
     return access;
+  }));
+  app.get('/:id/versions', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
+    const params = parse(z.object({ id: z.string().uuid() }), request.params, reply);
+    if (!params) return;
+    const agent = await query<{ id: string }>(
+      'SELECT id FROM agents WHERE id=$1 AND workspace_id=$2',
+      [params.id, request.user.workspaceId],
+    );
+    if (!agent.rowCount) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
+    const versions = await query(
+      `SELECT id,agent_id,version,snapshot,published_by,created_at
+         FROM agent_versions
+        WHERE agent_id=$1 AND workspace_id=$2
+        ORDER BY version DESC`,
+      [params.id, request.user.workspaceId],
+    );
+    return { data: versions.rows };
+  }));
+  app.post('/:id/publish', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const params = parse(z.object({ id: z.string().uuid() }), request.params, reply);
+    if (!params) return;
+    const published = await publishAgent({
+      workspaceId: request.user.workspaceId,
+      agentId: params.id,
+      actorId: request.user.sub,
+    });
+    await audit(request.user.workspaceId, request.user.sub, 'agent.published', 'agent', params.id, {
+      version: published.version,
+      versionId: published.id,
+    });
+    return reply.code(201).send(published);
   }));
   app.get('/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const result = await query('SELECT * FROM agents WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);

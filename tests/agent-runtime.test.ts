@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeModelConfig, resolveAgentRuntimePolicy } from '../src/lib/agent-runtime.js';
+import { agentRuntimeSourceFromSnapshot, normalizeModelConfig, resolveAgentRuntimePolicy } from '../src/lib/agent-runtime.js';
 import type { ToolRecord } from '../src/tools/runtime.js';
 
 function tool(id: string, name: string, permissions: string[]): ToolRecord {
@@ -13,6 +13,28 @@ function tool(id: string, name: string, permissions: string[]): ToolRecord {
 }
 
 describe('agent runtime policy', () => {
+  it('maps an immutable version snapshot to the existing runtime policy contract', () => {
+    expect(agentRuntimeSourceFromSnapshot({
+      name: 'Published agent',
+      role: 'Researcher',
+      goal: 'Find evidence',
+      instructions: 'Cite sources',
+      personality: null,
+      model: 'published-model',
+      modelConfig: { temperature: 0.4, maxTokens: 2048, topP: 0.8 },
+      capabilities: { webBrowser: true, codeInterpreter: false, knowledgeBase: true },
+      apiToolIds: ['tool-one'],
+      memoryConfig: { knowledgeBase: false },
+      avatarIdentity: {},
+    })).toMatchObject({
+      name: 'Published agent',
+      model: 'published-model',
+      model_config: { temperature: 0.4, maxTokens: 2048, topP: 0.8 },
+      tool_ids: ['tool-one'],
+      memory_config: { knowledgeBase: false },
+    });
+  });
+
   it('normalizes generation settings at the worker boundary', () => {
     expect(normalizeModelConfig({ temperature: 9, maxTokens: 12.5, topP: -1 })).toEqual({
       temperature: 2,

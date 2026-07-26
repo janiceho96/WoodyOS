@@ -212,6 +212,18 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const restored = await app.inject({ method: 'GET', url: `/v1/agents/${agentId}`, headers: { authorization: `Bearer ${token}` } });
     expect(restored.statusCode, restored.body).toBe(200);
     expect(restored.json().avatar_config).toEqual({});
+    const published = await app.inject({ method: 'POST', url: `/v1/agents/${agentId}/publish`, headers: { authorization: `Bearer ${token}` } });
+    expect(published.statusCode, published.body).toBe(201);
+    expect(published.json()).toMatchObject({
+      agentId,
+      version: 1,
+      snapshot: { instructions: 'Be concise.', modelConfig: { maxTokens: 8192 } },
+    });
+    const versions = await app.inject({ method: 'GET', url: `/v1/agents/${agentId}/versions`, headers: { authorization: `Bearer ${token}` } });
+    expect(versions.statusCode, versions.body).toBe(200);
+    expect(versions.json().data).toEqual([
+      expect.objectContaining({ id: published.json().id, version: 1 }),
+    ]);
   });
 
   it('serves revisioned Departments safely and keeps legacy team clients on the same source of truth', async () => {
@@ -1079,6 +1091,12 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(completedWorkflow.json()).toMatchObject({
       run_mode: 'production',
       workflow_version_id: published.json().published_version_id,
+      execution_manifest: {
+        manifestVersion: 1,
+        compatibility: 'exact',
+        workflow: { versionId: published.json().published_version_id },
+        agents: {},
+      },
       usage: { agentTasks: 0, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
     });
     expect(completedWorkflow.json().output).toMatchObject({ topic: 'agents', done: true });
@@ -1348,6 +1366,16 @@ describe.runIf(enabled)('database-backed API flow', () => {
 
     const task = await app.inject({ method: 'POST', url: '/v1/tasks', headers, payload: { agentId, title: 'Research current market', input: { topic: 'agent platforms' }, artifactFormats: ['pdf', 'html'], attachmentIds: [uploadedFile.json().id] } });
     expect(task.statusCode, task.body).toBe(202);
+    expect(task.json()).toMatchObject({
+      agent_version_id: expect.any(String),
+      execution_manifest: {
+        manifestVersion: 1,
+        compatibility: 'exact',
+        agents: {
+          [agentId]: { versionId: expect.any(String), version: 1, snapshotHash: expect.stringMatching(/^[a-f0-9]{64}$/) },
+        },
+      },
+    });
     const taskWithArtifact = await app.inject({ method: 'GET', url: `/v1/tasks/${task.json().id}`, headers });
     expect(taskWithArtifact.statusCode, taskWithArtifact.body).toBe(200);
     expect(taskWithArtifact.json().artifacts).toEqual(expect.arrayContaining([expect.objectContaining({ format: 'pdf', status: 'pending' }), expect.objectContaining({ format: 'html', status: 'pending' })]));
@@ -2337,5 +2365,110 @@ describe.runIf(enabled)('transactional department service', () => {
       'SELECT count(*)::int AS count FROM audit_events WHERE workspace_id=$1',
       [workspaceId],
     )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+});
+
+describe.runIf(enabled)('agent version and execution manifest migration', () => {
+  it('backfills tenant-bound immutable versions and marks historical runs as legacy partial idempotently', async () => {
+    const { db } = await import('../src/db/client.js');
+    const client = await db.connect();
+    const suffix = `${Date.now()}${Math.random().toString(36).slice(2)}`.replace(/[^a-z0-9]/gi, '');
+    const schema = `agent_version_migration_${suffix}`;
+    try {
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET search_path TO "${schema}", public`);
+      await client.query(`
+        CREATE TABLE workspaces (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          name TEXT NOT NULL
+        );
+        CREATE TABLE users (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+        );
+        CREATE TABLE agents (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL,
+          goal TEXT NOT NULL,
+          instructions TEXT NOT NULL DEFAULT '',
+          personality TEXT,
+          model TEXT NOT NULL,
+          status TEXT NOT NULL,
+          tool_ids JSONB NOT NULL DEFAULT '[]',
+          memory_config JSONB NOT NULL DEFAULT '{}',
+          model_config JSONB NOT NULL DEFAULT '{}',
+          capabilities JSONB NOT NULL DEFAULT '{}',
+          avatar_config JSONB NOT NULL DEFAULT '{}',
+          created_by UUID NOT NULL REFERENCES users(id),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE(id,workspace_id)
+        );
+        CREATE TABLE tasks (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          agent_id UUID NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          FOREIGN KEY(agent_id,workspace_id) REFERENCES agents(id,workspace_id)
+        );
+        CREATE TABLE workflow_runs (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+      const actorId = (await client.query<{ id: string }>('INSERT INTO users DEFAULT VALUES RETURNING id')).rows[0].id;
+      const workspaceIds = (await client.query<{ id: string }>(
+        "INSERT INTO workspaces(name) VALUES('First tenant'),('Second tenant') RETURNING id",
+      )).rows.map((row) => row.id);
+      const agents = await Promise.all(workspaceIds.map(async (workspaceId, index) => (await client.query<{ id: string }>(
+        `INSERT INTO agents(
+           workspace_id,name,role,goal,instructions,model,status,created_by
+         ) VALUES($1,$2,'Researcher','Find evidence',$3,'model-a','active',$4) RETURNING id`,
+        [workspaceId, `Agent ${index}`, `Instruction ${index}`, actorId],
+      )).rows[0].id));
+      for (const [index, workspaceId] of workspaceIds.entries()) {
+        await client.query('INSERT INTO tasks(workspace_id,agent_id) VALUES($1,$2)', [workspaceId, agents[index]]);
+        await client.query('INSERT INTO workflow_runs(workspace_id) VALUES($1)', [workspaceId]);
+      }
+
+      const migration = await readFile(
+        new URL('../src/db/migrations/030_agent_versions_and_manifests.sql', import.meta.url),
+        'utf8',
+      );
+      await client.query(migration);
+      await client.query(migration);
+
+      const versions = await client.query<{
+        id: string;
+        workspace_id: string;
+        agent_id: string;
+        version: number;
+        snapshot: { instructions: string };
+      }>('SELECT id,workspace_id,agent_id,version,snapshot FROM agent_versions ORDER BY workspace_id');
+      expect(versions.rows).toHaveLength(2);
+      expect(versions.rows.map((row) => row.version)).toEqual([1, 1]);
+      expect(new Set(versions.rows.map((row) => row.workspace_id))).toEqual(new Set(workspaceIds));
+      await expect(client.query(
+        `UPDATE tasks SET agent_version_id=$1
+          WHERE workspace_id=$2`,
+        [versions.rows.find((row) => row.workspace_id === workspaceIds[0])!.id, workspaceIds[1]],
+      )).rejects.toMatchObject({ code: '23503' });
+      await expect(client.query(
+        "UPDATE agent_versions SET snapshot=jsonb_set(snapshot,'{instructions}','\"mutated\"') WHERE id=$1",
+        [versions.rows[0].id],
+      )).rejects.toMatchObject({ code: '55000' });
+      expect((await client.query<{ compatibility: string }>(
+        "SELECT execution_manifest->>'compatibility' compatibility FROM tasks ORDER BY workspace_id",
+      )).rows).toEqual([{ compatibility: 'legacy_partial' }, { compatibility: 'legacy_partial' }]);
+      expect((await client.query<{ compatibility: string }>(
+        "SELECT execution_manifest->>'compatibility' compatibility FROM workflow_runs ORDER BY workspace_id",
+      )).rows).toEqual([{ compatibility: 'legacy_partial' }, { compatibility: 'legacy_partial' }]);
+    } finally {
+      await client.query('RESET search_path');
+      await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      client.release();
+    }
   });
 });

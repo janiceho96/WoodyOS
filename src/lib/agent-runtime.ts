@@ -21,6 +21,14 @@ export type AgentRuntimeSource = {
   tool_ids: unknown;
 };
 
+export type VersionedAgentRuntimeSource = AgentRuntimeSource & {
+  name: string;
+  role: string;
+  goal: string;
+  instructions: string;
+  model: string;
+};
+
 export type AgentRuntimePolicy = {
   modelConfig: AgentModelConfig;
   capabilities: AgentCapabilities;
@@ -70,6 +78,30 @@ export function normalizeCapabilities(value: unknown): AgentCapabilities {
     webBrowser: booleanValue(capabilities.webBrowser, DEFAULT_CAPABILITIES.webBrowser),
     codeInterpreter: booleanValue(capabilities.codeInterpreter, DEFAULT_CAPABILITIES.codeInterpreter),
     knowledgeBase: booleanValue(capabilities.knowledgeBase, DEFAULT_CAPABILITIES.knowledgeBase),
+  };
+}
+
+export function agentRuntimeSourceFromSnapshot(snapshot: {
+  name: string;
+  role: string;
+  goal: string;
+  instructions: string;
+  model: string;
+  modelConfig: AgentModelConfig;
+  capabilities: AgentCapabilities;
+  apiToolIds: string[];
+  memoryConfig: Record<string, unknown>;
+}): VersionedAgentRuntimeSource {
+  return {
+    name: snapshot.name,
+    role: snapshot.role,
+    goal: snapshot.goal,
+    instructions: snapshot.instructions,
+    model: snapshot.model,
+    model_config: snapshot.modelConfig,
+    capabilities: snapshot.capabilities,
+    memory_config: snapshot.memoryConfig,
+    tool_ids: snapshot.apiToolIds,
   };
 }
 

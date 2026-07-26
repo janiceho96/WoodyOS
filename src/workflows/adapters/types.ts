@@ -1,4 +1,5 @@
 import type { WorkflowDefinition, WorkflowNode } from '../definition.js';
+import type { ExecutionManifest } from '../../runtime/manifest.js';
 
 export type LoopCursor = { iteration: number };
 export type WorkflowCursor = { nodeId: string; loops: Record<string, LoopCursor>; attempt: number; previousNodeId?: string };
@@ -12,6 +13,7 @@ export type WorkflowRunRecord = {
   cursor: WorkflowCursor | null;
   step_count: number;
   run_mode?: 'test' | 'production';
+  execution_manifest?: ExecutionManifest | null;
   test_target_node_id?: string | null;
   name: string;
   created_by: string;
