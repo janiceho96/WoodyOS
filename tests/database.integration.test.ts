@@ -1,7 +1,16 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { PoolClient } from 'pg';
+import {
+  archiveDepartment,
+  createDepartment,
+  getOrganization,
+  removeMembership,
+  setExecutiveAgent,
+  setMembership,
+  updateDepartment,
+} from '../src/departments/service.js';
 
 const enabled = process.env.RUN_INTEGRATION === 'true';
 
@@ -1264,5 +1273,498 @@ describe.runIf(enabled)('database-backed API flow', () => {
         [secondDepartmentId, workspaceId, primaryAgentId],
       )).rejects.toMatchObject({ code: '23505' });
     });
+  });
+});
+
+describe.runIf(enabled)('transactional department service', () => {
+  const serviceSuffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let workspaceId = '';
+  let otherWorkspaceId = '';
+  let actorId = '';
+  let otherActorId = '';
+
+  beforeEach(async () => {
+    const { query } = await import('../src/db/client.js');
+    const unique = `${serviceSuffix}-${Math.random().toString(36).slice(2)}`;
+    workspaceId = (await query<{ id: string }>(
+      'INSERT INTO workspaces(name) VALUES($1) RETURNING id',
+      [`Department service ${unique}`],
+    )).rows[0].id;
+    otherWorkspaceId = (await query<{ id: string }>(
+      'INSERT INTO workspaces(name) VALUES($1) RETURNING id',
+      [`Other department service ${unique}`],
+    )).rows[0].id;
+    actorId = (await query<{ id: string }>(
+      `INSERT INTO users(email,password_hash,display_name)
+       VALUES($1,'integration-password-hash','Department Owner') RETURNING id`,
+      [`department-owner-${unique}@example.test`],
+    )).rows[0].id;
+    otherActorId = (await query<{ id: string }>(
+      `INSERT INTO users(email,password_hash,display_name)
+       VALUES($1,'integration-password-hash','Other Department Owner') RETURNING id`,
+      [`other-department-owner-${unique}@example.test`],
+    )).rows[0].id;
+    await query(
+      `INSERT INTO workspace_memberships(workspace_id,user_id,role)
+       VALUES($1,$2,'owner'),($3,$4,'owner')`,
+      [workspaceId, actorId, otherWorkspaceId, otherActorId],
+    );
+  });
+
+  afterEach(async () => {
+    const { query } = await import('../src/db/client.js');
+    if (workspaceId || otherWorkspaceId) {
+      await query('DELETE FROM workspaces WHERE id = ANY($1::uuid[])', [
+        [workspaceId, otherWorkspaceId].filter(Boolean),
+      ]);
+    }
+    if (actorId || otherActorId) {
+      await query('DELETE FROM users WHERE id = ANY($1::uuid[])', [
+        [actorId, otherActorId].filter(Boolean),
+      ]);
+    }
+  });
+
+  async function createAgent(
+    agentWorkspaceId: string,
+    createdBy: string,
+    name: string,
+    status: 'draft' | 'active' | 'paused' | 'archived' = 'active',
+  ) {
+    const { query } = await import('../src/db/client.js');
+    return (await query<{ id: string }>(
+      `INSERT INTO agents(workspace_id,name,role,goal,status,created_by)
+       VALUES($1,$2,'Specialist','Support the Department service integration test',$3,$4)
+       RETURNING id`,
+      [agentWorkspaceId, name, status, createdBy],
+    )).rows[0].id;
+  }
+
+  async function insertDepartment(name: string, targetWorkspaceId = workspaceId) {
+    const { query } = await import('../src/db/client.js');
+    return (await query<{ id: string }>(
+      'INSERT INTO departments(workspace_id,name) VALUES($1,$2) RETURNING id',
+      [targetWorkspaceId, name],
+    )).rows[0].id;
+  }
+
+  it('creates and reads an organization without exposing agent configuration', async () => {
+    const managerAgentId = await createAgent(workspaceId, actorId, 'Operations Manager');
+
+    const result = await createDepartment({
+      workspaceId,
+      actorId,
+      expectedRevision: 1,
+      name: 'Operations',
+      description: 'Coordinates internal operations',
+      displayOrder: 4,
+      managerAgentId,
+    });
+
+    expect(result).toEqual({ revision: 2 });
+    const organization = await getOrganization(workspaceId);
+    expect(organization).toMatchObject({
+      revision: 2,
+      executiveAgentId: null,
+      departments: [{
+        workspaceId,
+        name: 'Operations',
+        description: 'Coordinates internal operations',
+        status: 'active',
+        displayOrder: 4,
+        managerAgentId,
+      }],
+      memberships: [{
+        workspaceId,
+        agentId: managerAgentId,
+        membershipType: 'primary',
+      }],
+    });
+    expect(JSON.stringify(organization)).not.toMatch(/instructions|memory|tool/i);
+
+    const { query } = await import('../src/db/client.js');
+    await expect(query(
+      `SELECT action,entity_type,entity_id,metadata
+         FROM audit_events
+        WHERE workspace_id=$1 AND action='department.created'`,
+      [workspaceId],
+    )).resolves.toMatchObject({
+      rows: [{
+        action: 'department.created',
+        entity_type: 'department',
+        entity_id: organization.departments[0].id,
+        metadata: { revision: 2 },
+      }],
+    });
+  });
+
+  it('moves an agent primary membership atomically and preserves shared memberships', async () => {
+    const { query } = await import('../src/db/client.js');
+    const previousDepartmentId = await insertDepartment('Previous');
+    const salesDepartmentId = await insertDepartment('Sales');
+    const sharedDepartmentId = await insertDepartment('Shared services');
+    const agentId = await createAgent(workspaceId, actorId, 'Sales Agent');
+    await query(
+      `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
+       VALUES($1,$2,$3,'primary'),($4,$2,$3,'shared')`,
+      [previousDepartmentId, workspaceId, agentId, sharedDepartmentId],
+    );
+
+    const result = await setMembership({
+      workspaceId,
+      actorId,
+      departmentId: salesDepartmentId,
+      agentId,
+      membershipType: 'primary',
+      expectedRevision: 1,
+    });
+
+    expect(result).toEqual({ revision: 2 });
+    await expect(query(
+      `SELECT department_id,membership_type
+         FROM department_memberships
+        WHERE workspace_id=$1 AND agent_id=$2
+        ORDER BY membership_type,department_id`,
+      [workspaceId, agentId],
+    )).resolves.toMatchObject({
+      rows: expect.arrayContaining([
+        { department_id: salesDepartmentId, membership_type: 'primary' },
+        { department_id: sharedDepartmentId, membership_type: 'shared' },
+      ]),
+      rowCount: 2,
+    });
+  });
+
+  it('rejects stale organization revisions without mutating or auditing', async () => {
+    const departmentId = await insertDepartment('Business operations');
+    await createDepartment({
+      workspaceId,
+      actorId,
+      expectedRevision: 1,
+      name: 'Finance',
+    });
+
+    await expect(updateDepartment({
+      workspaceId,
+      actorId,
+      departmentId,
+      expectedRevision: 1,
+      name: 'Operations',
+    })).rejects.toMatchObject({
+      code: 'DEPARTMENT_REVISION_CONFLICT',
+      currentRevision: 2,
+    });
+
+    const { query } = await import('../src/db/client.js');
+    await expect(query(
+      'SELECT name FROM departments WHERE id=$1 AND workspace_id=$2',
+      [departmentId, workspaceId],
+    )).resolves.toMatchObject({ rows: [{ name: 'Business operations' }] });
+    await expect(query(
+      `SELECT count(*)::int AS count FROM audit_events
+        WHERE workspace_id=$1 AND action='department.updated'`,
+      [workspaceId],
+    )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+
+  it('serializes concurrent mutations on the organization revision', async () => {
+    const { query } = await import('../src/db/client.js');
+    await query(
+      'INSERT INTO workspace_org_settings(workspace_id) VALUES($1)',
+      [workspaceId],
+    );
+    const triggerId = serviceSuffix.replace(/[^a-z0-9]/gi, '');
+    const triggerName = `department_revision_race_${triggerId}`;
+    const functionName = `${triggerName}_delay`;
+    await query(`
+      CREATE FUNCTION "${functionName}"() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.workspace_id = '${workspaceId}'::uuid THEN
+          PERFORM pg_sleep(0.2);
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TRIGGER "${triggerName}"
+      BEFORE INSERT ON departments
+      FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+    `);
+    let attempts: PromiseSettledResult<{ revision: number }>[];
+    try {
+      attempts = await Promise.allSettled([
+        createDepartment({
+          workspaceId,
+          actorId,
+          expectedRevision: 1,
+          name: 'Concurrent one',
+        }),
+        createDepartment({
+          workspaceId,
+          actorId,
+          expectedRevision: 1,
+          name: 'Concurrent two',
+        }),
+      ]);
+    } finally {
+      await query(`
+        DROP TRIGGER "${triggerName}" ON departments;
+        DROP FUNCTION "${functionName}"();
+      `);
+    }
+
+    expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toEqual([
+      expect.objectContaining({ value: { revision: 2 } }),
+    ]);
+    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toEqual([
+      expect.objectContaining({
+        reason: expect.objectContaining({
+          code: 'DEPARTMENT_REVISION_CONFLICT',
+          currentRevision: 2,
+        }),
+      }),
+    ]);
+
+    const organization = await getOrganization(workspaceId);
+    expect(organization.revision).toBe(2);
+    expect(organization.departments).toHaveLength(1);
+    await expect(query(
+      `SELECT count(*)::int AS count
+         FROM audit_events
+        WHERE workspace_id=$1 AND action='department.created'`,
+      [workspaceId],
+    )).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  });
+
+  it('maps active Department name uniqueness conflicts to a stable domain error', async () => {
+    await createDepartment({
+      workspaceId,
+      actorId,
+      expectedRevision: 1,
+      name: 'Operations',
+    });
+
+    await expect(createDepartment({
+      workspaceId,
+      actorId,
+      expectedRevision: 2,
+      name: 'operations',
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_NAME_CONFLICT' });
+
+    expect((await getOrganization(workspaceId)).revision).toBe(2);
+  });
+
+  it('requires confirmation to move a manager primary membership and rejects inactive managers', async () => {
+    const { query } = await import('../src/db/client.js');
+    const originalDepartmentId = await insertDepartment('Original');
+    const targetDepartmentId = await insertDepartment('Target');
+    const activeManagerId = await createAgent(workspaceId, actorId, 'Active Manager');
+    const pausedManagerId = await createAgent(workspaceId, actorId, 'Paused Manager', 'paused');
+    await query(
+      `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
+       VALUES($1,$2,$3,'primary')`,
+      [originalDepartmentId, workspaceId, activeManagerId],
+    );
+
+    await expect(updateDepartment({
+      workspaceId,
+      actorId,
+      departmentId: targetDepartmentId,
+      expectedRevision: 1,
+      managerAgentId: activeManagerId,
+    })).rejects.toMatchObject({
+      code: 'DEPARTMENT_PRIMARY_MOVE_CONFIRMATION_REQUIRED',
+    });
+    await expect(updateDepartment({
+      workspaceId,
+      actorId,
+      departmentId: targetDepartmentId,
+      expectedRevision: 1,
+      managerAgentId: pausedManagerId,
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_MANAGER_INACTIVE' });
+
+    const result = await updateDepartment({
+      workspaceId,
+      actorId,
+      departmentId: targetDepartmentId,
+      expectedRevision: 1,
+      managerAgentId: activeManagerId,
+      confirmPrimaryMove: true,
+    });
+
+    expect(result).toEqual({ revision: 2 });
+    await expect(query(
+      `SELECT manager_agent_id FROM departments
+        WHERE id=$1 AND workspace_id=$2`,
+      [targetDepartmentId, workspaceId],
+    )).resolves.toMatchObject({ rows: [{ manager_agent_id: activeManagerId }] });
+    await expect(query(
+      `SELECT department_id FROM department_memberships
+        WHERE workspace_id=$1 AND agent_id=$2 AND membership_type='primary'`,
+      [workspaceId, activeManagerId],
+    )).resolves.toMatchObject({ rows: [{ department_id: targetDepartmentId }] });
+  });
+
+  it('removes a membership and clears its manager assignment atomically', async () => {
+    const { query } = await import('../src/db/client.js');
+    const departmentId = await insertDepartment('Managed');
+    const managerAgentId = await createAgent(workspaceId, actorId, 'Manager');
+    await query(
+      'UPDATE departments SET manager_agent_id=$1 WHERE id=$2 AND workspace_id=$3',
+      [managerAgentId, departmentId, workspaceId],
+    );
+    await query(
+      `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
+       VALUES($1,$2,$3,'primary')`,
+      [departmentId, workspaceId, managerAgentId],
+    );
+
+    expect(await removeMembership({
+      workspaceId,
+      actorId,
+      departmentId,
+      agentId: managerAgentId,
+      expectedRevision: 1,
+    })).toEqual({ revision: 2 });
+    await expect(query(
+      'SELECT manager_agent_id FROM departments WHERE id=$1 AND workspace_id=$2',
+      [departmentId, workspaceId],
+    )).resolves.toMatchObject({ rows: [{ manager_agent_id: null }] });
+    await expect(removeMembership({
+      workspaceId,
+      actorId,
+      departmentId,
+      agentId: managerAgentId,
+      expectedRevision: 2,
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_MEMBERSHIP_NOT_FOUND' });
+  });
+
+  it('archives Department history while leaving former primary members unassigned', async () => {
+    const { query } = await import('../src/db/client.js');
+    const departmentId = await insertDepartment('Archive me');
+    const otherDepartmentId = await insertDepartment('Still active');
+    const managerAgentId = await createAgent(workspaceId, actorId, 'Historical Manager');
+    const memberAgentId = await createAgent(workspaceId, actorId, 'Historical Member');
+    const sharedAgentId = await createAgent(workspaceId, actorId, 'Shared Historical Member');
+    await query(
+      'UPDATE departments SET manager_agent_id=$1 WHERE id=$2 AND workspace_id=$3',
+      [managerAgentId, departmentId, workspaceId],
+    );
+    await query(
+      `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
+       VALUES($1,$2,$3,'primary'),($1,$2,$4,'primary'),($1,$2,$5,'shared'),($6,$2,$5,'shared')`,
+      [departmentId, workspaceId, managerAgentId, memberAgentId, sharedAgentId, otherDepartmentId],
+    );
+
+    expect(await archiveDepartment({
+      workspaceId,
+      actorId,
+      departmentId,
+      expectedRevision: 1,
+    })).toEqual({ revision: 2 });
+
+    await expect(query(
+      'SELECT status,manager_agent_id FROM departments WHERE id=$1 AND workspace_id=$2',
+      [departmentId, workspaceId],
+    )).resolves.toMatchObject({
+      rows: [{ status: 'archived', manager_agent_id: managerAgentId }],
+    });
+    await expect(query(
+      `SELECT agent_id,membership_type FROM department_memberships
+        WHERE department_id=$1 AND workspace_id=$2 ORDER BY agent_id`,
+      [departmentId, workspaceId],
+    )).resolves.toMatchObject({
+      rowCount: 3,
+      rows: expect.arrayContaining([
+        { agent_id: managerAgentId, membership_type: 'shared' },
+        { agent_id: memberAgentId, membership_type: 'shared' },
+        { agent_id: sharedAgentId, membership_type: 'shared' },
+      ]),
+    });
+    await expect(query(
+      `SELECT count(*)::int AS count FROM department_memberships
+        WHERE workspace_id=$1
+          AND agent_id = ANY($2::uuid[])
+          AND membership_type='primary'`,
+      [workspaceId, [managerAgentId, memberAgentId]],
+    )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    await expect(query(
+      `SELECT membership_type FROM department_memberships
+        WHERE department_id=$1 AND workspace_id=$2 AND agent_id=$3`,
+      [otherDepartmentId, workspaceId, sharedAgentId],
+    )).resolves.toMatchObject({ rows: [{ membership_type: 'shared' }] });
+    await expect(setMembership({
+      workspaceId,
+      actorId,
+      departmentId,
+      agentId: memberAgentId,
+      membershipType: 'primary',
+      expectedRevision: 2,
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_ARCHIVED' });
+  });
+
+  it('sets and clears a workspace executive while rejecting cross-workspace agents', async () => {
+    const executiveAgentId = await createAgent(workspaceId, actorId, 'Executive');
+    const otherAgentId = await createAgent(otherWorkspaceId, otherActorId, 'Other Executive');
+
+    await expect(setExecutiveAgent({
+      workspaceId,
+      actorId,
+      agentId: otherAgentId,
+      expectedRevision: 1,
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_EXECUTIVE_INVALID' });
+    expect(await setExecutiveAgent({
+      workspaceId,
+      actorId,
+      agentId: executiveAgentId,
+      expectedRevision: 1,
+    })).toEqual({ revision: 2 });
+    expect((await getOrganization(workspaceId)).executiveAgentId).toBe(executiveAgentId);
+    expect(await setExecutiveAgent({
+      workspaceId,
+      actorId,
+      agentId: null,
+      expectedRevision: 2,
+    })).toEqual({ revision: 3 });
+    expect((await getOrganization(workspaceId)).executiveAgentId).toBeNull();
+  });
+
+  it('rejects cross-workspace Department and agent resources', async () => {
+    const otherDepartmentId = await insertDepartment('Other tenant Department', otherWorkspaceId);
+    const otherAgentId = await createAgent(otherWorkspaceId, otherActorId, 'Other tenant Agent');
+
+    await expect(updateDepartment({
+      workspaceId,
+      actorId,
+      departmentId: otherDepartmentId,
+      expectedRevision: 1,
+      name: 'Cross-tenant edit',
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_NOT_FOUND' });
+    await expect(setMembership({
+      workspaceId,
+      actorId,
+      departmentId: await insertDepartment('Local'),
+      agentId: otherAgentId,
+      membershipType: 'shared',
+      expectedRevision: 1,
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_AGENT_NOT_FOUND' });
+    expect((await getOrganization(otherWorkspaceId)).revision).toBe(1);
+  });
+
+  it('rejects cross-workspace audit actors before mutating organization state', async () => {
+    await expect(createDepartment({
+      workspaceId,
+      actorId: otherActorId,
+      expectedRevision: 1,
+      name: 'Spoofed actor Department',
+    })).rejects.toMatchObject({ code: 'DEPARTMENT_ACTOR_INVALID' });
+
+    const organization = await getOrganization(workspaceId);
+    expect(organization).toMatchObject({ revision: 1, departments: [] });
+    const { query } = await import('../src/db/client.js');
+    await expect(query(
+      'SELECT count(*)::int AS count FROM audit_events WHERE workspace_id=$1',
+      [workspaceId],
+    )).resolves.toMatchObject({ rows: [{ count: 0 }] });
   });
 });
