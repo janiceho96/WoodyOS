@@ -13,7 +13,7 @@ import {
   Trash2,
   UserRoundPlus,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, type Department, type OrganizationSnapshot } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState, Modal, PageHeader, Status } from '../../components/ui';
@@ -60,9 +60,12 @@ type PendingMove =
     managerAgentId: string;
   };
 
-function smallScreenDefault() {
-  return typeof window.matchMedia === 'function'
-    && window.matchMedia('(max-width: 720px)').matches;
+const departmentCompactBreakpoint = '(max-width: 760px)';
+
+function departmentMediaQuery() {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    ? window.matchMedia(departmentCompactBreakpoint)
+    : null;
 }
 
 function focusLabel(snapshot: OrganizationSnapshot, focusId: string | null) {
@@ -90,9 +93,10 @@ export function DepartmentPage() {
     refetchOnWindowFocus: true,
   });
   const [view, setView] = useState<DepartmentView>(initialDepartmentView);
-  const [canvasMode, setCanvasMode] = useState<DepartmentCanvasMode>(() => (
-    initialDepartmentCanvasMode(smallScreenDefault())
+  const [canvasMode, setCanvasMode] = useState<DepartmentCanvasMode>(() => initialDepartmentCanvasMode(
+    departmentMediaQuery()?.matches ?? false,
   ));
+  const [canvasModeChosen, setCanvasModeChosen] = useState(false);
   const [filters, setFilters] = useState<DepartmentFilters>(emptyDepartmentFilters);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
@@ -106,6 +110,15 @@ export function DepartmentPage() {
   const visibleAgentIds = useMemo(() => snapshot
     ? filteredDepartmentAgentIds(snapshot, filters)
     : new Set<string>(), [snapshot, filters]);
+  useEffect(() => {
+    if (canvasModeChosen) return;
+    const query = departmentMediaQuery();
+    if (!query) return;
+    const update = () => setCanvasMode(initialDepartmentCanvasMode(query.matches));
+    update();
+    query.addEventListener?.('change', update);
+    return () => query.removeEventListener?.('change', update);
+  }, [canvasModeChosen]);
 
   const openDrawer = (next: Exclude<DrawerState, null>) => {
     setMutationError('');
@@ -248,7 +261,7 @@ export function DepartmentPage() {
       title="Department organization"
       description="Map responsibility, ownership, and collaboration across your agent workforce. Department does not initiate work or delegation."
       actions={<div className="department-header-actions">
-        {!canEdit && <span className="department-readonly"><Status value="viewer"/>Read-only organization</span>}
+        {!canEdit && <span className="department-readonly"><Status value={session.workspace.role ?? 'viewer'}/>Read-only organization</span>}
         <button className="button" type="button" onClick={() => openDrawer({ kind: 'unassigned' })}>
           <UserRoundPlus size={15}/>Unassigned <span>{unassigned.length}</span>
         </button>
@@ -281,13 +294,13 @@ export function DepartmentPage() {
           type="button"
           className={canvasMode === 'graph' ? 'active' : ''}
           aria-pressed={canvasMode === 'graph'}
-          onClick={() => setCanvasMode((current) => nextDepartmentCanvasMode(current, 'show-graph'))}
+          onClick={() => { setCanvasModeChosen(true); setCanvasMode((current) => nextDepartmentCanvasMode(current, 'show-graph')); }}
         ><Network size={14}/>Graph</button>
         <button
           type="button"
           className={canvasMode === 'list' ? 'active' : ''}
           aria-pressed={canvasMode === 'list'}
-          onClick={() => setCanvasMode((current) => nextDepartmentCanvasMode(current, 'show-list'))}
+          onClick={() => { setCanvasModeChosen(true); setCanvasMode((current) => nextDepartmentCanvasMode(current, 'show-list')); }}
         ><LayoutList size={14}/>Accessible list</button>
       </div>
       <span className="department-toolbar-spacer"/>
@@ -347,7 +360,7 @@ export function DepartmentPage() {
       />}
     </section>
 
-    {drawer?.kind === 'create' && <DepartmentDrawer title="Create Department" eyebrow="Organization editor" close={closeDrawer}>
+    {drawer?.kind === 'create' && <DepartmentDrawer title="Create Department" eyebrow="Organization editor" close={closeDrawer} suspended={Boolean(pendingMove || archiveTarget)}>
       <DepartmentForm
         snapshot={snapshot}
         pending={mutationPending}
@@ -358,7 +371,7 @@ export function DepartmentPage() {
         close={closeDrawer}
       />
     </DepartmentDrawer>}
-    {drawer?.kind === 'department' && selectedDepartment && <DepartmentDrawer title={`Edit ${selectedDepartment.name}`} eyebrow="Department editor" close={closeDrawer}>
+    {drawer?.kind === 'department' && selectedDepartment && <DepartmentDrawer title={`Edit ${selectedDepartment.name}`} eyebrow="Department editor" close={closeDrawer} suspended={Boolean(pendingMove || archiveTarget)}>
       <DepartmentForm
         snapshot={snapshot}
         department={selectedDepartment}
@@ -384,11 +397,11 @@ export function DepartmentPage() {
         )}
       />
       <div className="department-danger-zone">
-        <span><strong>Archive Department</strong><small>Primary members become unassigned. Agents are preserved; assignments to this Department are removed.</small></span>
+        <span><strong>Archive Department</strong><small>Primary members become unassigned. Agents and historical/shared Department references are retained.</small></span>
         <button type="button" className="button danger" disabled={mutationPending} onClick={() => setArchiveTarget(selectedDepartment)}><Trash2 size={14}/>Archive</button>
       </div>
     </DepartmentDrawer>}
-    {drawer?.kind === 'settings' && <DepartmentDrawer title="Organization settings" eyebrow="Workspace hierarchy" close={closeDrawer}>
+    {drawer?.kind === 'settings' && <DepartmentDrawer title="Organization settings" eyebrow="Workspace hierarchy" close={closeDrawer} suspended={Boolean(pendingMove || archiveTarget)}>
       <ExecutiveEditor
         snapshot={snapshot}
         pending={mutationPending}
@@ -401,11 +414,12 @@ export function DepartmentPage() {
         )}
       />
     </DepartmentDrawer>}
-    {drawer?.kind === 'unassigned' && <DepartmentDrawer title="Unassigned agents" eyebrow="Organization coverage" close={closeDrawer}>
+    {drawer?.kind === 'unassigned' && <DepartmentDrawer title="Unassigned agents" eyebrow="Organization coverage" close={closeDrawer} suspended={Boolean(pendingMove || archiveTarget)}>
       <UnassignedDrawer
         snapshot={snapshot}
         canEdit={canEdit}
         pending={mutationPending}
+        error={mutationError}
         assign={(agentId, departmentId) => void setPrimary(agentId, departmentId)}
       />
     </DepartmentDrawer>}
@@ -424,8 +438,9 @@ export function DepartmentPage() {
     </Modal>}
     {archiveTarget && <Modal title={`Archive ${archiveTarget.name}`} close={() => setArchiveTarget(null)}>
       <div className="department-confirmation">
-        <Trash2 size={20}/><p>Archive this Department? Its primary members will become unassigned. No agents will be removed.</p>
+        <Trash2 size={20}/><p>Archive this Department? Its primary members will become unassigned. Agents and historical/shared Department references are retained.</p>
       </div>
+      {mutationError && <div className="inline-error" role="alert"><AlertTriangle size={15}/>{mutationError}</div>}
       <div className="form-actions">
         <button type="button" className="button" onClick={() => setArchiveTarget(null)}>Cancel</button>
         <button type="button" className="button danger" disabled={mutationPending} onClick={() => void execute(

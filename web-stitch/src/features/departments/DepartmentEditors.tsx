@@ -161,11 +161,13 @@ export function UnassignedDrawer({
   snapshot,
   canEdit,
   pending,
+  error,
   assign,
 }: {
   snapshot: OrganizationSnapshot;
   canEdit: boolean;
   pending: boolean;
+  error: string;
   assign: (agentId: string, departmentId: string) => void;
 }) {
   const agents = unassignedDepartmentAgents(snapshot);
@@ -173,7 +175,9 @@ export function UnassignedDrawer({
     .sort((left, right) => left.displayOrder - right.displayOrder || left.name.localeCompare(right.name));
   const [assignments, setAssignments] = useState<Record<string, string>>({});
   if (!agents.length) return <EmptyState Icon={UserRoundPlus} title="Everyone has a primary Department" text="Shared assignments remain visible in collaboration view."/>;
-  return <div className="department-unassigned-list">{agents.map((agent) => <article key={agent.id}>
+  return <div className="department-unassigned-list">
+    {error && <div className="inline-error" role="alert"><AlertTriangle size={15}/>{error}</div>}
+    {agents.map((agent) => <article key={agent.id}>
     <div><strong>{agent.name}</strong><small>{agent.role} · {agent.status}</small></div>
     {canEdit ? <div>
       <label><span className="sr-only">Primary Department for {agent.name}</span><select
@@ -182,5 +186,5 @@ export function UnassignedDrawer({
       ><option value="">Choose Department</option>{departments.map((department) => <option key={department.id} value={department.id}>{department.name}</option>)}</select></label>
       <button type="button" className="button small" disabled={pending || !assignments[agent.id]} onClick={() => assign(agent.id, assignments[agent.id])}>Assign primary</button>
     </div> : <Status value="unassigned"/>}
-  </article>)}</div>;
+    </article>)}</div>;
 }

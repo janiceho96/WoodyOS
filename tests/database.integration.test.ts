@@ -805,7 +805,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
       rows: [{
         name: 'Deep Research Report Team',
         status: 'active',
-        manager_agent_id: null,
+        manager_agent_id: resources.agentIds.agent_4,
       }],
     });
     await expect(query(
@@ -814,6 +814,11 @@ describe.runIf(enabled)('database-backed API flow', () => {
         WHERE department_id=$1 AND membership_type='primary'`,
       [resources.departmentId],
     )).resolves.toMatchObject({ rows: [{ count: 4 }] });
+    await expect(query(
+      `SELECT membership_type FROM department_memberships
+        WHERE department_id=$1 AND agent_id=$2`,
+      [resources.departmentId, resources.agentIds.agent_4],
+    )).resolves.toMatchObject({ rows: [{ membership_type: 'primary' }] });
     await expect(query(
       'SELECT count(*)::int AS count FROM agent_teams WHERE id=$1',
       [resources.departmentId],

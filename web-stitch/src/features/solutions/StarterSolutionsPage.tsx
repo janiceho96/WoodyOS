@@ -23,6 +23,8 @@ import { AgentHubTabs } from '../agents/AgentHubTabs';
 type Tab = 'starters' | 'generate' | 'installed';
 
 export function StarterSolutionsPage() {
+  const { session } = useWorkspace();
+  const canInstall = session.workspace.role === 'owner' || session.workspace.role === 'admin';
   const location = useLocation();
   const inAgentLibrary = location.pathname === '/agents/library';
   const [params, setParams] = useSearchParams();
@@ -38,18 +40,19 @@ export function StarterSolutionsPage() {
       description={inAgentLibrary ? 'Browse proven single and multi-agent templates, generate an agent from your prompt, or continue an installed draft.' : 'Start from a proven template or turn a written goal into one reviewable draft with agents, workflow, knowledge, integrations, permissions, and estimated usage.'}
       actions={<button className="button primary" onClick={() => setTab('generate')}><WandSparkles size={15}/>Generate from prompt</button>}
     />
+    {!canInstall && <div className="inline-error" role="status">Only workspace owners and administrators can install or save solution drafts.</div>}
     <div className="solution-tabs" role="tablist" aria-label="Create agent system sections" onKeyDown={handleTabListKeyDown}>
       <button id="create-tab-starters" type="button" role="tab" aria-selected={tab === 'starters'} aria-controls="create-panel-starters" tabIndex={tab === 'starters' ? 0 : -1} className={tab === 'starters' ? 'active' : ''} onClick={() => setTab('starters')}><Boxes size={15}/>Templates</button>
       <button id="create-tab-generate" type="button" role="tab" aria-selected={tab === 'generate'} aria-controls="create-panel-generate" tabIndex={tab === 'generate' ? 0 : -1} className={tab === 'generate' ? 'active' : ''} onClick={() => setTab('generate')}><Sparkles size={15}/>From a prompt</button>
       <button id="create-tab-installed" type="button" role="tab" aria-selected={tab === 'installed'} aria-controls="create-panel-installed" tabIndex={tab === 'installed' ? 0 : -1} className={tab === 'installed' ? 'active' : ''} onClick={() => setTab('installed')}><GitBranch size={15}/>Drafts</button>
     </div>
-    {tab === 'starters' && <section id="create-panel-starters" role="tabpanel" aria-labelledby="create-tab-starters"><StarterCatalog openInstalled={() => setTab('installed')}/></section>}
-    {tab === 'generate' && <section id="create-panel-generate" role="tabpanel" aria-labelledby="create-tab-generate"><PromptCompiler initialPrompt={params.get('prompt') ?? ''} initialAttachmentIds={initialAttachmentIds} openInstalled={() => setTab('installed')}/></section>}
-    {tab === 'installed' && <section id="create-panel-installed" role="tabpanel" aria-labelledby="create-tab-installed"><InstalledSolutions/></section>}
+    {tab === 'starters' && <section id="create-panel-starters" role="tabpanel" aria-labelledby="create-tab-starters"><StarterCatalog canInstall={canInstall} openInstalled={() => setTab('installed')}/></section>}
+    {tab === 'generate' && <section id="create-panel-generate" role="tabpanel" aria-labelledby="create-tab-generate"><PromptCompiler canInstall={canInstall} initialPrompt={params.get('prompt') ?? ''} initialAttachmentIds={initialAttachmentIds} openInstalled={() => setTab('installed')}/></section>}
+    {tab === 'installed' && <section id="create-panel-installed" role="tabpanel" aria-labelledby="create-tab-installed"><InstalledSolutions canInstall={canInstall}/></section>}
   </div>;
 }
 
-function StarterCatalog({ openInstalled }: { openInstalled: () => void }) {
+function StarterCatalog({ canInstall, openInstalled }: { canInstall: boolean; openInstalled: () => void }) {
   const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const starters = useQuery({ queryKey: ['starter-solutions'], queryFn: api.starterSolutions });
@@ -95,13 +98,14 @@ function StarterCatalog({ openInstalled }: { openInstalled: () => void }) {
         <div className="solution-metrics"><span><Users size={13}/>{solution.agents.length} agents</span><span><Play size={13}/>{solution.estimatedModelCalls} calls</span><span><FileText size={13}/>{compact(solution.estimatedTokenRange.minimum)}–{compact(solution.estimatedTokenRange.maximum)} tokens</span></div>
         {toolReady && <div className={`template-tool-readiness ${readyRequirements === requirements.length ? 'ready' : 'warning'}`}><span>{readyRequirements === requirements.length ? <CheckCircle2 size={14}/> : <AlertTriangle size={14}/>}<strong>{readyRequirements}/{requirements.length} required tools connected</strong></span><small>{requirements.map(({ requirement }) => requirement.label).join(' · ')}</small></div>}
         <div className="solution-agent-stack">{solution.agents.map((agent) => <span key={agent.key}><AgentAvatar agent={{ name: agent.name, role: agent.role, avatar_config: {} }} size="xs" decorative/>{agent.name}</span>)}</div>
-        <div className="solution-card-actions"><button className="button" onClick={() => openPreview(solution)}>Preview</button><button className="button primary" disabled={installed || install.isPending} onClick={() => toolReady ? openPreview(solution) : install.mutate({ solution, copy: false })}>{installed ? <CheckCircle2 size={14}/> : <Plus size={14}/>} {installed ? 'Installed' : toolReady ? 'Choose tools' : 'Install draft'}</button></div>
+        <div className="solution-card-actions"><button className="button" onClick={() => openPreview(solution)}>Preview</button>{canInstall ? <button className="button primary" disabled={installed || install.isPending} onClick={() => toolReady ? openPreview(solution) : install.mutate({ solution, copy: false })}>{installed ? <CheckCircle2 size={14}/> : <Plus size={14}/>} {installed ? 'Installed' : toolReady ? 'Choose tools' : 'Install draft'}</button> : <small>Administrator access required to install</small>}</div>
       </article>;
     })}</div>
     {selected && <SolutionPreview
       solution={selected}
       close={() => { setSelected(null); setToolSelections({}); }}
       actionLabel={installedSlugs.has(selected.slug) ? 'Install another copy' : 'Install as draft'}
+      canInstall={canInstall}
       pending={install.isPending}
       tools={data.tools}
       toolSelections={toolSelections}
@@ -115,8 +119,9 @@ function StarterCatalog({ openInstalled }: { openInstalled: () => void }) {
   </>;
 }
 
-function PromptCompiler({ openInstalled, initialPrompt = '', initialAttachmentIds = [] }: {
+function PromptCompiler({ canInstall, openInstalled, initialPrompt = '', initialAttachmentIds = [] }: {
   openInstalled: () => void;
+  canInstall: boolean;
   initialPrompt?: string;
   initialAttachmentIds?: string[];
 }) {
@@ -215,13 +220,13 @@ function PromptCompiler({ openInstalled, initialPrompt = '', initialAttachmentId
         <ProposalRequirements solution={proposal}/>
         <section className="proposal-section"><h3>Expected Markdown output</h3><div className="markdown-output contract-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{proposal.expectedMarkdownOutput}</ReactMarkdown></div></section>
         <label className="persist-prompt"><input type="checkbox" checked={persistPrompt} onChange={(event) => setPersistPrompt(event.target.checked)}/><span><strong>Store the original prompt with this draft</strong><small>Off by default. If enabled, it is encrypted at rest and never returned by the API.</small></span></label>
-        <div className="proposal-actions"><button className="button" onClick={() => setProposal(null)}>Cancel</button><button className="button primary" disabled={install.isPending} onClick={() => install.mutate()}>{install.isPending ? <LoaderCircle className="spin" size={15}/> : <Save size={15}/>}Save as draft</button></div>
+        <div className="proposal-actions"><button className="button" onClick={() => setProposal(null)}>Cancel</button>{canInstall ? <button className="button primary" disabled={install.isPending} onClick={() => install.mutate()}>{install.isPending ? <LoaderCircle className="spin" size={15}/> : <Save size={15}/>}Save as draft</button> : <small>Administrator access required to save this draft.</small>}</div>
       </>}
     </section>
   </div>;
 }
 
-function InstalledSolutions() {
+function InstalledSolutions({ canInstall }: { canInstall: boolean }) {
   const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const installations = useQuery({ queryKey: ['agent-solution-installations'], queryFn: api.agentSolutionInstallations, refetchInterval: 10_000 });
@@ -270,7 +275,7 @@ function InstalledSolutions() {
       <div className="installed-resources"><span><Bot size={14}/><strong>{installation.solution.agents.length}</strong> draft agents</span><span><Users size={14}/>1 team</span><span><GitBranch size={14}/>1 workflow</span><span><LockKeyhole size={14}/>0 automatic tool grants</span></div>
       <SolutionToolReadiness installation={installation} tools={data.tools} agents={data.agents}/>
       <WorkflowPreview solution={installation.solution}/>
-      {installation.status === 'draft' && <div className="solution-test-form"><div><span className="eyebrow">Safe test input</span><p>Draft testing runs the real workflow without activating agents or assigning integrations.</p></div><div className="test-input-grid">{installation.solution.requiredInputs.map((field) => <label key={field.key}>{field.label}{field.required && <span> *</span>}<input value={inputs[installation.id]?.[field.key] ?? ''} placeholder={field.example ?? field.description} onChange={(event) => setInputs((current) => ({ ...current, [installation.id]: { ...current[installation.id], [field.key]: event.target.value } }))}/></label>)}</div><div className="installed-actions"><span>{installation.last_test_status ? <>Last test: <Status value={installation.last_test_status}/></> : 'A successful test is required before activation.'}</span><button className="button" disabled={test.isPending} onClick={() => test.mutate(installation)}>{test.isPending ? <LoaderCircle className="spin" size={14}/> : <Play size={14}/>}Run test · {installation.solution.estimatedModelCalls} calls</button><button className="button primary" disabled={activate.isPending || installation.last_test_status !== 'completed'} title={installation.last_test_status !== 'completed' ? 'Complete a successful test first' : undefined} onClick={() => activate.mutate(installation)}><Rocket size={14}/>Activate solution</button></div></div>}
+      {installation.status === 'draft' && <div className="solution-test-form"><div><span className="eyebrow">Safe test input</span><p>Draft testing runs the real workflow without activating agents or assigning integrations.</p></div><div className="test-input-grid">{installation.solution.requiredInputs.map((field) => <label key={field.key}>{field.label}{field.required && <span> *</span>}<input value={inputs[installation.id]?.[field.key] ?? ''} placeholder={field.example ?? field.description} onChange={(event) => setInputs((current) => ({ ...current, [installation.id]: { ...current[installation.id], [field.key]: event.target.value } }))}/></label>)}</div><div className="installed-actions"><span>{installation.last_test_status ? <>Last test: <Status value={installation.last_test_status}/></> : 'A successful test is required before activation.'}</span>{canInstall ? <><button className="button" disabled={test.isPending} onClick={() => test.mutate(installation)}>{test.isPending ? <LoaderCircle className="spin" size={14}/> : <Play size={14}/>}Run test · {installation.solution.estimatedModelCalls} calls</button><button className="button primary" disabled={activate.isPending || installation.last_test_status !== 'completed'} title={installation.last_test_status !== 'completed' ? 'Complete a successful test first' : undefined} onClick={() => activate.mutate(installation)}><Rocket size={14}/>Activate solution</button></> : <small>Administrator access required to change this draft.</small>}</div></div>}
       {installation.status === 'active' && <div className="active-solution-note"><CheckCircle2 size={16}/><span><strong>Active</strong><small>Use the saved workflow from Workflow Designer. Assign reviewed MCP tools per agent when needed.</small></span></div>}
       {runContext?.installationId === installation.id && testRun.data && <TestRunResult run={testRun.data}/>}
     </article>)}
@@ -353,13 +358,14 @@ function selectedToolAssignments(solution: AgentSolution, selections: Record<str
 }
 
 function SolutionPreview({
-  solution, close, install, pending, actionLabel, tools = [], toolSelections = {}, setToolSelection,
+  solution, close, install, pending, actionLabel, canInstall, tools = [], toolSelections = {}, setToolSelection,
 }: {
   solution: AgentSolution;
   close: () => void;
   install: () => void;
   pending: boolean;
   actionLabel: string;
+  canInstall: boolean;
   tools?: Tool[];
   toolSelections?: Record<string, string>;
   setToolSelection?: (key: string, toolId: string) => void;
@@ -378,7 +384,7 @@ function SolutionPreview({
       return <label key={key}><span><strong>{requirement.label}{requirement.required ? ' *' : ''}</strong><small>{requirement.purpose}</small></span>{matches.length ? <select value={toolSelections[key] ?? ''} required={requirement.required} onChange={(event) => setToolSelection?.(key, event.target.value)}><option value="">Choose a connected tool</option>{matches.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select> : <span className="missing-tool"><AlertTriangle size={14}/>Not connected <Link to={requirement.permissions.includes('jobs.read') ? '/tools?section=jobs' : '/tools?section=web'}>Connect tool</Link></span>}</label>;
     })}</div></section>}
     <ProposalRequirements solution={solution}/>
-    <div className="proposal-actions"><button className="button" onClick={close}>Cancel</button><button className="button primary" disabled={pending || missingRequired} title={missingRequired ? 'Connect and choose every required read-only tool first' : undefined} onClick={install}>{pending ? <LoaderCircle className="spin" size={15}/> : <Plus size={15}/>} {requirements.length ? 'Install draft with selected tools' : actionLabel}</button></div>
+    <div className="proposal-actions"><button className="button" onClick={close}>Cancel</button>{canInstall ? <button className="button primary" disabled={pending || missingRequired} title={missingRequired ? 'Connect and choose every required read-only tool first' : undefined} onClick={install}>{pending ? <LoaderCircle className="spin" size={15}/> : <Plus size={15}/>} {requirements.length ? 'Install draft with selected tools' : actionLabel}</button> : <small>Administrator access required to install this draft.</small>}</div>
   </div></Modal>;
 }
 

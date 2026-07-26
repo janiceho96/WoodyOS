@@ -12,6 +12,7 @@ import {
   nextDepartmentCanvasMode,
   nextDepartmentView,
   requiresPrimaryMoveConfirmation,
+  isDepartmentFocusTarget,
   type DepartmentFilters,
 } from './departmentState';
 
@@ -192,6 +193,38 @@ describe('Department graph layout', () => {
     expect(graph.nodes.some((node) => node.id === 'department:marketing')).toBe(true);
     expect(graph.nodes.some((node) => node.id === 'department:sales')).toBe(false);
   });
+
+  it('keeps globally shared agents in the shared rail under a Department filter', () => {
+    const graph = buildDepartmentGraph(organizationFixture, {
+      view: 'org',
+      departmentId: 'sales',
+    });
+
+    expect(graph.nodes.filter((node) => node.data.agentId === 'shared-specialist')).toHaveLength(1);
+    expect(graph.nodes.find((node) => node.data.agentId === 'shared-specialist')?.data.kind).toBe('shared-agent');
+  });
+
+  it('never renders an executive in the shared rail when it has shared memberships', () => {
+    const snapshot = structuredClone(organizationFixture);
+    snapshot.memberships.push({
+      departmentId: 'sales', workspaceId: 'workspace', agentId: 'executive', membershipType: 'shared',
+      createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:00:00.000Z',
+    });
+    const graph = buildDepartmentGraph(snapshot, { view: 'collaboration' });
+
+    expect(graph.nodes.filter((node) => node.data.agentId === 'executive')).toHaveLength(1);
+    expect(graph.nodes.find((node) => node.data.agentId === 'executive')?.data.kind).toBe('executive');
+  });
+
+  it('keeps a focused agent visible even when filters exclude it', () => {
+    const graph = buildDepartmentGraph(organizationFixture, {
+      view: 'org',
+      focusId: 'agent:researcher',
+      visibleAgentIds: new Set(['marketing-manager']),
+    });
+
+    expect(graph.nodes.some((node) => node.data.agentId === 'researcher')).toBe(true);
+  });
 });
 
 describe('Department view state and filters', () => {
@@ -213,6 +246,13 @@ describe('Department view state and filters', () => {
     expect(initialDepartmentCanvasMode(true)).toBe('list');
     expect(initialDepartmentCanvasMode(false)).toBe('graph');
     expect(nextDepartmentCanvasMode('list', 'show-graph')).toBe('graph');
+  });
+
+  it('allows focus only for Department and agent nodes', () => {
+    expect(isDepartmentFocusTarget('agent:researcher')).toBe(true);
+    expect(isDepartmentFocusTarget('department:marketing')).toBe(true);
+    expect(isDepartmentFocusTarget('workspace')).toBe(false);
+    expect(isDepartmentFocusTarget('shared-rail')).toBe(false);
   });
 
   it('combines Department, role, status, work, MCP, and API Tool filters', () => {

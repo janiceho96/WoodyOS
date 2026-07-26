@@ -28,6 +28,7 @@ import {
   type DepartmentGraphNode,
 } from './departmentLayout';
 import type { DepartmentView } from './departmentState';
+import { isDepartmentFocusTarget } from './departmentState';
 
 type GraphCallbacks = {
   onFocus?: (id: string) => void;
@@ -46,7 +47,9 @@ function metricLabel(data: DepartmentGraphNode['data']) {
 
 function DepartmentOrgNode({ id, data }: NodeProps<DepartmentGraphNode>) {
   const callbacks = data as DepartmentGraphNode['data'] & GraphCallbacks;
-  const focus = () => callbacks.onFocus?.(id);
+  const focus = () => {
+    if (isDepartmentFocusTarget(id)) callbacks.onFocus?.(id);
+  };
   if (data.kind === 'workspace') {
     return <button type="button" className="department-node workspace-node" onClick={focus}>
       <Building2 size={18}/><span><small>Workspace</small><strong>{data.name}</strong></span>
@@ -152,7 +155,9 @@ export function DepartmentGraph({
       maxZoom={1.4}
       fitView
       onInit={setInstance}
-      onNodeClick={(_, node) => onFocus(node.id)}
+      onNodeClick={(_, node) => {
+        if (isDepartmentFocusTarget(node.id)) onFocus(node.id);
+      }}
       proOptions={{ hideAttribution: true }}
     >
       <Background variant={BackgroundVariant.Dots} gap={22} size={1}/>
@@ -221,24 +226,23 @@ export function DepartmentHierarchyList({
     workspaceName,
   });
   const renderedIds = new Set(graph.nodes.map((node) => node.id));
+  const renderedAgentKinds = new Map(graph.nodes
+    .filter((node) => node.data.agentId)
+    .map((node) => [node.data.agentId!, node.data.kind]));
   const agentById = new Map(snapshot.agents.map((agent) => [agent.id, agent]));
   const executive = snapshot.executiveAgentId
     ? agentById.get(snapshot.executiveAgentId)
     : undefined;
-  const sharedIds = new Set(snapshot.memberships.filter((membership) => (
-    membership.membershipType === 'shared'
-  )).map((membership) => membership.agentId));
   const departments = snapshot.departments.filter((department) => (
     department.status === 'active' && renderedIds.has(`department:${department.id}`)
   )).sort(compareDepartment);
   const sharedAgents = snapshot.agents.filter((agent) => (
-    sharedIds.has(agent.id) && renderedIds.has(`agent:${agent.id}`)
+    renderedAgentKinds.get(agent.id) === 'shared-agent'
   )).sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
 
   return <nav className="department-hierarchy-list" aria-label="Department hierarchy">
     <header>
       <span><Building2 size={18}/><span><small>Workspace</small><h2>{workspaceName}</h2></span></span>
-      <button type="button" onClick={() => onFocus('workspace')}>Focus workspace</button>
     </header>
     {executive && renderedIds.has(`agent:${executive.id}`) && <ul>
       <AgentListItem
@@ -259,9 +263,8 @@ export function DepartmentHierarchyList({
         const primaryAgents = snapshot.memberships.filter((membership) => (
           membership.departmentId === department.id
           && membership.membershipType === 'primary'
-          && membership.agentId !== snapshot.executiveAgentId
-          && !sharedIds.has(membership.agentId)
-          && renderedIds.has(`agent:${membership.agentId}`)
+          && (renderedAgentKinds.get(membership.agentId) === 'agent'
+            || renderedAgentKinds.get(membership.agentId) === 'manager')
         )).map((membership) => agentById.get(membership.agentId))
           .filter((agent): agent is OrganizationAgentSummary => Boolean(agent))
           .sort(compareAgent);

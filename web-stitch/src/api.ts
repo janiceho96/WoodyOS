@@ -96,9 +96,16 @@ export class DepartmentApiError extends Error {
   }
 }
 
-let token = typeof localStorage === 'undefined'
-  ? ''
-  : localStorage.getItem('nexus_token') ?? '';
+function withTokenStorage(action: (storage: Storage) => void) {
+  try {
+    if (typeof window !== 'undefined') action(window.localStorage);
+  } catch {
+    // Browser privacy settings can deny storage while requests still work in-memory.
+  }
+}
+
+let token = '';
+withTokenStorage((storage) => { token = storage.getItem('nexus_token') ?? ''; });
 
 const errorMessages: Record<string, string> = {
   AI_NOT_CONFIGURED: 'AI provider is not configured. Add a provider, API key, and model in the server environment, then restart Woody.',
@@ -151,11 +158,11 @@ export const auth = {
   get: () => token,
   set: (value: string) => {
     token = value;
-    if (typeof localStorage !== 'undefined') localStorage.setItem('nexus_token', value);
+    withTokenStorage((storage) => storage.setItem('nexus_token', value));
   },
   clear: () => {
     token = '';
-    if (typeof localStorage !== 'undefined') localStorage.removeItem('nexus_token');
+    withTokenStorage((storage) => storage.removeItem('nexus_token'));
   },
 };
 
@@ -592,7 +599,7 @@ export type AgentSolutionInstallation = {
   solution_name: string;
   status: 'draft' | 'active' | 'archived';
   solution: AgentSolution;
-  resources: { agentIds?: Record<string, string>; teamId?: string; workflowId?: string };
+  resources: { agentIds?: Record<string, string>; departmentId?: string; teamId?: string; workflowId?: string };
   last_test_run_id?: string | null;
   last_test_status?: string | null;
   last_tested_at?: string | null;

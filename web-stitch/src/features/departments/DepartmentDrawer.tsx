@@ -5,11 +5,13 @@ export function DepartmentDrawer({
   title,
   eyebrow,
   close,
+  suspended = false,
   children,
 }: {
   title: string;
   eyebrow: string;
   close: () => void;
+  suspended?: boolean;
   children: ReactNode;
 }) {
   const drawerRef = useRef<HTMLElement>(null);
@@ -17,6 +19,7 @@ export function DepartmentDrawer({
   const titleId = useId();
   closeRef.current = close;
   useEffect(() => {
+    if (suspended) return;
     const previousFocus = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
@@ -55,12 +58,12 @@ export function DepartmentDrawer({
       window.removeEventListener('keydown', handler);
       previousFocus?.focus();
     };
-  }, []);
+  }, [suspended]);
   return <>
     <button
       type="button"
       className="department-drawer-backdrop"
-      onClick={close}
+      onClick={suspended ? undefined : close}
       aria-label="Close Department drawer"
     />
     <aside
@@ -68,7 +71,7 @@ export function DepartmentDrawer({
       className="department-drawer"
       tabIndex={-1}
       role="dialog"
-      aria-modal="true"
+      aria-modal={!suspended}
       aria-labelledby={titleId}
     >
       <header>

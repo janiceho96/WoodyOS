@@ -30,6 +30,10 @@ export function initialDepartmentView(): DepartmentView {
   return 'org';
 }
 
+export function isDepartmentFocusTarget(id: string): boolean {
+  return id.startsWith('department:') || id.startsWith('agent:');
+}
+
 export function nextDepartmentView(
   current: DepartmentView,
   action: 'show-org' | 'show-collaboration',

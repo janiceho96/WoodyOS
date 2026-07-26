@@ -148,11 +148,14 @@ async function installWithClient(client: PoolClient, input: InstallInput) {
   const departmentName = sameName.rowCount
     ? `${solution.team.name.slice(0, 81)} (${installationId})`
     : solution.team.name;
+  const managerAgentId = solution.team.managerAgentKey
+    ? agentIds.get(solution.team.managerAgentKey)
+    : null;
   const department = await client.query<{ id: string }>(
-    `INSERT INTO departments(workspace_id,name,description)
-     VALUES($1,$2,$3)
+    `INSERT INTO departments(workspace_id,name,description,manager_agent_id)
+     VALUES($1,$2,$3,$4)
      RETURNING id`,
-    [input.workspaceId, departmentName, solution.team.description],
+    [input.workspaceId, departmentName, solution.team.description, managerAgentId],
   );
   for (const agent of solution.agents) {
     const agentId = agentIds.get(agent.key)!;

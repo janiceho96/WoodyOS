@@ -160,6 +160,8 @@ describe('agent solution installation transaction', () => {
     expect(statements.some((sql) => sql.includes('INSERT INTO workspace_org_settings'))).toBe(true);
     expect(statements.some((sql) => sql.includes('INSERT INTO audit_events'))).toBe(true);
     expect(statements.every((sql) => !/\b(?:agent_teams|team_memberships)\b/i.test(sql))).toBe(true);
+    const departmentInsert = queryMock.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO departments'));
+    expect(departmentInsert?.[1]).toContain(`00000000-0000-4000-8000-${String(starterSolutions[0].agents.length).padStart(12, '0')}`);
     expect(queryMock).toHaveBeenCalledWith('COMMIT');
   });
 });

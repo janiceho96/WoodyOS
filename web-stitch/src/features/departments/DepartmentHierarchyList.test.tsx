@@ -53,3 +53,28 @@ it('keeps read-only viewers out of Department mutation controls', () => {
   expect(screen.queryByRole('button', { name: /Edit Marketing/ })).toBeNull();
   expect(screen.getByRole('button', { name: /Focus Marketing/ })).toBeTruthy();
 });
+
+it('uses the graph classification so filtered shared and executive agents render once', () => {
+  const snapshot = structuredClone(organizationFixture);
+  snapshot.memberships.push({
+    departmentId: 'sales', workspaceId: 'workspace', agentId: 'executive', membershipType: 'shared',
+    createdAt: '2026-07-01T00:00:00.000Z', updatedAt: '2026-07-01T00:00:00.000Z',
+  });
+  render(
+    <MemoryRouter>
+      <DepartmentHierarchyList
+        snapshot={snapshot}
+        workspaceName="Acme"
+        focusId={null}
+        visibleAgentIds={new Set(snapshot.agents.map((agent) => agent.id))}
+        departmentId="sales"
+        onFocus={vi.fn()}
+        onEditDepartment={vi.fn()}
+        canEdit
+      />
+    </MemoryRouter>,
+  );
+
+  expect(screen.getAllByRole('link', { name: /Sam Specialist/ })).toHaveLength(1);
+  expect(screen.getAllByRole('link', { name: /Eli Executive/ })).toHaveLength(1);
+});

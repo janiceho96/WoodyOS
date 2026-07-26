@@ -107,17 +107,18 @@ export function buildDepartmentGraph(
     .filter((department) => department.status === 'active')
     .sort(compareDepartment);
   const agentById = new Map(snapshot.agents.map((agent) => [agent.id, agent]));
-  const visibleAgent = (agentId: string) => (
-    agentId === snapshot.executiveAgentId
-    || !options.visibleAgentIds
-    || options.visibleAgentIds.has(agentId)
-  );
   const focusDepartmentId = options.focusId?.startsWith('department:')
     ? options.focusId.slice('department:'.length)
     : null;
   const focusAgentId = options.focusId?.startsWith('agent:')
     ? options.focusId.slice('agent:'.length)
     : null;
+  const visibleAgent = (agentId: string) => (
+    agentId === snapshot.executiveAgentId
+    || agentId === focusAgentId
+    || !options.visibleAgentIds
+    || options.visibleAgentIds.has(agentId)
+  );
   const focusAgentDepartments = focusAgentId
     ? new Set(snapshot.memberships.filter((membership) => (
       membership.agentId === focusAgentId
@@ -133,7 +134,7 @@ export function buildDepartmentGraph(
   const departmentIds = new Set(departments.map((department) => department.id));
   const sharedAgentIds = new Set(snapshot.memberships.filter((membership) => (
     membership.membershipType === 'shared'
-    && departmentIds.has(membership.departmentId)
+    && membership.agentId !== snapshot.executiveAgentId
   )).map((membership) => membership.agentId));
   const rootX = departments.length > 1 ? ((departments.length - 1) * departmentGap) / 2 : 0;
   const nodes: DepartmentGraphNode[] = [{
