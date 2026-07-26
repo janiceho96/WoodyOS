@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Bot, BookOpen, CircleHelp, LayoutDashboard, LogOut, Menu, Minus, Moon, Plus, PlugZap, RefreshCw, Search, Settings, Sun, Workflow, X } from 'lucide-react';
+import { Activity, BarChart3, Bot, BookOpen, Building2, CircleHelp, LayoutDashboard, LogOut, Menu, Minus, Moon, Plus, PlugZap, RefreshCw, Search, Settings, Sun, Workflow, X } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
@@ -20,6 +20,7 @@ export type AppDialog = 'task' | 'document' | 'tool' | 'search' | null;
 const nav = [
   { path: '/dashboard', label: 'Home', Icon: LayoutDashboard, group: 'Workspace' },
   { path: '/agents', label: 'Agents', Icon: Bot, group: 'Build' },
+  { path: '/departments', label: 'Department', Icon: Building2, group: 'Build' },
   { path: '/workflows', label: 'Workflows', Icon: Workflow, group: 'Build' },
   { path: '/knowledge', label: 'Knowledge', Icon: BookOpen, group: 'Resources' },
   { path: '/api-tools', label: 'API Tools', Icon: PlugZap, group: 'Resources' },

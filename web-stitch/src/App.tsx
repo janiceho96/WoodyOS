@@ -13,6 +13,7 @@ import { ApiToolsPage } from './features/tools/ApiToolsPage';
 const McpMarketplacePage = lazy(() => import('./features/mcp/McpMarketplacePage').then((module) => ({ default: module.McpMarketplacePage })));
 const AgentBuilderPage = lazy(() => import('./features/agents/AgentBuilderPage').then((module) => ({ default: module.AgentBuilderPage })));
 const AgentsPage = lazy(() => import('./features/agents/AgentsPage').then((module) => ({ default: module.AgentsPage })));
+const DepartmentPage = lazy(() => import('./features/departments/DepartmentPage').then((module) => ({ default: module.DepartmentPage })));
 const AgentWorkspacePage = lazy(() => import('./features/agents/AgentWorkspacePage').then((module) => ({ default: module.AgentWorkspacePage })));
 const AnalyticsPage = lazy(() => import('./features/analytics/AnalyticsPage').then((module) => ({ default: module.AnalyticsPage })));
 const DashboardPage = lazy(() => import('./features/dashboard/DashboardPage').then((module) => ({ default: module.DashboardPage })));
@@ -29,7 +30,7 @@ function RoutedApp() {
   const { theme, setTheme, toggleTheme, accentColor, setAccentColor } = useTheme();
   useEffect(() => {
     if (!auth.get()) { setChecking(false); return; }
-    api.me().then((me) => setSession({ accessToken: auth.get(), user: { id: me.id, email: me.email, displayName: me.display_name, onboarding: me.onboarding }, workspace: { id: me.workspace_id, name: me.workspace_name } })).catch(() => auth.clear()).finally(() => setChecking(false));
+    api.me().then((me) => setSession({ accessToken: auth.get(), user: { id: me.id, email: me.email, displayName: me.display_name, onboarding: me.onboarding }, workspace: { id: me.workspace_id, name: me.workspace_name, role: me.role } })).catch(() => auth.clear()).finally(() => setChecking(false));
   }, []);
   if (checking) return <div className="boot-screen"><BrandMark/><strong>Starting Woody…</strong></div>;
   if (!session) return <AuthPage theme={theme} toggleTheme={toggleTheme} onSession={(next) => { auth.set(next.accessToken); queryClient.clear(); setSession(next); }}/>;
@@ -41,6 +42,7 @@ function RoutedApp() {
     <Route path="/agents/new" element={<AgentBuilderPage/>}/>
     <Route path="/agents/:agentId/edit" element={<AgentBuilderPage/>}/>
     <Route path="/agents/:agentId" element={<AgentWorkspacePage/>}/>
+    <Route path="/departments" element={<DepartmentPage/>}/>
     <Route path="/executions" element={<ExecutionRoute/>}/>
     <Route path="/workflows" element={<WorkflowsPage/>}/>
     <Route path="/solutions" element={<StarterSolutionsPage/>}/>

@@ -13,10 +13,92 @@ export type Onboarding = {
 export type Session = {
   accessToken: string;
   user: { id: string; email: string; displayName: string; onboarding: Onboarding };
-  workspace: { id: string; name: string; role?: string };
+  workspace: { id: string; name: string; role?: 'owner' | 'admin' | 'member' | 'viewer' };
 };
 
-let token = localStorage.getItem('nexus_token') ?? '';
+export type DepartmentMembershipType = 'primary' | 'shared';
+export type DepartmentStatus = 'active' | 'archived';
+export type DepartmentErrorCode =
+  | 'DEPARTMENT_NOT_FOUND'
+  | 'DEPARTMENT_ARCHIVED'
+  | 'DEPARTMENT_NAME_CONFLICT'
+  | 'DEPARTMENT_REVISION_CONFLICT'
+  | 'DEPARTMENT_AGENT_NOT_FOUND'
+  | 'DEPARTMENT_MANAGER_INACTIVE'
+  | 'DEPARTMENT_EXECUTIVE_INVALID'
+  | 'DEPARTMENT_MEMBERSHIP_NOT_FOUND'
+  | 'DEPARTMENT_PRIMARY_MOVE_CONFIRMATION_REQUIRED'
+  | 'DEPARTMENT_ACTOR_INVALID';
+export type Department = {
+  id: string;
+  workspaceId: string;
+  name: string;
+  description: string;
+  status: DepartmentStatus;
+  displayOrder: number;
+  managerAgentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+export type DepartmentMembership = {
+  departmentId: string;
+  workspaceId: string;
+  agentId: string;
+  membershipType: DepartmentMembershipType;
+  createdAt: string;
+  updatedAt: string;
+};
+export type OrganizationAgentSummary = {
+  id: string;
+  name: string;
+  role: string;
+  status: 'draft' | 'active' | 'paused' | 'archived';
+  avatar: Record<string, unknown>;
+  activeWorkCount: number;
+  apiToolCount: number;
+  mcpConnectionCount: number;
+};
+export type OrganizationSnapshot = {
+  revision: number;
+  executiveAgentId: string | null;
+  departments: Department[];
+  memberships: DepartmentMembership[];
+  agents: OrganizationAgentSummary[];
+};
+export type DepartmentMutationResult = { revision: number };
+export type CreateDepartmentInput = {
+  name: string;
+  description?: string;
+  displayOrder?: number;
+  managerAgentId?: string | null;
+  confirmPrimaryMove?: boolean;
+  expectedRevision: number;
+};
+export type UpdateDepartmentInput = Partial<Omit<CreateDepartmentInput, 'expectedRevision'>> & {
+  expectedRevision: number;
+};
+
+export class DepartmentApiError extends Error {
+  readonly code: DepartmentErrorCode;
+  readonly statusCode: number;
+  readonly currentRevision?: number;
+
+  constructor(
+    code: DepartmentErrorCode,
+    statusCode: number,
+    currentRevision?: number,
+  ) {
+    super(code);
+    this.name = 'DepartmentApiError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.currentRevision = currentRevision;
+  }
+}
+
+let token = typeof localStorage === 'undefined'
+  ? ''
+  : localStorage.getItem('nexus_token') ?? '';
 
 const errorMessages: Record<string, string> = {
   AI_NOT_CONFIGURED: 'AI provider is not configured. Add a provider, API key, and model in the server environment, then restart Woody.',
@@ -69,11 +151,11 @@ export const auth = {
   get: () => token,
   set: (value: string) => {
     token = value;
-    localStorage.setItem('nexus_token', value);
+    if (typeof localStorage !== 'undefined') localStorage.setItem('nexus_token', value);
   },
   clear: () => {
     token = '';
-    localStorage.removeItem('nexus_token');
+    if (typeof localStorage !== 'undefined') localStorage.removeItem('nexus_token');
   },
 };
 
@@ -92,6 +174,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const detail = Array.isArray(body.details) ? `: ${body.details.join(', ')}` : '';
     const explanation = typeof body.message === 'string' ? `: ${body.message}` : '';
     const error = typeof body.error === 'string' ? body.error : `Request failed (${response.status})`;
+    if (error.startsWith('DEPARTMENT_')) {
+      throw new DepartmentApiError(
+        error as DepartmentErrorCode,
+        response.status,
+        typeof body.currentRevision === 'number' ? body.currentRevision : undefined,
+      );
+    }
     throw new Error(`${errorMessages[error] ?? error}${explanation}${detail}`);
   }
   return response.status === 204 ? (undefined as T) : (response.json() as Promise<T>);
@@ -790,7 +879,7 @@ export const api = {
   login: (body: { email: string; password: string }) =>
     request<Session>('/v1/auth/login', { method: 'POST', body: JSON.stringify(body) }),
   me: () =>
-    request<{ id: string; email: string; display_name: string; workspace_id: string; workspace_name: string; onboarding: Onboarding }>('/v1/auth/me'),
+    request<{ id: string; email: string; display_name: string; workspace_id: string; workspace_name: string; role: NonNullable<Session['workspace']['role']>; onboarding: Onboarding }>('/v1/auth/me'),
   onboarding: (body: { lastStep: number; action?: 'progress' | 'complete' | 'skip' }) =>
     request<Onboarding>('/v1/auth/onboarding', { method: 'PUT', body: JSON.stringify(body) }),
   restartOnboarding: () => request<Onboarding>('/v1/auth/onboarding/restart', { method: 'POST' }),
@@ -830,6 +919,44 @@ export const api = {
   },
   agentAvatarImage: (id: string) => requestBlob(`/v1/agents/${id}/avatar/image`),
   resetAgentAvatar: (id: string) => request<void>(`/v1/agents/${id}/avatar`, { method: 'DELETE' }),
+
+  departments: () => request<OrganizationSnapshot>('/v1/departments'),
+  createDepartment: (body: CreateDepartmentInput) =>
+    request<DepartmentMutationResult & { department: Department }>('/v1/departments', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateDepartment: (id: string, body: UpdateDepartmentInput) =>
+    request<DepartmentMutationResult>(`/v1/departments/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  archiveDepartment: (id: string, expectedRevision: number) =>
+    request<DepartmentMutationResult>(`/v1/departments/${id}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ expectedRevision }),
+    }),
+  setDepartmentMembership: (
+    departmentId: string,
+    agentId: string,
+    body: { membershipType: DepartmentMembershipType; expectedRevision: number },
+  ) => request<DepartmentMutationResult>(`/v1/departments/${departmentId}/members/${agentId}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  }),
+  removeDepartmentMembership: (
+    departmentId: string,
+    agentId: string,
+    expectedRevision: number,
+  ) => request<DepartmentMutationResult>(`/v1/departments/${departmentId}/members/${agentId}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ expectedRevision }),
+  }),
+  setExecutiveAgent: (agentId: string | null, expectedRevision: number) =>
+    request<DepartmentMutationResult>('/v1/departments/settings/executive', {
+      method: 'PUT',
+      body: JSON.stringify({ agentId, expectedRevision }),
+    }),
 
   tasks: () => request<{ data: Task[] }>('/v1/tasks'),
   task: (id: string) => request<TaskDetail>(`/v1/tasks/${id}`),
