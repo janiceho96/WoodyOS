@@ -1405,6 +1405,12 @@ describe.runIf(enabled)('transactional department service', () => {
     const sharedDepartmentId = await insertDepartment('Shared services');
     const agentId = await createAgent(workspaceId, actorId, 'Sales Agent');
     await query(
+      `UPDATE departments
+          SET manager_agent_id=$1
+        WHERE id=$2 AND workspace_id=$3`,
+      [agentId, previousDepartmentId, workspaceId],
+    );
+    await query(
       `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
        VALUES($1,$2,$3,'primary'),($4,$2,$3,'shared')`,
       [previousDepartmentId, workspaceId, agentId, sharedDepartmentId],
@@ -1433,6 +1439,12 @@ describe.runIf(enabled)('transactional department service', () => {
       ]),
       rowCount: 2,
     });
+    await expect(query(
+      `SELECT manager_agent_id
+         FROM departments
+        WHERE id=$1 AND workspace_id=$2`,
+      [previousDepartmentId, workspaceId],
+    )).resolves.toMatchObject({ rows: [{ manager_agent_id: null }] });
   });
 
   it('rejects stale organization revisions without mutating or auditing', async () => {
@@ -1462,6 +1474,65 @@ describe.runIf(enabled)('transactional department service', () => {
     )).resolves.toMatchObject({ rows: [{ name: 'Business operations' }] });
     await expect(query(
       `SELECT count(*)::int AS count FROM audit_events
+        WHERE workspace_id=$1 AND action='department.updated'`,
+      [workspaceId],
+    )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+
+  it('rolls back the Department mutation and revision when audit insertion fails', async () => {
+    const { query } = await import('../src/db/client.js');
+    const departmentId = await insertDepartment('Audit rollback original');
+    await query(
+      'INSERT INTO workspace_org_settings(workspace_id) VALUES($1)',
+      [workspaceId],
+    );
+    const triggerId = serviceSuffix.replace(/[^a-z0-9]/gi, '');
+    const triggerName = `department_audit_rollback_${triggerId}`;
+    const functionName = `${triggerName}_reject`;
+    await query(`
+      CREATE FUNCTION "${functionName}"() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.workspace_id = '${workspaceId}'::uuid
+           AND NEW.action = 'department.updated' THEN
+          RAISE EXCEPTION 'forced Department audit failure'
+            USING ERRCODE = 'P0001';
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+      CREATE TRIGGER "${triggerName}"
+      BEFORE INSERT ON audit_events
+      FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+    `);
+    try {
+      await expect(updateDepartment({
+        workspaceId,
+        actorId,
+        departmentId,
+        expectedRevision: 1,
+        name: 'Mutation that must roll back',
+      })).rejects.toMatchObject({ code: 'P0001' });
+    } finally {
+      await query(`
+        DROP TRIGGER "${triggerName}" ON audit_events;
+        DROP FUNCTION "${functionName}"();
+      `);
+    }
+
+    await expect(query(
+      'SELECT name FROM departments WHERE id=$1 AND workspace_id=$2',
+      [departmentId, workspaceId],
+    )).resolves.toMatchObject({
+      rows: [{ name: 'Audit rollback original' }],
+    });
+    await expect(query(
+      'SELECT revision FROM workspace_org_settings WHERE workspace_id=$1',
+      [workspaceId],
+    )).resolves.toMatchObject({ rows: [{ revision: 1 }] });
+    await expect(query(
+      `SELECT count(*)::int AS count
+         FROM audit_events
         WHERE workspace_id=$1 AND action='department.updated'`,
       [workspaceId],
     )).resolves.toMatchObject({ rows: [{ count: 0 }] });
@@ -1536,6 +1607,115 @@ describe.runIf(enabled)('transactional department service', () => {
     )).resolves.toMatchObject({ rows: [{ count: 1 }] });
   });
 
+  it('serializes concurrent first mutations while creating organization settings', async () => {
+    const { db, query } = await import('../src/db/client.js');
+    const triggerId = serviceSuffix.replace(/[^a-z0-9]/gi, '');
+    const triggerName = `department_first_race_${triggerId}`;
+    const functionName = `${triggerName}_barrier`;
+    const sequenceName = `${triggerName}_arrivals`;
+    const advisoryKey = Number.parseInt(workspaceId.slice(0, 8), 16) % 2_147_483_647;
+    const barrierClient = await db.connect();
+    let barrierLocked = false;
+    let attemptsPromise:
+      | Promise<PromiseSettledResult<{ revision: number }>[]>
+      | undefined;
+    let attempts: PromiseSettledResult<{ revision: number }>[] = [];
+    try {
+      await query(`
+        CREATE SEQUENCE "${sequenceName}";
+        CREATE FUNCTION "${functionName}"() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.workspace_id = '${workspaceId}'::uuid THEN
+            PERFORM nextval('"${sequenceName}"'::regclass);
+            PERFORM pg_advisory_xact_lock_shared(${advisoryKey});
+          END IF;
+          RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER "${triggerName}"
+        BEFORE INSERT ON workspace_org_settings
+        FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+      `);
+      await barrierClient.query(
+        'SELECT pg_advisory_lock($1)',
+        [advisoryKey],
+      );
+      barrierLocked = true;
+      attemptsPromise = Promise.allSettled([
+        createDepartment({
+          workspaceId,
+          actorId,
+          expectedRevision: 1,
+          name: 'First concurrent Department',
+        }),
+        createDepartment({
+          workspaceId,
+          actorId,
+          expectedRevision: 1,
+          name: 'Second concurrent Department',
+        }),
+      ]);
+
+      let bothArrived = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const arrivals = (await query<{
+          last_value: string;
+          is_called: boolean;
+        }>(
+          `SELECT last_value::text,is_called FROM "${sequenceName}"`,
+        )).rows[0];
+        if (arrivals.is_called && Number(arrivals.last_value) >= 2) {
+          bothArrived = true;
+          break;
+        }
+        await delay(5);
+      }
+      expect(bothArrived).toBe(true);
+      await barrierClient.query(
+        'SELECT pg_advisory_unlock($1)',
+        [advisoryKey],
+      );
+      barrierLocked = false;
+      attempts = await attemptsPromise;
+    } finally {
+      if (barrierLocked) {
+        await barrierClient.query(
+          'SELECT pg_advisory_unlock($1)',
+          [advisoryKey],
+        );
+      }
+      if (attemptsPromise) await attemptsPromise;
+      await query(`
+        DROP TRIGGER IF EXISTS "${triggerName}" ON workspace_org_settings;
+        DROP FUNCTION IF EXISTS "${functionName}"();
+        DROP SEQUENCE IF EXISTS "${sequenceName}";
+      `);
+      barrierClient.release();
+    }
+
+    expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toEqual([
+      expect.objectContaining({ value: { revision: 2 } }),
+    ]);
+    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toEqual([
+      expect.objectContaining({
+        reason: expect.objectContaining({
+          code: 'DEPARTMENT_REVISION_CONFLICT',
+          currentRevision: 2,
+        }),
+      }),
+    ]);
+    const organization = await getOrganization(workspaceId);
+    expect(organization.revision).toBe(2);
+    expect(organization.departments).toHaveLength(1);
+    await expect(query(
+      `SELECT count(*)::int AS count
+         FROM audit_events
+        WHERE workspace_id=$1 AND action='department.created'`,
+      [workspaceId],
+    )).resolves.toMatchObject({ rows: [{ count: 1 }] });
+  });
+
   it('maps active Department name uniqueness conflicts to a stable domain error', async () => {
     await createDepartment({
       workspaceId,
@@ -1560,6 +1740,12 @@ describe.runIf(enabled)('transactional department service', () => {
     const targetDepartmentId = await insertDepartment('Target');
     const activeManagerId = await createAgent(workspaceId, actorId, 'Active Manager');
     const pausedManagerId = await createAgent(workspaceId, actorId, 'Paused Manager', 'paused');
+    await query(
+      `UPDATE departments
+          SET manager_agent_id=$1
+        WHERE id=$2 AND workspace_id=$3`,
+      [activeManagerId, originalDepartmentId, workspaceId],
+    );
     await query(
       `INSERT INTO department_memberships(department_id,workspace_id,agent_id,membership_type)
        VALUES($1,$2,$3,'primary')`,
@@ -1603,6 +1789,11 @@ describe.runIf(enabled)('transactional department service', () => {
         WHERE workspace_id=$1 AND agent_id=$2 AND membership_type='primary'`,
       [workspaceId, activeManagerId],
     )).resolves.toMatchObject({ rows: [{ department_id: targetDepartmentId }] });
+    await expect(query(
+      `SELECT manager_agent_id FROM departments
+        WHERE id=$1 AND workspace_id=$2`,
+      [originalDepartmentId, workspaceId],
+    )).resolves.toMatchObject({ rows: [{ manager_agent_id: null }] });
   });
 
   it('removes a membership and clears its manager assignment atomically', async () => {
