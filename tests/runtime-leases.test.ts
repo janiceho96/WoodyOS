@@ -10,6 +10,9 @@ const state = vi.hoisted(() => ({
   leases: new Map<string, StoredLease>(),
   statements: [] as Array<{ sql: string; values: unknown[] }>,
   heartbeatFailure: null as Error | null,
+  heartbeatPending: null as Promise<never> | null,
+  releaseAttempts: 0,
+  releasePending: null as Promise<never> | null,
 }));
 
 function key(subjectType: unknown, subjectId: unknown) {
@@ -31,6 +34,7 @@ vi.mock('../src/db/client.js', () => ({
       return { rowCount: 1, rows: [{ owner_id: values[2] }] };
     }
     if (sql.includes('UPDATE execution_leases')) {
+      if (state.heartbeatPending) return state.heartbeatPending;
       if (state.heartbeatFailure) throw state.heartbeatFailure;
       const existing = state.leases.get(leaseKey);
       if (!existing || existing.ownerId !== values[2] || existing.expiresAt <= state.now) {
@@ -40,6 +44,8 @@ vi.mock('../src/db/client.js', () => ({
       return { rowCount: 1, rows: [{ owner_id: existing.ownerId }] };
     }
     if (sql.includes('DELETE FROM execution_leases')) {
+      state.releaseAttempts += 1;
+      if (state.releasePending) return state.releasePending;
       const existing = state.leases.get(leaseKey);
       if (!existing || existing.ownerId !== values[2]) return { rowCount: 0, rows: [] };
       state.leases.delete(leaseKey);
@@ -69,6 +75,9 @@ describe('execution leases', () => {
     state.leases = new Map();
     state.statements = [];
     state.heartbeatFailure = null;
+    state.heartbeatPending = null;
+    state.releaseAttempts = 0;
+    state.releasePending = null;
   });
 
   afterEach(() => {
@@ -141,5 +150,50 @@ describe('execution leases', () => {
     expect(JSON.stringify(serializeRuntimeError(heartbeat.signal.reason))).not.toContain('secret');
     await heartbeat.stop();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('bounds stop on a pending heartbeat and consumes a late rejection before release', async () => {
+    vi.useFakeTimers();
+    await acquireLease(subject, 'worker-a');
+    let rejectHeartbeat!: (error: Error) => void;
+    state.heartbeatPending = new Promise<never>((_resolve, reject) => {
+      rejectHeartbeat = reject;
+    });
+    const heartbeat = startLeaseHeartbeat(subject, 'worker-a', {
+      intervalMs: 10,
+      cleanupTimeoutMs: 5,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    const stopped = heartbeat.stop();
+    await vi.advanceTimersByTimeAsync(5);
+    await expect(stopped).resolves.toBe(false);
+    await expect(releaseLease(subject, 'worker-a', { cleanupTimeoutMs: 5 })).resolves.toBe(true);
+    expect(state.releaseAttempts).toBe(1);
+
+    rejectHeartbeat(new Error('late heartbeat token=must-not-leak'));
+    await vi.runAllTicks();
+    expect(state.leases.get(key('task', subject.id))).toBeUndefined();
+  });
+
+  it('bounds release and consumes a late database rejection', async () => {
+    vi.useFakeTimers();
+    await acquireLease(subject, 'worker-a');
+    let rejectRelease!: (error: Error) => void;
+    state.releasePending = new Promise<never>((_resolve, reject) => {
+      rejectRelease = reject;
+    });
+
+    const released = releaseLease(subject, 'worker-a', { cleanupTimeoutMs: 5 });
+    const releaseOutcome = expect(released).rejects.toMatchObject({
+      code: 'EXECUTION_LEASE_CLEANUP_TIMEOUT',
+    });
+    await vi.advanceTimersByTimeAsync(5);
+    await releaseOutcome;
+    expect(state.releaseAttempts).toBe(1);
+
+    rejectRelease(new Error('late release token=must-not-leak'));
+    await vi.runAllTicks();
+    expect(state.leases.get(key('task', subject.id))?.ownerId).toBe('worker-a');
   });
 });

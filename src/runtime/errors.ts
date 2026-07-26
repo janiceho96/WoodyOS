@@ -285,6 +285,12 @@ export async function preserveActionFailure(
     await persist();
     return failure;
   } catch (persistenceFailure) {
+    if (
+      persistenceFailure
+      && typeof persistenceFailure === 'object'
+      && 'code' in persistenceFailure
+      && (persistenceFailure as { code?: unknown }).code === 'EXECUTION_LEASE_LOST'
+    ) return persistenceFailure;
     const primary = serializeRuntimeError(failure);
     const primaryDetails = primary.details && typeof primary.details === 'object' && !Array.isArray(primary.details)
       ? primary.details as Record<string, unknown>

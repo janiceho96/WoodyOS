@@ -88,4 +88,22 @@ describe('structured runtime error persistence', () => {
       },
     });
   });
+
+  it('same-statement fences workflow claims, node mutations, events, and terminal transitions', async () => {
+    await executeWorkflowStep(run.id, async () => null, new AbortController().signal, 'worker-owner');
+
+    const workerMutations = state.statements.filter(({ sql }) => (
+      sql.includes('UPDATE workflow_runs r SET')
+      || sql.includes('INSERT INTO workflow_run_node_states')
+      || sql.includes("workflow_run_node_states SET status='failed'")
+      || sql.includes("workflow_runs SET status='failed',output=")
+      || sql.includes('INSERT INTO workflow_run_events')
+    ));
+    expect(workerMutations.length).toBeGreaterThan(4);
+    expect(workerMutations.every(({ sql, values }) => (
+      sql.includes('execution_leases')
+      && sql.includes('expires_at>now()')
+      && values.includes('worker-owner')
+    ))).toBe(true);
+  });
 });

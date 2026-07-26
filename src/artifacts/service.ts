@@ -217,9 +217,26 @@ export async function requestTaskVersionArtifacts(input: {
   }
 }
 
-export async function releaseTaskArtifacts(taskId: string, signal?: AbortSignal) {
+export async function releaseTaskArtifacts(
+  taskId: string,
+  signal?: AbortSignal,
+  leaseOwnerId?: string,
+) {
   signal?.throwIfAborted();
-  const rows = (await query<ArtifactRecord>("UPDATE artifacts SET status='queued',updated_at=now() WHERE task_id=$1 AND status='pending' RETURNING *", [taskId])).rows;
+  const rows = (await query<ArtifactRecord>(
+    `UPDATE artifacts SET status='queued',updated_at=now()
+      WHERE task_id=$1 AND status='pending'
+        AND (
+          $2::text IS NULL
+          OR EXISTS(
+            SELECT 1 FROM execution_leases
+            WHERE subject_type='task' AND subject_id=$1
+              AND owner_id=$2 AND expires_at>now()
+          )
+        )
+      RETURNING *`,
+    [taskId, leaseOwnerId ?? null],
+  )).rows;
   signal?.throwIfAborted();
   await enqueuePreparedArtifacts(rows);
   return rows;

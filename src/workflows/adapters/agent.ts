@@ -2,6 +2,7 @@ import { query } from '../../db/client.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { resolveNodeInput } from './templates.js';
 import { childTraceContext } from '../../runtime/trace.js';
+import { assertFencedMutation } from '../../runtime/leases.js';
 
 function json(value: unknown) {
   return JSON.stringify(value === undefined ? null : value);
@@ -36,12 +37,21 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
       });
     }
     execution.signal.throwIfAborted();
-    task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
+    const childTask = await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
       `INSERT INTO tasks(
          workspace_id,agent_id,agent_version_id,workflow_run_id,workflow_node_id,workflow_iteration_key,
          workflow_attempt,title,input,requested_by,manifest_version,execution_manifest,
          trace_id,span_id,parent_span_id
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       )
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
+       WHERE (
+         $16::text IS NULL
+         OR EXISTS(
+           SELECT 1 FROM execution_leases
+           WHERE subject_type='workflow_run' AND subject_id=$4
+             AND owner_id=$16 AND expires_at>now()
+         )
+       )
        RETURNING id,status,output,error,trace_id`,
       [
         run.workspace_id,
@@ -59,8 +69,19 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
         agentTrace.traceId,
         agentTrace.spanId,
         agentTrace.parentSpanId,
+        execution.leaseOwnerId ?? null,
       ],
-    )).rows[0];
+    );
+    await assertFencedMutation(
+      childTask.rowCount,
+      execution.leaseOwnerId
+        ? {
+          subject: { kind: 'workflow_run', id: run.id },
+          ownerId: execution.leaseOwnerId,
+        }
+        : undefined,
+    );
+    task = childTask.rows[0];
   }
   if (task.status === 'failed') throw new Error(typeof task.error === 'object' && task.error && 'message' in task.error ? String((task.error as { message: unknown }).message) : `Agent node ${node.id} failed`);
   let output = task.status === 'completed'

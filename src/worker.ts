@@ -73,9 +73,12 @@ import {
 } from './runtime/cancellation.js';
 import {
   acquireLease,
+  assertFencedMutation,
+  executionLeaseCleanupTimeout,
   isLeaseFailure,
   releaseLease,
   startLeaseHeartbeat,
+  type ExecutionLeaseContext,
   type LeaseSubject,
 } from './runtime/leases.js';
 
@@ -123,7 +126,7 @@ function reportLeaseCleanupFailure(subject: LeaseSubject, error: unknown) {
 async function finalizeIfCancellationRequested(subject: {
   kind: 'task' | 'workflow_run';
   id: string;
-}) {
+}, leaseOwnerId?: string) {
   const table = subject.kind === 'task' ? 'tasks' : 'workflow_runs';
   const status = (await query<{ status: string }>(
     `SELECT status FROM ${table} WHERE id=$1`,
@@ -132,7 +135,7 @@ async function finalizeIfCancellationRequested(subject: {
   if (!['cancel_requested', 'cancelling', 'cancelled', 'cancelled_with_side_effects'].includes(status ?? '')) {
     return false;
   }
-  await finalizeCancellation(subject);
+  await finalizeCancellation(subject, leaseOwnerId);
   return true;
 }
 function openAiToolDefinitions(tools: ToolRecord[]): ChatCompletionTool[] {
@@ -175,6 +178,7 @@ async function taskEvent(
   message: string,
   payload: Record<string, unknown> = {},
   parentTrace?: TraceContext,
+  lease?: ExecutionLeaseContext,
 ) {
   const authoritative = parentTrace ?? authoritativeTraceContext((await query<{
     trace_id: string;
@@ -182,10 +186,20 @@ async function taskEvent(
     parent_span_id: string | null;
   }>('SELECT trace_id,span_id,parent_span_id FROM tasks WHERE id=$1 AND workspace_id=$2', [taskId, workspaceId])).rows[0] ?? {});
   const trace = childTraceContext(authoritative);
-  await query(
+  const inserted = await query(
     `INSERT INTO task_events(
        workspace_id,task_id,event_type,message,payload,trace_id,span_id,parent_span_id
-     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+     )
+     SELECT $1,$2,$3,$4,$5,$6,$7,$8
+     WHERE (
+       $9::text IS NULL
+       OR EXISTS(
+         SELECT 1 FROM execution_leases
+         WHERE subject_type='task' AND subject_id=$2
+           AND owner_id=$9 AND expires_at>now()
+       )
+     )
+     RETURNING id`,
     [
       workspaceId,
       taskId,
@@ -195,8 +209,10 @@ async function taskEvent(
       trace.traceId,
       trace.spanId,
       trace.parentSpanId,
+      lease?.ownerId ?? null,
     ],
   );
+  await assertFencedMutation(inserted.rowCount, lease);
 }
 type TaskToolAction =
   | { adapter: 'api'; tool: ToolRecord }
@@ -295,11 +311,11 @@ export async function executeTaskToolAction(input: {
         trace: childTraceContext(input.trace),
         signal,
       });
-      await completeAction(input.authorizationId, executed.result);
+      await completeAction(input.authorizationId, executed.result, input.leaseOwnerId);
       return { result: executed.result, toolCallId: executed.callId };
     }
     const result = limitedActionResult(await invokeTool(input.action.tool, input.arguments_, false, signal));
-    await completeAction(input.authorizationId, result);
+    await completeAction(input.authorizationId, result, input.leaseOwnerId);
     return { result, toolCallId: null };
   } catch (error) {
     const risk = input.action.adapter === 'api'
@@ -308,7 +324,7 @@ export async function executeTaskToolAction(input: {
     const failure = risk === 'read' ? error : uncertainActionOutcome(error);
     throw await preserveActionFailure(
       failure,
-      () => failAction(input.authorizationId, failure),
+      () => failAction(input.authorizationId, failure, input.leaseOwnerId),
     );
   }
 }
@@ -374,37 +390,53 @@ export async function executeAgentTask(
   const leaseSubject: LeaseSubject = { kind: 'task', id: taskId };
   const leaseOwnerId = executionOwnerId();
   if (!await acquireLease(leaseSubject, leaseOwnerId)) return null;
+  const leaseContext: ExecutionLeaseContext = { subject: leaseSubject, ownerId: leaseOwnerId };
   const lease = startLeaseHeartbeat(leaseSubject, leaseOwnerId);
   let cancellation: Awaited<ReturnType<typeof createCancellationContext>> | null = null;
   let signal: AbortSignal = lease.signal;
   try {
-    cancellation = await createCancellationContext({ kind: 'task', id: taskId });
+    cancellation = await createCancellationContext({ kind: 'task', id: taskId }, { leaseOwnerId });
     signal = combineAbortSignals([callerSignal, cancellation.signal, lease.signal]);
     if (signal.aborted || queuedTask.status === 'cancel_requested') {
-      await finalizeCancellation({ kind: 'task', id: taskId });
+      await finalizeCancellation({ kind: 'task', id: taskId }, leaseOwnerId);
       return null;
     }
-    const task = (await query<Task>(
+    const taskClaim = (await query<Task>(
       `UPDATE tasks SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
-       WHERE id=$1 AND status IN ('queued','running') RETURNING *`,
-      [taskId],
-    )).rows[0];
-    if (!task) {
-      if (signal.aborted) await finalizeCancellation({ kind: 'task', id: taskId });
-      else await finalizeIfCancellationRequested({ kind: 'task', id: taskId });
+       WHERE id=$1 AND status IN ('queued','running')
+         AND EXISTS(
+           SELECT 1 FROM execution_leases
+           WHERE subject_type='task' AND subject_id=$1
+             AND owner_id=$2 AND expires_at>now()
+         )
+       RETURNING *`,
+      [taskId, leaseOwnerId],
+    ));
+    await assertFencedMutation(taskClaim.rowCount, leaseContext, cancellationError);
+    const claimedTask = taskClaim.rows[0];
+    if (!claimedTask) {
+      if (signal.aborted) await finalizeCancellation({ kind: 'task', id: taskId }, leaseOwnerId);
+      else await finalizeIfCancellationRequested({ kind: 'task', id: taskId }, leaseOwnerId);
       return null;
     }
+    const task = claimedTask;
     const taskTrace = authoritativeTraceContext(task, queuedTraceId);
+    const emitTaskEvent = (
+      type: string,
+      message: string,
+      payload: Record<string, unknown> = {},
+      parentTrace?: TraceContext,
+    ) => taskEvent(task.workspace_id, task.id, type, message, payload, parentTrace, leaseContext);
     try {
     const { agent, exactManifest } = await runtimeAgentForTask(task);
     const checkpoint = await loadTaskActionCheckpoint(task.workspace_id, task.id);
-    await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`, {}, taskTrace);
+    await emitTaskEvent(checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`, {}, taskTrace);
     await assertWorkspaceAiBudgetAvailable(task.workspace_id);
     const runtime = assertConfiguredAiProvider(await configuredAiProviderForWorkspace(task.workspace_id));
     const { provider, anthropic, openAiCompatible } = runtime;
     if (checkpoint && checkpoint.state.provider !== provider) throw Object.assign(new Error('The workspace AI provider changed while this task was waiting for confirmation. Start a new run so Woody can build a compatible request.'), { code: 'AI_PROVIDER_CHANGED_DURING_RUN' });
     const modelTrace = childTraceContext(taskTrace);
-    await taskEvent(task.workspace_id, task.id, 'model.requested', `Sending task to ${agent.model}`, {}, modelTrace);
+    await emitTaskEvent('model.requested', `Sending task to ${agent.model}`, {}, modelTrace);
     const toolIds = Array.isArray(agent.tool_ids) ? agent.tool_ids.filter((id): id is string => typeof id === 'string') : [];
     const assignedTools = toolIds.length ? (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE workspace_id=$1 AND enabled=true AND id = ANY($2::uuid[])', [task.workspace_id, toolIds])).rows : [];
     const runtimePolicy = resolveAgentRuntimePolicy(agent, assignedTools);
@@ -416,7 +448,7 @@ export async function executeAgentTask(
       ? authorizedMcp.filter((tool) => Boolean(task.execution_manifest?.mcpActions[tool.id]))
       : authorizedMcp;
     if (runtimePolicy.deniedTools.length) {
-      await taskEvent(task.workspace_id, task.id, 'capability.enforced', 'Some assigned tools were unavailable under the agent capability policy', {
+      await emitTaskEvent('capability.enforced', 'Some assigned tools were unavailable under the agent capability policy', {
         deniedToolIds: runtimePolicy.deniedTools.map((tool) => tool.id),
       });
     }
@@ -442,7 +474,7 @@ export async function executeAgentTask(
       : '';
     const outputContract = outputContractFromTaskInput(task.input);
     if (attachments.citations.length) {
-      await taskEvent(task.workspace_id, task.id, 'attachments.retrieved', `${attachments.citations.length} relevant attachment passage${attachments.citations.length === 1 ? '' : 's'} selected`, {
+      await emitTaskEvent('attachments.retrieved', `${attachments.citations.length} relevant attachment passage${attachments.citations.length === 1 ? '' : 's'} selected`, {
         citations: attachments.citations.map(({ content: _content, ...citation }) => citation),
       });
     }
@@ -474,7 +506,16 @@ export async function executeAgentTask(
         } else if (!action) {
           content = 'Tool access was revoked before the approved action executed.';
           isError = true;
-          if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
+          if (checkpoint.callId) await query(
+            `UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now()
+              WHERE id=$2
+                AND EXISTS(
+                  SELECT 1 FROM execution_leases
+                  WHERE subject_type='task' AND subject_id=$3
+                    AND owner_id=$4 AND expires_at>now()
+                )`,
+            [content, checkpoint.callId, task.id, leaseOwnerId],
+          );
         } else {
           const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace, signal, leaseOwnerId);
           if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
@@ -526,7 +567,7 @@ export async function executeAgentTask(
           const arguments_ = use.input as Record<string, unknown>;
           try {
             const authorization = await authorizeTaskToolAction(task, use.id, action, arguments_, modelTrace, signal, leaseOwnerId);
-            await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
+            await emitTaskEvent('action.requested', `Requesting ${actionName(action)}`, {
               authorizationId: authorization.authorizationId,
               adapter: action.adapter,
               toolId: action.tool.id,
@@ -547,8 +588,9 @@ export async function executeAgentTask(
                 state,
                 mcpTool: action.adapter === 'mcp' ? action.tool : undefined,
                 trace: childTraceContext(authorization.trace),
+                leaseOwnerId,
               });
-              await taskEvent(task.workspace_id, task.id, 'action.confirmation.requested', 'Human confirmation is required before this action', {
+              await emitTaskEvent('action.confirmation.requested', 'Human confirmation is required before this action', {
                 authorizationId: authorization.authorizationId,
                 toolCallId: paused.toolCallId,
                 toolId: action.tool.id,
@@ -560,7 +602,7 @@ export async function executeAgentTask(
             const executed = authorization.status === 'completed'
               ? { result: authorization.result, toolCallId: null }
               : await executeTaskToolAction({ task, action, arguments_, authorizationId: authorization.authorizationId, trace: authorization.trace, signal, leaseOwnerId });
-            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
+            await emitTaskEvent('action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
             const serialized = serializeRuntimeError(error);
@@ -568,7 +610,7 @@ export async function executeAgentTask(
               throw signal.reason ?? error;
             }
             if (signal.aborted || serialized.category === 'cancelled') throw cancellationError(error);
-            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, {
+            await emitTaskEvent('action.failed', `${actionName(action)} failed`, {
               adapter: action.adapter,
               toolId: action.tool.id,
               error: serialized,
@@ -600,7 +642,16 @@ export async function executeAgentTask(
           content = 'The user rejected this external action. Do not retry it unless the user explicitly requests a new action.';
         } else if (!action) {
           content = 'Tool access was revoked before the approved action executed.';
-          if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
+          if (checkpoint.callId) await query(
+            `UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now()
+              WHERE id=$2
+                AND EXISTS(
+                  SELECT 1 FROM execution_leases
+                  WHERE subject_type='task' AND subject_id=$3
+                    AND owner_id=$4 AND expires_at>now()
+                )`,
+            [content, checkpoint.callId, task.id, leaseOwnerId],
+          );
         } else {
           const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace, signal, leaseOwnerId);
           if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
@@ -662,7 +713,7 @@ export async function executeAgentTask(
           const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
           try {
             const authorization = await authorizeTaskToolAction(task, use.id, action, input, modelTrace, signal, leaseOwnerId);
-            await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
+            await emitTaskEvent('action.requested', `Requesting ${actionName(action)}`, {
               authorizationId: authorization.authorizationId,
               adapter: action.adapter,
               toolId: action.tool.id,
@@ -683,8 +734,9 @@ export async function executeAgentTask(
                 state,
                 mcpTool: action.adapter === 'mcp' ? action.tool : undefined,
                 trace: childTraceContext(authorization.trace),
+                leaseOwnerId,
               });
-              await taskEvent(task.workspace_id, task.id, 'action.confirmation.requested', 'Human confirmation is required before this action', {
+              await emitTaskEvent('action.confirmation.requested', 'Human confirmation is required before this action', {
                 authorizationId: authorization.authorizationId,
                 toolCallId: paused.toolCallId,
                 toolId: action.tool.id,
@@ -696,7 +748,7 @@ export async function executeAgentTask(
             const executed = authorization.status === 'completed'
               ? { result: authorization.result, toolCallId: null }
               : await executeTaskToolAction({ task, action, arguments_: input, authorizationId: authorization.authorizationId, trace: authorization.trace, signal, leaseOwnerId });
-            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
+            await emitTaskEvent('action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
             const serialized = serializeRuntimeError(error);
@@ -704,7 +756,7 @@ export async function executeAgentTask(
               throw signal.reason ?? error;
             }
             if (signal.aborted || serialized.category === 'cancelled') throw cancellationError(error);
-            await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, {
+            await emitTaskEvent('action.failed', `${actionName(action)} failed`, {
               adapter: action.adapter,
               toolId: action.tool.id,
               error: serialized,
@@ -723,33 +775,76 @@ export async function executeAgentTask(
     const completed = await query(
       `UPDATE tasks SET status='completed',output=$1,token_input=$2,token_output=$3,
               estimated_cost_usd=$4,duration_ms=$5,completed_at=now(),updated_at=now()
-        WHERE id=$6 AND status='running' RETURNING id`,
-      [JSON.stringify(output), inputTokens, outputTokens, estimatedCostUsd, durationMs, task.id],
+        WHERE id=$6 AND status='running'
+          AND EXISTS(
+            SELECT 1 FROM execution_leases
+            WHERE subject_type='task' AND subject_id=$6
+              AND owner_id=$7 AND expires_at>now()
+          )
+        RETURNING id`,
+      [JSON.stringify(output), inputTokens, outputTokens, estimatedCostUsd, durationMs, task.id, leaseOwnerId],
     );
-    if (!completed.rowCount) throw cancellationError();
-    await query('DELETE FROM task_runtime_checkpoints WHERE task_id=$1', [task.id]);
-    await taskEvent(task.workspace_id, task.id, 'task.completed', 'Agent completed task', { durationMs, inputTokens, outputTokens, estimatedCostUsd, toolCallCount });
+    await assertFencedMutation(completed.rowCount, leaseContext, cancellationError);
+    await query(
+      `DELETE FROM task_runtime_checkpoints
+        WHERE task_id=$1
+          AND EXISTS(
+            SELECT 1 FROM execution_leases
+            WHERE subject_type='task' AND subject_id=$1
+              AND owner_id=$2 AND expires_at>now()
+          )`,
+      [task.id, leaseOwnerId],
+    );
+    await emitTaskEvent('task.completed', 'Agent completed task', { durationMs, inputTokens, outputTokens, estimatedCostUsd, toolCallCount });
     try {
-      const releasedArtifacts = await releaseTaskArtifacts(task.id, signal);
-      if (releasedArtifacts.length) await taskEvent(task.workspace_id, task.id, 'artifacts.queued', `${releasedArtifacts.length} artifact${releasedArtifacts.length === 1 ? '' : 's'} queued`, { artifactIds: releasedArtifacts.map((artifact) => artifact.id) });
+      const releasedArtifacts = await releaseTaskArtifacts(task.id, signal, leaseOwnerId);
+      if (releasedArtifacts.length) await emitTaskEvent('artifacts.queued', `${releasedArtifacts.length} artifact${releasedArtifacts.length === 1 ? '' : 's'} queued`, { artifactIds: releasedArtifacts.map((artifact) => artifact.id) });
     } catch (artifactError) {
-      await taskEvent(task.workspace_id, task.id, 'artifacts.queue_failed', 'Agent output completed, but downloadable files could not be queued', { error: artifactError instanceof Error ? artifactError.message : 'Artifact queue unavailable' });
+      await emitTaskEvent('artifacts.queue_failed', 'Agent output completed, but downloadable files could not be queued', { error: artifactError instanceof Error ? artifactError.message : 'Artifact queue unavailable' });
     }
     if (checkpoint && task.workflow_run_id && task.workflow_node_id) {
       try {
-        await query("UPDATE workflow_runs SET status='queued',updated_at=now() WHERE id=$1 AND status='awaiting_approval'", [task.workflow_run_id]);
+        const resumed = await query(
+          `UPDATE workflow_runs SET status='queued',updated_at=now()
+            WHERE id=$1 AND status='awaiting_approval'
+              AND EXISTS(
+                SELECT 1 FROM execution_leases
+                WHERE subject_type='task' AND subject_id=$2
+                  AND owner_id=$3 AND expires_at>now()
+              )
+            RETURNING id`,
+          [task.workflow_run_id, task.id, leaseOwnerId],
+        );
+        await assertFencedMutation(resumed.rowCount, leaseContext);
         await enqueueWorkflowRun(task.workflow_run_id, `${task.workflow_run_id}:${task.id}:mcp-resume`, 0, task.trace_id);
       } catch (resumeError) {
         const serialized = serializeRuntimeError(resumeError);
         const failedRun = await query(
-          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued' RETURNING id",
-          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), task.workflow_run_id],
+          `UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now()
+            WHERE id=$3 AND status='queued'
+              AND EXISTS(
+                SELECT 1 FROM execution_leases
+                WHERE subject_type='task' AND subject_id=$4
+                  AND owner_id=$5 AND expires_at>now()
+              )
+            RETURNING id`,
+          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), task.workflow_run_id, task.id, leaseOwnerId],
         );
+        if (!failedRun.rowCount) await assertFencedMutation(failedRun.rowCount, leaseContext);
         if (!failedRun.rowCount) {
           await finalizeIfCancellationRequested({ kind: 'workflow_run', id: task.workflow_run_id });
         } else {
-          await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [task.workflow_run_id]);
-          await taskEvent(task.workspace_id, task.id, 'workflow.resume_failed', 'Task completed, but its workflow could not resume', { error: resumeError instanceof Error ? resumeError.message : 'Workflow queue unavailable' });
+          await query(
+            `UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now()
+              WHERE workflow_run_id=$1 AND status='pending'
+                AND EXISTS(
+                  SELECT 1 FROM execution_leases
+                  WHERE subject_type='task' AND subject_id=$2
+                    AND owner_id=$3 AND expires_at>now()
+                )`,
+            [task.workflow_run_id, task.id, leaseOwnerId],
+          );
+          await emitTaskEvent('workflow.resume_failed', 'Task completed, but its workflow could not resume', { error: resumeError instanceof Error ? resumeError.message : 'Workflow queue unavailable' });
         }
       }
     }
@@ -760,26 +855,45 @@ export async function executeAgentTask(
     if (signal.aborted || serialized.category === 'cancelled') {
       const cancellationFailure = serialized.category === 'cancelled' ? error : cancellationError(error);
       const cancellationSerialized = serializeRuntimeError(cancellationFailure);
-      await taskEvent(task.workspace_id, task.id, 'task.cancelling', cancellationSerialized.message, {
+      await emitTaskEvent('task.cancelling', cancellationSerialized.message, {
         error: cancellationSerialized,
       }, taskTrace);
-      await finalizeCancellation({ kind: 'task', id: task.id });
+      await finalizeCancellation({ kind: 'task', id: task.id }, leaseOwnerId);
       return null;
     }
     const failedTask = await query(
-      "UPDATE tasks SET status='failed',error=$1,completed_at=now(),updated_at=now() WHERE id=$2 AND status='running' RETURNING id",
-      [JSON.stringify(serialized), task.id],
+      `UPDATE tasks SET status='failed',error=$1,completed_at=now(),updated_at=now()
+        WHERE id=$2 AND status='running'
+          AND EXISTS(
+            SELECT 1 FROM execution_leases
+            WHERE subject_type='task' AND subject_id=$2
+              AND owner_id=$3 AND expires_at>now()
+          )
+        RETURNING id`,
+      [JSON.stringify(serialized), task.id, leaseOwnerId],
     );
-    if (!failedTask.rowCount && await finalizeIfCancellationRequested({ kind: 'task', id: task.id })) return null;
+    if (!failedTask.rowCount) await assertFencedMutation(failedTask.rowCount, leaseContext);
+    if (!failedTask.rowCount && await finalizeIfCancellationRequested({ kind: 'task', id: task.id }, leaseOwnerId)) return null;
     if (!failedTask.rowCount) throw error;
-    await query("UPDATE artifacts SET status='failed',error_message='Source task failed',updated_at=now() WHERE task_id=$1 AND status='pending'", [task.id]);
-    await taskEvent(task.workspace_id, task.id, 'task.failed', serialized.message, { error: serialized }, taskTrace);
+    await query(
+      `UPDATE artifacts SET status='failed',error_message='Source task failed',updated_at=now()
+        WHERE task_id=$1 AND status='pending'
+          AND EXISTS(
+            SELECT 1 FROM execution_leases
+            WHERE subject_type='task' AND subject_id=$1
+              AND owner_id=$2 AND expires_at>now()
+          )`,
+      [task.id, leaseOwnerId],
+    );
+    await emitTaskEvent('task.failed', serialized.message, { error: serialized }, taskTrace);
     throw error;
     }
   } finally {
     cancellation?.stop();
     try {
-      await lease.stop();
+      if (!await lease.stop()) {
+        reportLeaseCleanupFailure(leaseSubject, executionLeaseCleanupTimeout('heartbeat'));
+      }
     } catch (error) {
       reportLeaseCleanupFailure(leaseSubject, error);
     }
@@ -860,14 +974,15 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
   const leaseSubject: LeaseSubject = { kind: 'workflow_run', id: job.data.workflowRunId };
   const leaseOwnerId = executionOwnerId();
   if (!await acquireLease(leaseSubject, leaseOwnerId)) return null;
+  const leaseContext: ExecutionLeaseContext = { subject: leaseSubject, ownerId: leaseOwnerId };
   const lease = startLeaseHeartbeat(leaseSubject, leaseOwnerId);
   let cancellation: Awaited<ReturnType<typeof createCancellationContext>> | null = null;
   let signal: AbortSignal = lease.signal;
   try {
-    cancellation = await createCancellationContext(leaseSubject);
+    cancellation = await createCancellationContext(leaseSubject, { leaseOwnerId });
     signal = combineAbortSignals([cancellation.signal, lease.signal]);
     if (signal.aborted || run.status === 'cancel_requested') {
-      await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
+      await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId }, leaseOwnerId);
       return null;
     }
     if (run.run_mode === 'production') {
@@ -880,16 +995,28 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
           `UPDATE workflow_runs
               SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now()
             WHERE id=$3 AND status IN ('queued','awaiting_approval')
+              AND EXISTS(
+                SELECT 1 FROM execution_leases
+                WHERE subject_type='workflow_run' AND subject_id=$3
+                  AND owner_id=$4 AND expires_at>now()
+              )
             RETURNING id`,
-          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), job.data.workflowRunId],
+          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), job.data.workflowRunId, leaseOwnerId],
         );
+        if (!failedRun.rowCount) await assertFencedMutation(failedRun.rowCount, leaseContext);
         if (!failedRun.rowCount && await finalizeIfCancellationRequested({
           kind: 'workflow_run',
           id: job.data.workflowRunId,
-        })) return null;
+        }, leaseOwnerId)) return null;
         await query(
-          "UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'",
-          [job.data.workflowRunId],
+          `UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now()
+            WHERE workflow_run_id=$1 AND status='pending'
+              AND EXISTS(
+                SELECT 1 FROM execution_leases
+                WHERE subject_type='workflow_run' AND subject_id=$1
+                  AND owner_id=$2 AND expires_at>now()
+              )`,
+          [job.data.workflowRunId, leaseOwnerId],
         );
         throw error;
       }
@@ -902,30 +1029,32 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     );
     if (lease.signal.aborted || isLeaseFailure(signal.reason)) return null;
     if (signal.aborted) {
-      await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
+      await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId }, leaseOwnerId);
       return null;
     }
     if (await finalizeIfCancellationRequested({
       kind: 'workflow_run',
       id: job.data.workflowRunId,
-    })) return null;
+    }, leaseOwnerId)) return null;
     return result;
   } catch (error) {
     const serialized = serializeRuntimeError(error);
     if (lease.signal.aborted || isLeaseFailure(signal.reason) || isLeaseFailure(error)) return null;
     if (signal.aborted || serialized.category === 'cancelled') {
-      await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
+      await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId }, leaseOwnerId);
       return null;
     }
     if (await finalizeIfCancellationRequested({
       kind: 'workflow_run',
       id: job.data.workflowRunId,
-    })) return null;
+    }, leaseOwnerId)) return null;
     throw error;
   } finally {
     cancellation?.stop();
     try {
-      await lease.stop();
+      if (!await lease.stop()) {
+        reportLeaseCleanupFailure(leaseSubject, executionLeaseCleanupTimeout('heartbeat'));
+      }
     } catch (error) {
       reportLeaseCleanupFailure(leaseSubject, error);
     }

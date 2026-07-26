@@ -52,7 +52,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
   await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
   try {
     const output = limitedActionResult(await invokeTool(tool, arguments_, false, execution.signal));
-    await completeWorkflowAction(authorization.authorizationId, output);
+    await completeWorkflowAction(authorization.authorizationId, output, execution.leaseOwnerId);
     await emitEvent('api.completed', `${tool.name} completed`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
     setNodeOutput(output);
     return { output, result: output };
@@ -60,7 +60,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     const failure = toolRiskLevel(tool) === 'read' ? error : uncertainActionOutcome(error);
     throw await preserveActionFailure(
       failure,
-      () => failWorkflowAction(authorization.authorizationId, failure),
+      () => failWorkflowAction(authorization.authorizationId, failure, execution.leaseOwnerId),
     );
   }
 }

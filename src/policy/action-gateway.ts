@@ -3,6 +3,7 @@ import { actionArgumentHash, limitedActionResult, safeActionSummary } from '../l
 import { decryptJsonWithContext, encryptJsonWithContext, type EncryptedPayload } from '../lib/crypto.js';
 import type { WorkflowNodeRisk } from '../workflows/registry.js';
 import { serializeRuntimeError } from '../runtime/errors.js';
+import { assertFencedMutation, type ExecutionLeaseContext } from '../runtime/leases.js';
 import type { TraceContext } from '../runtime/trace.js';
 
 export type ActionAdapter = 'api' | 'mcp' | 'browser';
@@ -161,7 +162,32 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
 
   if (existing) {
     if (existing.status === 'awaiting_confirmation' && new Date(existing.expires_at).getTime() <= Date.now()) {
-      await query("UPDATE action_authorizations SET status='expired',resolved_at=now() WHERE id=$1 AND status='awaiting_confirmation'", [existing.id]);
+      const expired = await query(
+        `UPDATE action_authorizations SET status='expired',resolved_at=now()
+          WHERE id=$1 AND status='awaiting_confirmation'
+            AND (
+              $2::text IS NULL
+              OR EXISTS(
+                SELECT 1 FROM execution_leases lease
+                WHERE lease.subject_type=action_authorizations.subject_type
+                  AND lease.subject_id=COALESCE(action_authorizations.task_id,action_authorizations.workflow_run_id)
+                  AND lease.owner_id=$2 AND lease.expires_at>now()
+              )
+            )
+          RETURNING id`,
+        [existing.id, input.leaseOwnerId ?? null],
+      );
+      await assertFencedMutation(
+        expired.rowCount,
+        input.leaseOwnerId
+          ? {
+            subject: input.subject.type === 'task'
+              ? { kind: 'task', id: input.subject.taskId }
+              : { kind: 'workflow_run', id: input.subject.workflowRunId },
+            ownerId: input.leaseOwnerId,
+          }
+          : undefined,
+      );
       return { status: 'denied' as const, authorizationId: existing.id, reason: 'Action confirmation expired' };
     }
     if (existing.status === 'awaiting_confirmation') return { status: 'awaiting_confirmation' as const, authorizationId: existing.id };
@@ -343,7 +369,18 @@ export async function beginAction(authorizationId: string, leaseOwnerId?: string
 
 export const beginWorkflowAction = beginAction;
 
-export async function completeAction(authorizationId: string, result: unknown) {
+function authorizationLeaseContext(
+  authorization: Pick<AuthorizationRow, 'subject_type' | 'task_id' | 'workflow_run_id'>,
+  ownerId: string | undefined,
+): ExecutionLeaseContext | undefined {
+  if (!ownerId) return undefined;
+  const id = authorization.subject_type === 'task'
+    ? authorization.task_id
+    : authorization.workflow_run_id;
+  return id ? { subject: { kind: authorization.subject_type, id }, ownerId } : undefined;
+}
+
+export async function completeAction(authorizationId: string, result: unknown, leaseOwnerId?: string) {
   const authorization = (await query<AuthorizationRow>(
     `SELECT id,workspace_id,subject_type,workflow_run_id,task_id,status,result_summary,encrypted_result,error_message,expires_at
      FROM action_authorizations WHERE id=$1 AND status='executing'`,
@@ -351,22 +388,54 @@ export async function completeAction(authorizationId: string, result: unknown) {
   )).rows[0];
   if (!authorization) return;
   const encrypted = encryptJsonWithContext({ value: result }, resultContext(authorization));
-  await query(
+  const settled = await query(
     `UPDATE action_authorizations SET status='consumed',result_summary=$1,encrypted_result=$2,consumed_at=now()
-     WHERE id=$3 AND status='executing'`,
-    [JSON.stringify(limitedActionResult(result)), JSON.stringify(encrypted), authorizationId],
+     WHERE id=$3 AND status='executing'
+       AND (
+         $4::text IS NULL
+         OR EXISTS(
+           SELECT 1 FROM execution_leases lease
+           WHERE lease.subject_type=action_authorizations.subject_type
+             AND lease.subject_id=COALESCE(action_authorizations.task_id,action_authorizations.workflow_run_id)
+             AND lease.owner_id=$4 AND lease.expires_at>now()
+         )
+       )
+     RETURNING id`,
+    [JSON.stringify(limitedActionResult(result)), JSON.stringify(encrypted), authorizationId, leaseOwnerId ?? null],
   );
+  await assertFencedMutation(settled.rowCount, authorizationLeaseContext(authorization, leaseOwnerId));
 }
 
 export const completeWorkflowAction = completeAction;
 
-export async function failAction(authorizationId: string, error: unknown) {
+export async function failAction(authorizationId: string, error: unknown, leaseOwnerId?: string) {
   const serialized = serializeRuntimeError(error);
-  await query(
+  const authorization = leaseOwnerId
+    ? (await query<AuthorizationRow>(
+      `SELECT id,workspace_id,subject_type,workflow_run_id,task_id,status,result_summary,encrypted_result,error_message,expires_at
+       FROM action_authorizations WHERE id=$1`,
+      [authorizationId],
+    )).rows[0]
+    : undefined;
+  const settled = await query(
     `UPDATE action_authorizations
         SET status='failed',error_message=$1,runtime_error=$2,consumed_at=now()
-      WHERE id=$3 AND status='executing'`,
-    [serialized.message, JSON.stringify(serialized), authorizationId],
+      WHERE id=$3 AND status='executing'
+        AND (
+          $4::text IS NULL
+          OR EXISTS(
+            SELECT 1 FROM execution_leases lease
+            WHERE lease.subject_type=action_authorizations.subject_type
+              AND lease.subject_id=COALESCE(action_authorizations.task_id,action_authorizations.workflow_run_id)
+              AND lease.owner_id=$4 AND lease.expires_at>now()
+          )
+        )
+      RETURNING id`,
+    [serialized.message, JSON.stringify(serialized), authorizationId, leaseOwnerId ?? null],
+  );
+  await assertFencedMutation(
+    settled.rowCount,
+    authorization ? authorizationLeaseContext(authorization, leaseOwnerId) : undefined,
   );
 }
 

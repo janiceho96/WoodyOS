@@ -6,6 +6,7 @@ import { argumentHash, safeArgumentsSummary } from './runtime.js';
 import type { TraceContext } from '../runtime/trace.js';
 import { redactRuntimeMessage, redactRuntimeValue } from '../runtime/errors.js';
 import { cancellationError } from '../runtime/cancellation.js';
+import { executionLeaseLost } from '../runtime/leases.js';
 
 export type TaskActionCheckpointState = {
   provider: 'anthropic' | 'openai-compatible';
@@ -64,6 +65,7 @@ export async function pauseForActionConfirmation(input: {
   state: TaskActionCheckpointState;
   mcpTool?: AuthorizedMcpTool;
   trace: TraceContext;
+  leaseOwnerId?: string;
 }) {
   const sanitizedState = sanitizeTaskActionCheckpointState(input.state);
   const encrypted = encryptJsonWithContext(
@@ -100,7 +102,17 @@ export async function pauseForActionConfirmation(input: {
         `INSERT INTO mcp_tool_calls(
            workspace_id,connection_id,mcp_tool_id,agent_id,task_id,workflow_run_id,action_authorization_id,status,risk_level,
            arguments_summary,arguments_hash,trace_id,span_id,parent_span_id
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,'awaiting_confirmation',$8,$9,$10,$11,$12,$13) RETURNING id`,
+         )
+         SELECT $1,$2,$3,$4,$5,$6,$7,'awaiting_confirmation',$8,$9,$10,$11,$12,$13
+         WHERE (
+           $14::text IS NULL
+           OR EXISTS(
+             SELECT 1 FROM execution_leases
+             WHERE subject_type='task' AND subject_id=$5
+               AND owner_id=$14 AND expires_at>now()
+           )
+         )
+         RETURNING id`,
         [
           input.workspaceId,
           input.mcpTool.connection_id,
@@ -115,42 +127,101 @@ export async function pauseForActionConfirmation(input: {
           input.trace.traceId,
           input.trace.spanId,
           input.trace.parentSpanId,
+          input.leaseOwnerId ?? null,
         ],
       );
+      if (!call.rowCount) throw executionLeaseLost();
       callId = call.rows[0].id;
-      await client.query(
+      const confirmation = await client.query(
         `INSERT INTO mcp_tool_confirmations(tool_call_id,action_summary,target_summary,requested_by)
-         VALUES($1,$2,$3,$4)`,
+         SELECT $1,$2,$3,$4
+         WHERE (
+           $5::text IS NULL
+           OR EXISTS(
+             SELECT 1 FROM execution_leases
+             WHERE subject_type='task' AND subject_id=$6
+               AND owner_id=$5 AND expires_at>now()
+           )
+         )
+         RETURNING id`,
         [
           callId,
           `${input.mcpTool.title ?? input.mcpTool.remote_name} via ${input.mcpTool.connection_name}`,
           targetSummary(input.state.pending.arguments),
           input.requestedBy,
+          input.leaseOwnerId ?? null,
+          input.taskId,
         ],
       );
+      if (!confirmation.rowCount) throw executionLeaseLost();
     }
-    await client.query(
+    const checkpoint = await client.query(
       `INSERT INTO task_runtime_checkpoints(
          task_id,workspace_id,provider,encrypted_state,pending_tool_call_id,pending_action_authorization_id,status
-       ) VALUES($1,$2,$3,$4,$5,$6,'awaiting_confirmation')
+       )
+       SELECT $1,$2,$3,$4,$5,$6,'awaiting_confirmation'
+       WHERE (
+         $7::text IS NULL
+         OR EXISTS(
+           SELECT 1 FROM execution_leases
+           WHERE subject_type='task' AND subject_id=$1
+             AND owner_id=$7 AND expires_at>now()
+         )
+       )
        ON CONFLICT(task_id) DO UPDATE SET provider=EXCLUDED.provider,encrypted_state=EXCLUDED.encrypted_state,
        pending_tool_call_id=EXCLUDED.pending_tool_call_id,pending_action_authorization_id=EXCLUDED.pending_action_authorization_id,
-       status='awaiting_confirmation',updated_at=now()`,
-      [input.taskId, input.workspaceId, input.state.provider, JSON.stringify(encrypted), callId, input.authorizationId],
+       status='awaiting_confirmation',updated_at=now()
+       WHERE (
+         $7::text IS NULL
+         OR EXISTS(
+           SELECT 1 FROM execution_leases
+           WHERE subject_type='task' AND subject_id=$1
+             AND owner_id=$7 AND expires_at>now()
+         )
+       )
+       RETURNING task_id`,
+      [input.taskId, input.workspaceId, input.state.provider, JSON.stringify(encrypted), callId, input.authorizationId, input.leaseOwnerId ?? null],
     );
-    await client.query(
+    if (!checkpoint.rowCount) throw executionLeaseLost();
+    const taskPaused = await client.query(
       `UPDATE tasks SET status='awaiting_approval',updated_at=now()
         WHERE id=$1 AND workspace_id=$2
-          AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')`,
-      [input.taskId, input.workspaceId],
+          AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+          AND (
+            $3::text IS NULL
+            OR EXISTS(
+              SELECT 1 FROM execution_leases
+              WHERE subject_type='task' AND subject_id=$1
+                AND owner_id=$3 AND expires_at>now()
+            )
+          )
+        RETURNING id`,
+      [input.taskId, input.workspaceId, input.leaseOwnerId ?? null],
     );
+    if (!taskPaused.rowCount) {
+      if (input.leaseOwnerId) throw executionLeaseLost();
+      throw cancellationError();
+    }
     if (input.workflowRunId) {
-      await client.query(
+      const workflowPaused = await client.query(
         `UPDATE workflow_runs SET status='awaiting_approval'
           WHERE id=$1 AND workspace_id=$2
-            AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')`,
-        [input.workflowRunId, input.workspaceId],
+            AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+            AND (
+              $3::text IS NULL
+              OR EXISTS(
+                SELECT 1 FROM execution_leases
+                WHERE subject_type='task' AND subject_id=$4
+                  AND owner_id=$3 AND expires_at>now()
+              )
+            )
+          RETURNING id`,
+        [input.workflowRunId, input.workspaceId, input.leaseOwnerId ?? null, input.taskId],
       );
+      if (!workflowPaused.rowCount) {
+        if (input.leaseOwnerId) throw executionLeaseLost();
+        throw cancellationError();
+      }
     }
     await client.query('COMMIT');
     return { authorizationId: input.authorizationId, toolCallId: callId };

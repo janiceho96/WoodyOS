@@ -84,7 +84,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   }, actionTrace);
   try {
     const output = limitedActionResult(await invokeTool(tool, input, false, execution.signal));
-    await completeWorkflowAction(authorization.authorizationId, output);
+    await completeWorkflowAction(authorization.authorizationId, output, execution.leaseOwnerId);
     await emitEvent('tool.completed', `${tool.name} completed`, {
       authorizationId: authorization.authorizationId,
       toolId: tool.id,
@@ -97,7 +97,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
     const failure = toolRiskLevel(tool) === 'read' ? error : uncertainActionOutcome(error);
     throw await preserveActionFailure(
       failure,
-      () => failWorkflowAction(authorization.authorizationId, failure),
+      () => failWorkflowAction(authorization.authorizationId, failure, execution.leaseOwnerId),
     );
   }
 }

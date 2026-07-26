@@ -2,6 +2,7 @@ import { query } from '../../db/client.js';
 import { evaluateCondition, valueAtPath, type WorkflowNode } from '../definition.js';
 import type { WorkflowAdapterContext, WorkflowCursor } from './types.js';
 import { cancellationError } from '../../runtime/cancellation.js';
+import { assertFencedMutation } from '../../runtime/leases.js';
 
 export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Record<string, unknown>) {
   const mode = String(node.config.mode ?? 'forEach');
@@ -112,7 +113,16 @@ export async function executeLogicNode(context: WorkflowAdapterContext) {
        RETURNING id`,
       [run.workspace_id, run.id, node.id, iterationKey, cursor.attempt, execution.leaseOwnerId ?? null],
     );
-    if (!inserted.rowCount) throw cancellationError();
+    await assertFencedMutation(
+      inserted.rowCount,
+      execution.leaseOwnerId
+        ? {
+          subject: { kind: 'workflow_run', id: run.id },
+          ownerId: execution.leaseOwnerId,
+        }
+        : undefined,
+      cancellationError,
+    );
     return { waiting: true, waitingMessage: 'Human approval is required', output: null };
   }
   if (approval.status === 'pending') return { waiting: true, waitingMessage: 'Human approval is required', output: null };

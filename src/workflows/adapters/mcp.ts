@@ -61,7 +61,7 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
       trace: childTraceContext(actionTrace),
       signal: execution.signal,
     });
-    await completeWorkflowAction(authorization.authorizationId, executed.result);
+    await completeWorkflowAction(authorization.authorizationId, executed.result, execution.leaseOwnerId);
     await emitEvent('mcp.tool.completed', `${actionName} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.callId, toolId: tool.id }, actionTrace);
     setNodeOutput(executed.result);
     return { output: executed.result, result: executed.result };
@@ -69,7 +69,7 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
     const failure = tool.risk_level === 'read' ? error : uncertainActionOutcome(error);
     throw await preserveActionFailure(
       failure,
-      () => failWorkflowAction(authorization.authorizationId, failure),
+      () => failWorkflowAction(authorization.authorizationId, failure, execution.leaseOwnerId),
     );
   }
 }

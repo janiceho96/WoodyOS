@@ -34,6 +34,7 @@ const state = vi.hoisted(() => ({
   cancelWinsFailure: true,
   workflowStepCalls: 0,
   abortLeaseOnWorkflowStep: false,
+  takeoverOnTaskTerminal: false,
 }));
 
 const manifest = {
@@ -129,6 +130,9 @@ vi.mock('../src/db/client.js', () => ({
       state.taskStatus = 'running';
       return { rowCount: 1, rows: [{ ...task }] };
     }
+    if (sql.includes("UPDATE tasks SET status='completed'") && state.takeoverOnTaskTerminal) {
+      return { rowCount: 0, rows: [] };
+    }
     if (sql.includes("UPDATE tasks SET status='failed'")) {
       if (state.cancelWinsFailure) {
         state.taskStatus = 'cancel_requested';
@@ -216,6 +220,7 @@ vi.mock('../src/runtime/leases.js', () => ({
     signal: state.leaseController.signal,
     stop: vi.fn(async () => {
       state.leaseStops.push(subject.id);
+      return true;
     }),
   })),
   releaseLease: vi.fn(async (subject: { id: string }) => {
@@ -225,6 +230,18 @@ vi.mock('../src/runtime/leases.js', () => ({
   }),
   isLeaseFailure: vi.fn((error: unknown) => (
     Boolean(error && typeof error === 'object' && (error as { code?: string }).code === 'EXECUTION_LEASE_LOST')
+  )),
+  assertFencedMutation: vi.fn(async (rowCount: number | null | undefined) => {
+    if (rowCount) return;
+    if (state.takeoverOnTaskTerminal) {
+      throw Object.assign(new Error('lease ownership lost'), {
+        code: 'EXECUTION_LEASE_LOST',
+      });
+    }
+  }),
+  executionLeaseCleanupTimeout: vi.fn(() => Object.assign(
+    new Error('lease cleanup timed out'),
+    { code: 'EXECUTION_LEASE_CLEANUP_TIMEOUT' },
   )),
 }));
 vi.mock('../src/tools/runtime.js', () => ({
@@ -381,6 +398,7 @@ describe('task worker cancellation', () => {
     state.cancelWinsFailure = true;
     state.workflowStepCalls = 0;
     state.abortLeaseOnWorkflowStep = false;
+    state.takeoverOnTaskTerminal = false;
   });
 
   it('finalizes queued cancellation without starting the provider', async () => {
@@ -492,5 +510,16 @@ describe('task worker cancellation', () => {
     expect(state.finalized).toEqual([]);
     expect(state.leaseStops).toEqual([ids.workflowRun]);
     expect(state.leaseReleases).toEqual([ids.workflowRun]);
+  });
+
+  it('does not report a stale task terminal write as user cancellation', async () => {
+    state.takeoverOnTaskTerminal = true;
+
+    await expect(executeAgentTask(ids.task, ids.trace)).resolves.toBeNull();
+
+    const terminal = state.statements.find((sql) => sql.includes("UPDATE tasks SET status='completed'"));
+    expect(terminal).toContain('execution_leases');
+    expect(state.finalized).toEqual([]);
+    expect(state.taskStatus).toBe('running');
   });
 });

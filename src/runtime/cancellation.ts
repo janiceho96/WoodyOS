@@ -1,5 +1,6 @@
 import { db, query } from '../db/client.js';
 import { runtimeError, serializeRuntimeError } from './errors.js';
+import { assertFencedMutation } from './leases.js';
 
 export type CancellationSubject = {
   kind: 'task' | 'workflow_run';
@@ -67,7 +68,7 @@ export function cancellationRequested(signal?: AbortSignal) {
 
 export async function createCancellationContext(
   subject: CancellationSubject,
-  options: { pollIntervalMs?: number } = {},
+  options: { pollIntervalMs?: number; leaseOwnerId?: string } = {},
 ): Promise<CancellationContext> {
   const controller = new AbortController();
   const intervalMs = Math.min(1_000, Math.max(10, options.pollIntervalMs ?? 500));
@@ -84,10 +85,25 @@ export async function createCancellationContext(
         [subject.id],
       )).rows[0]?.status;
       if (current === 'cancel_requested') {
-        await query(
+        const cancelling = await query(
           `UPDATE ${table} SET status='cancelling',updated_at=now()
-            WHERE id=$1 AND status='cancel_requested' RETURNING status`,
-          [subject.id],
+            WHERE id=$1 AND status='cancel_requested'
+              AND (
+                $2::text IS NULL
+                OR EXISTS(
+                  SELECT 1 FROM execution_leases
+                  WHERE subject_type=$3 AND subject_id=$1
+                    AND owner_id=$2 AND expires_at>now()
+                )
+              )
+            RETURNING status`,
+          [subject.id, options.leaseOwnerId ?? null, subject.kind],
+        );
+        await assertFencedMutation(
+          cancelling.rowCount,
+          options.leaseOwnerId
+            ? { subject, ownerId: options.leaseOwnerId }
+            : undefined,
         );
         controller.abort(cancellationError());
       } else if (current === 'cancelling' || current === 'cancelled' || current === 'cancelled_with_side_effects') {
@@ -229,7 +245,7 @@ export async function requestCancellation(input: CancellationSubject & {
   }
 }
 
-export async function finalizeCancellation(subject: CancellationSubject) {
+export async function finalizeCancellation(subject: CancellationSubject, leaseOwnerId?: string) {
   const sideEffects = (await query<{ side_effects: boolean }>(
     `SELECT EXISTS(
        SELECT 1 FROM action_authorizations authorization
@@ -250,11 +266,23 @@ export async function finalizeCancellation(subject: CancellationSubject) {
   const status: CancellationStatus = sideEffects ? 'cancelled_with_side_effects' : 'cancelled';
   const serialized = serializeRuntimeError(cancellationError());
   const table = subjectTable(subject);
-  await query(
+  const finalized = await query(
     `UPDATE ${table} SET status=$1,error=$2,completed_at=now(),updated_at=now()
       WHERE id=$3 AND status IN ('queued','running','awaiting_approval','cancel_requested','cancelling')
+        AND (
+          $4::text IS NULL
+          OR EXISTS(
+            SELECT 1 FROM execution_leases
+            WHERE subject_type=$5 AND subject_id=$3
+              AND owner_id=$4 AND expires_at>now()
+          )
+        )
       RETURNING status`,
-    [status, JSON.stringify(serialized), subject.id],
+    [status, JSON.stringify(serialized), subject.id, leaseOwnerId ?? null, subject.kind],
+  );
+  await assertFencedMutation(
+    finalized.rowCount,
+    leaseOwnerId ? { subject, ownerId: leaseOwnerId } : undefined,
   );
   if (subject.kind === 'task') {
     await query(

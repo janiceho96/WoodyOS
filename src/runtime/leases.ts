@@ -12,11 +12,17 @@ export type LeaseOptions = {
 
 export type LeaseHeartbeatOptions = LeaseOptions & {
   intervalMs?: number;
+  cleanupTimeoutMs?: number;
 };
 
 export type LeaseHeartbeat = {
   signal: AbortSignal;
-  stop(): Promise<void>;
+  stop(): Promise<boolean>;
+};
+
+export type ExecutionLeaseContext = {
+  subject: LeaseSubject;
+  ownerId: string;
 };
 
 const DEFAULT_LEASE_TTL_MS = 30_000;
@@ -33,7 +39,11 @@ function heartbeatIntervalMs(options: LeaseHeartbeatOptions) {
   );
 }
 
-function leaseFailure(cause?: unknown) {
+function cleanupTimeoutMs(options: { cleanupTimeoutMs?: number }) {
+  return Math.min(10_000, Math.max(1, options.cleanupTimeoutMs ?? 2_000));
+}
+
+export function executionLeaseLost(cause?: unknown) {
   return runtimeError('EXECUTION_LEASE_LOST', {
     category: 'infrastructure',
     retryable: false,
@@ -42,6 +52,14 @@ function leaseFailure(cause?: unknown) {
       details: { heartbeat: serializeRuntimeError(cause) },
       cause,
     }),
+  });
+}
+
+export function executionLeaseCleanupTimeout(operation: 'heartbeat' | 'release') {
+  return runtimeError('EXECUTION_LEASE_CLEANUP_TIMEOUT', {
+    category: 'infrastructure',
+    retryable: false,
+    message: `Execution lease ${operation} cleanup timed out`,
   });
 }
 
@@ -92,14 +110,53 @@ export async function heartbeatLease(
   return Boolean(heartbeat.rowCount);
 }
 
-export async function releaseLease(subject: LeaseSubject, ownerId: string) {
-  const released = await query(
+export async function releaseLease(
+  subject: LeaseSubject,
+  ownerId: string,
+  options: { cleanupTimeoutMs?: number } = {},
+) {
+  const release = query(
     `DELETE FROM execution_leases
       WHERE subject_type=$1 AND subject_id=$2 AND owner_id=$3
       RETURNING owner_id`,
     [subject.kind, subject.id, ownerId],
   );
+  const timeout = Symbol('release-timeout');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const released = await Promise.race([
+    release,
+    new Promise<typeof timeout>((resolve) => {
+      timer = setTimeout(() => resolve(timeout), cleanupTimeoutMs(options));
+      timer.unref();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (released === timeout) {
+    void release.catch(() => undefined);
+    throw executionLeaseCleanupTimeout('release');
+  }
   return Boolean(released.rowCount);
+}
+
+export async function assertLeaseOwned(context: ExecutionLeaseContext) {
+  const owned = await query(
+    `SELECT EXISTS(
+       SELECT 1 FROM execution_leases
+       WHERE subject_type=$1 AND subject_id=$2 AND owner_id=$3 AND expires_at>now()
+     ) lease_owned`,
+    [context.subject.kind, context.subject.id, context.ownerId],
+  );
+  if (owned.rows[0]?.lease_owned !== true) throw executionLeaseLost();
+}
+
+export async function assertFencedMutation(
+  rowCount: number | null | undefined,
+  context: ExecutionLeaseContext | undefined,
+  fallback?: () => Error,
+) {
+  if (rowCount) return;
+  if (context) await assertLeaseOwned(context);
+  if (fallback) throw fallback();
 }
 
 export function startLeaseHeartbeat(
@@ -115,10 +172,10 @@ export function startLeaseHeartbeat(
     active = (async () => {
       try {
         if (!(await heartbeatLease(subject, ownerId, options))) {
-          controller.abort(leaseFailure());
+          controller.abort(executionLeaseLost());
         }
       } catch (error) {
-        controller.abort(leaseFailure(error));
+        controller.abort(executionLeaseLost(error));
       }
     })().finally(() => {
       active = null;
@@ -131,7 +188,23 @@ export function startLeaseHeartbeat(
     async stop() {
       stopped = true;
       clearInterval(timer);
-      await active;
+      if (!active) return true;
+      const current = active;
+      const timeout = Symbol('heartbeat-timeout');
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([
+        current.then(() => true, () => true),
+        new Promise<typeof timeout>((resolve) => {
+          cleanupTimer = setTimeout(() => resolve(timeout), cleanupTimeoutMs(options));
+          cleanupTimer.unref();
+        }),
+      ]);
+      if (cleanupTimer) clearTimeout(cleanupTimer);
+      if (result === timeout) {
+        void current.catch(() => undefined);
+        return false;
+      }
+      return true;
     },
   };
 }
