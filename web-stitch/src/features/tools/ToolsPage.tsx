@@ -1,54 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Activity, AlertTriangle, ArrowRightLeft, Blocks, BookOpen, BriefcaseBusiness, CheckCircle2, CloudSun, Code2, ExternalLink, FileSearch, Globe2, KeyRound, LoaderCircle, Plus, RefreshCw, Search, ServerCog, ShieldCheck, Unplug, Wrench } from 'lucide-react';
+import { AlertTriangle, ArrowRightLeft, BookOpen, BriefcaseBusiness, CloudSun, ExternalLink, FileSearch, Globe2, LoaderCircle, Plus, RefreshCw, Search, ShieldCheck, Wrench } from 'lucide-react';
 import { type FormEvent, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { api, type Tool } from '../../api';
 import { useWorkspace } from '../../app/workspace';
-import { EmptyState, PageHeader, Status } from '../../components/ui';
+import { EmptyState } from '../../components/ui';
 import { BrandIcon } from '../../components/BrandIcon';
-import { handleTabListKeyDown } from '../../lib/a11y';
-import './web-research.css';
-
-type Section = 'connected' | 'web' | 'jobs' | 'apps' | 'custom';
-
-export function ToolsPage({ openConnect }: { openConnect: () => void }) {
-  const { data, report, reportError } = useWorkspace();
-  const navigate = useNavigate();
-  const [params, setParams] = useSearchParams();
-  const queryClient = useQueryClient();
-  const requestedSection = params.get('section');
-  const section: Section = requestedSection === 'web' || requestedSection === 'jobs' || requestedSection === 'apps' || requestedSection === 'custom' ? requestedSection : 'connected';
-  const setSection = (next: Section) => {
-    setParams(next === 'connected' ? {} : { section: next });
-  };
-  const connections = useQuery({ queryKey: ['mcp-connections'], queryFn: api.mcpConnections, refetchInterval: 15_000 });
-  const test = useMutation({
-    mutationFn: (tool: Tool) => api.testTool(tool.id).then(() => tool),
-    onSuccess: (tool) => report(`${tool.name} connection is healthy`),
-    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Tool health test failed'),
-  });
-  const toggle = useMutation({
-    mutationFn: (tool: Tool) => api.updateTool(tool.id, { enabled: !tool.enabled }).then(() => tool),
-    onSuccess: async (tool) => { report(`${tool.name} ${tool.enabled ? 'disabled' : 'enabled'}`); await queryClient.invalidateQueries({ queryKey: ['workspace'] }); },
-    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not update tool'),
-  });
-  const mcp = connections.data?.data ?? [];
-  const activeConnections = mcp.filter((connection) => connection.enabled).length + data.tools.filter((tool) => tool.enabled).length;
-
-  return <div className="tools-page integrations-page">
-    <PageHeader eyebrow="Resources" title="Integrations" description="Connect the applications and APIs your agents may use, then control their access explicitly." actions={<><button className="button" onClick={() => navigate('/mcp')}><Blocks size={15}/>Advanced MCP</button><button className="button primary" onClick={openConnect}><Plus size={15}/>Custom API</button></>}/>
-    <section className="integrations-safety"><ShieldCheck size={20}/><div><strong>Connections stay private and off by default</strong><p>Credentials are encrypted by Woody’s backend. Agents receive only the specific tools and permissions you allow.</p></div><span>{activeConnections} active connection{activeConnections === 1 ? '' : 's'}</span></section>
-    <div className="integration-sections" role="tablist" aria-label="Integration sections" onKeyDown={handleTabListKeyDown}><button id="integrations-tab-connected" type="button" role="tab" aria-selected={section === 'connected'} aria-controls="integrations-panel-connected" tabIndex={section === 'connected' ? 0 : -1} className={section === 'connected' ? 'active' : ''} onClick={() => setSection('connected')}><CheckCircle2 size={15}/>Connected <span>{data.tools.length + mcp.length}</span></button><button id="integrations-tab-web" type="button" role="tab" aria-selected={section === 'web'} aria-controls="integrations-panel-web" tabIndex={section === 'web' ? 0 : -1} className={section === 'web' ? 'active' : ''} onClick={() => setSection('web')}><Search size={15}/>Web research</button><button id="integrations-tab-jobs" type="button" role="tab" aria-selected={section === 'jobs'} aria-controls="integrations-panel-jobs" tabIndex={section === 'jobs' ? 0 : -1} className={section === 'jobs' ? 'active' : ''} onClick={() => setSection('jobs')}><BriefcaseBusiness size={15}/>Job search</button><button id="integrations-tab-apps" type="button" role="tab" aria-selected={section === 'apps'} aria-controls="integrations-panel-apps" tabIndex={section === 'apps' ? 0 : -1} className={section === 'apps' ? 'active' : ''} onClick={() => setSection('apps')}><Globe2 size={15}/>App catalog</button><button id="integrations-tab-custom" type="button" role="tab" aria-selected={section === 'custom'} aria-controls="integrations-panel-custom" tabIndex={section === 'custom' ? 0 : -1} className={section === 'custom' ? 'active' : ''} onClick={() => setSection('custom')}><Code2 size={15}/>Custom API</button></div>
-    {section === 'connected' && <section id="integrations-panel-connected" role="tabpanel" aria-labelledby="integrations-tab-connected" className="integration-connected-grid">
-      <article className="panel integration-connection-panel"><div className="panel-header"><div><span className="eyebrow">Agent tools</span><h2>APIs and web research</h2></div><button className="text-button" onClick={() => setSection('web')}>Add research tool</button></div>{data.tools.length ? <div className="integration-connection-list">{data.tools.map((tool) => <article key={tool.id}><span className="tool-glyph">{tool.permissions.includes('jobs.read') ? <BriefcaseBusiness size={18}/> : tool.permissions.includes('web.search') ? <Search size={18}/> : tool.permissions.some((permission) => permission.startsWith('web.page.')) ? <FileSearch size={18}/> : <Wrench size={18}/>}</span><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><Status value={tool.enabled ? 'active' : 'paused'}/><button className="button" disabled={!tool.enabled || test.isPending} onClick={() => test.mutate(tool)}>Test</button><button className="button" disabled={toggle.isPending} onClick={() => toggle.mutate(tool)}>{tool.enabled ? 'Disable' : 'Enable'}</button></article>)}</div> : <EmptyState Icon={Unplug} title="No agent tools" text="Add a web research provider, safe page reader, or custom HTTPS API." action={<button className="button primary" onClick={() => setSection('web')}>Add web research</button>}/>}</article>
-      <article className="panel integration-connection-panel"><div className="panel-header"><div><span className="eyebrow">Application connections</span><h2>MCP apps</h2></div><button className="text-button" onClick={() => navigate('/mcp')}>Manage apps</button></div>{connections.isLoading ? <EmptyState Icon={LoaderCircle} title="Loading applications" text="Checking connection health and installed tools."/> : mcp.length ? <div className="integration-connection-list">{mcp.slice(0, 8).map((connection) => <article key={connection.id}><span className="tool-glyph"><ServerCog size={18}/></span><span><strong>{connection.name}</strong><small>{connection.tool_count ?? 0} actions · {connection.agent_count ?? 0} assigned agents</small></span><Status value={connection.enabled ? connection.health_status : 'paused'}/><button className="button" onClick={() => navigate(`/mcp?connection=${connection.id}`)}>Review</button></article>)}</div> : <EmptyState Icon={Blocks} title="No apps connected" text="Browse official application connections or safely review Community Registry servers." action={<button className="button primary" onClick={() => navigate('/mcp')}>Browse app catalog</button>}/>}</article>
-    </section>}
-    {section === 'web' && <WebResearchPanel/>}
-    {section === 'jobs' && <JobSearchPanel/>}
-    {section === 'apps' && <section id="integrations-panel-apps" role="tabpanel" aria-labelledby="integrations-tab-apps" className="integration-app-entry panel"><div><span className="integration-app-glyph"><Globe2 size={24}/></span><span className="eyebrow">Application catalog</span><h2>Connect familiar apps, not protocol jargon</h2><p>Browse supported applications such as Notion, Gmail, Google Drive, GitHub, Slack and more. Woody shows their real actions, authentication state, health, assigned agents and least-privilege access.</p><div className="integration-app-points"><span><KeyRound size={14}/>Encrypted authentication</span><span><ShieldCheck size={14}/>Explicit per-agent access</span><span><Activity size={14}/>Health and call activity</span></div><button className="button primary" onClick={() => navigate('/mcp')}>Browse app catalog</button></div><aside><strong>Advanced MCP remains available</strong><p>Use it for Community Registry discovery, a custom Streamable HTTP endpoint, transport details and raw discovered-tool review.</p><button className="text-button" onClick={() => navigate('/mcp')}>Open Advanced MCP <Blocks size={14}/></button></aside></section>}
-    {section === 'custom' && <div id="integrations-panel-custom" role="tabpanel" aria-labelledby="integrations-tab-custom" className="custom-api-panel"><DemoApiGallery/><section className="integration-app-entry panel custom-api-entry"><div><span className="integration-app-glyph"><Code2 size={24}/></span><span className="eyebrow">Custom API</span><h2>Connect a secure HTTPS service</h2><p>Use a custom API when it is an internal system or not represented by an application connection. Woody stores configuration server-side and can run a safe health check.</p><div className="integration-app-points"><span><ShieldCheck size={14}/>HTTPS only</span><span><KeyRound size={14}/>Secrets never return to browser</span><span><RefreshCw size={14}/>Safe health check</span></div><button className="button primary" onClick={openConnect}>Add custom API</button></div><aside><strong>Need an application connection?</strong><p>Prefer an app connection when available. It can expose named actions, OAuth, tool discovery, approvals and agent-specific allowlists.</p><button className="text-button" onClick={() => setSection('apps')}>Browse app catalog <Globe2 size={14}/></button></aside></section></div>}
-  </div>;
-}
 
 function AgentToolAssignment({ tool, done }: { tool: Tool; done: () => void }) {
   const { data, report, reportError } = useWorkspace();
@@ -74,7 +31,7 @@ function AgentToolAssignment({ tool, done }: { tool: Tool; done: () => void }) {
   })}</div><button className="text-button" onClick={done}>Done assigning</button></section>;
 }
 
-function WebResearchPanel() {
+export function WebResearchPanel() {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const catalog = useQuery({ queryKey: ['web-research-catalog'], queryFn: api.webResearchCatalog });
@@ -122,7 +79,7 @@ function WebResearchPanel() {
   </section>;
 }
 
-function JobSearchPanel() {
+export function JobSearchPanel() {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const catalog = useQuery({ queryKey: ['job-tool-catalog'], queryFn: api.jobToolCatalog });
@@ -159,7 +116,7 @@ function JobSearchPanel() {
   </section>;
 }
 
-function DemoApiGallery() {
+export function DemoApiGallery() {
   const { report, reportError } = useWorkspace();
   const navigate = useNavigate();
   const queryClient = useQueryClient();

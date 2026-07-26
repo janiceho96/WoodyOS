@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { primaryNavigation, resolveLegacyResourcePath } from '../../app/navigation';
+
+vi.mock('../../api', () => ({ api: {} }));
+
+import { API_TOOL_SECTIONS } from './ApiToolsPage';
 
 describe('resource navigation', () => {
   it('exposes MCP and API Tools as separate primary destinations', () => {
@@ -17,5 +21,15 @@ describe('resource navigation', () => {
 
   it('preserves legacy tool-section queries', () => {
     expect(resolveLegacyResourcePath('/tools?section=web')).toBe('/api-tools?section=web');
+  });
+
+  it('defines API-only sections', () => {
+    expect(API_TOOL_SECTIONS.map((section) => section.id)).toEqual([
+      'installed',
+      'add',
+      'providers',
+      'activity',
+    ]);
+    expect(API_TOOL_SECTIONS.map((section) => section.label)).not.toContain('MCP');
   });
 });

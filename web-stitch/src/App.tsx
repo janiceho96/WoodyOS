@@ -9,7 +9,7 @@ import { BrandMark } from './components/BrandMark';
 import { AuthPage } from './features/auth/AuthPage';
 import { ExecutionPage } from './features/execution/ExecutionPage';
 import { KnowledgePage } from './features/knowledge/KnowledgePage';
-import { ToolsPage } from './features/tools/ToolsPage';
+import { ApiToolsPage } from './features/tools/ApiToolsPage';
 const McpMarketplacePage = lazy(() => import('./features/mcp/McpMarketplacePage').then((module) => ({ default: module.McpMarketplacePage })));
 const AgentBuilderPage = lazy(() => import('./features/agents/AgentBuilderPage').then((module) => ({ default: module.AgentBuilderPage })));
 const AgentsPage = lazy(() => import('./features/agents/AgentsPage').then((module) => ({ default: module.AgentsPage })));
@@ -58,7 +58,7 @@ function RoutedApp() {
 function DashboardRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); const navigate = useNavigate(); return <DashboardPage openTask={() => openDialog('task')} openAgent={() => navigate('/agents/new')}/>; }
 function ExecutionRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ExecutionPage openTask={() => openDialog('task')}/>; }
 function KnowledgeRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <KnowledgePage openText={() => openDialog('document')}/>; }
-function ApiToolsRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ToolsPage openConnect={() => openDialog('tool')}/>; }
+function ApiToolsRoute() { const { openDialog } = useOutletContext<ShellOutlet>(); return <ApiToolsPage openConnect={() => openDialog('tool')}/>; }
 function LegacyToolsRedirect() { const location = useLocation(); return <Navigate to={resolveLegacyResourcePath(`${location.pathname}${location.search}${location.hash}`)} replace/>; }
 function SettingsRoute({ accentColor, setAccentColor }: { accentColor: string; setAccentColor: (color: string) => void }) { const { theme, setTheme, onboarding, resumeOnboarding, restartOnboarding } = useOutletContext<ShellOutlet>(); return <SettingsPage theme={theme} setTheme={setTheme} accentColor={accentColor} setAccentColor={setAccentColor} onboarding={onboarding} resume={resumeOnboarding} restart={() => void restartOnboarding()}/>; }
 
