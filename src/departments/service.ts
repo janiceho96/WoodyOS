@@ -4,6 +4,7 @@ import {
   DepartmentError,
   type ArchiveDepartmentInput,
   type CreateDepartmentInput,
+  type CreateDepartmentResult,
   type DepartmentMembershipRecord,
   type DepartmentMutationResult,
   type DepartmentRecord,
@@ -43,11 +44,12 @@ type MutationContext = {
   currentRevision: number;
 };
 
-type MutationAudit = {
+type MutationAudit<TResult extends object = Record<string, never>> = {
   action: string;
   entityType: string;
   entityId: string | null;
   metadata?: Record<string, unknown>;
+  result?: TResult;
 };
 
 type PostgreSqlError = {
@@ -229,14 +231,16 @@ function translatedPostgreSqlError(
   return cause;
 }
 
-async function mutateOrganization(
+async function mutateOrganization<
+  TResult extends object = Record<string, never>,
+>(
   input: {
     workspaceId: string;
     actorId: string;
     expectedRevision: number;
   },
-  mutation: (context: MutationContext) => Promise<MutationAudit>,
-): Promise<DepartmentMutationResult> {
+  mutation: (context: MutationContext) => Promise<MutationAudit<TResult>>,
+): Promise<DepartmentMutationResult & TResult> {
   const client = await db.connect();
   let currentRevision: number | undefined;
   try {
@@ -299,7 +303,10 @@ async function mutateOrganization(
       ],
     );
     await client.query('COMMIT');
-    return { revision: nextRevision };
+    return Object.assign(
+      { revision: nextRevision },
+      audit.result ?? {},
+    ) as DepartmentMutationResult & TResult;
   } catch (cause) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw translatedPostgreSqlError(cause, currentRevision);
@@ -358,45 +365,50 @@ export async function getOrganization(
 
 export async function createDepartment(
   input: CreateDepartmentInput,
-): Promise<DepartmentMutationResult> {
-  return mutateOrganization(input, async ({ client, workspaceId }) => {
-    if (input.managerAgentId) {
-      await ensureManagerPrimary({
-        client,
-        workspaceId,
-        departmentId: null,
-        managerAgentId: input.managerAgentId,
-        confirmPrimaryMove: input.confirmPrimaryMove,
-      });
-    }
-    const department = (await client.query<{ id: string }>(
-      `INSERT INTO departments(
-         workspace_id,name,description,display_order,manager_agent_id
-       ) VALUES($1,$2,$3,$4,$5)
-       RETURNING id`,
-      [
-        workspaceId,
-        input.name,
-        input.description ?? '',
-        input.displayOrder ?? 0,
-        input.managerAgentId ?? null,
-      ],
-    )).rows[0];
-    if (input.managerAgentId) {
-      await ensureManagerPrimary({
-        client,
-        workspaceId,
-        departmentId: department.id,
-        managerAgentId: input.managerAgentId,
-        confirmPrimaryMove: input.confirmPrimaryMove,
-      });
-    }
-    return {
-      action: 'department.created',
-      entityType: 'department',
-      entityId: department.id,
-    };
-  });
+): Promise<CreateDepartmentResult> {
+  return mutateOrganization<{ department: DepartmentRecord }>(
+    input,
+    async ({ client, workspaceId }) => {
+      if (input.managerAgentId) {
+        await ensureManagerPrimary({
+          client,
+          workspaceId,
+          departmentId: null,
+          managerAgentId: input.managerAgentId,
+          confirmPrimaryMove: input.confirmPrimaryMove,
+        });
+      }
+      const department = (await client.query<DepartmentRow>(
+        `INSERT INTO departments(
+           workspace_id,name,description,display_order,manager_agent_id
+         ) VALUES($1,$2,$3,$4,$5)
+         RETURNING id,workspace_id,name,description,status,display_order,
+                   manager_agent_id,created_at,updated_at`,
+        [
+          workspaceId,
+          input.name,
+          input.description ?? '',
+          input.displayOrder ?? 0,
+          input.managerAgentId ?? null,
+        ],
+      )).rows[0];
+      if (input.managerAgentId) {
+        await ensureManagerPrimary({
+          client,
+          workspaceId,
+          departmentId: department.id,
+          managerAgentId: input.managerAgentId,
+          confirmPrimaryMove: input.confirmPrimaryMove,
+        });
+      }
+      return {
+        action: 'department.created',
+        entityType: 'department',
+        entityId: department.id,
+        result: { department: mapDepartment(department) },
+      };
+    },
+  );
 }
 
 export async function updateDepartment(
@@ -545,6 +557,8 @@ export async function setMembershipWithManager(
         managerAgentId: input.managerAgentId,
         confirmPrimaryMove: input.confirmPrimaryMove,
       });
+    }
+    if (input.managerAgentId !== undefined) {
       await client.query(
         `UPDATE departments
             SET manager_agent_id=$1,updated_at=now()
@@ -566,7 +580,7 @@ export async function setMembershipWithManager(
       metadata: {
         agentId: input.agentId,
         membershipType: input.membershipType,
-        ...(input.managerAgentId
+        ...(input.managerAgentId !== undefined
           ? { managerAgentId: input.managerAgentId }
           : {}),
       },

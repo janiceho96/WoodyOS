@@ -46,6 +46,10 @@ export interface DepartmentMutationResult {
   revision: number;
 }
 
+export interface CreateDepartmentResult extends DepartmentMutationResult {
+  department: DepartmentRecord;
+}
+
 interface RevisionedDepartmentMutation {
   workspaceId: string;
   actorId: string;

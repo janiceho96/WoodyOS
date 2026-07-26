@@ -27,7 +27,7 @@ const teamInput = z.object({
 const teamParams = z.object({ id: z.string().uuid() });
 const membershipParams = teamParams.extend({ agentId: z.string().uuid() });
 const legacyMembershipInput = z.object({
-  managerAgentId: z.string().uuid().nullable().optional(),
+  managerAgentId: z.string().uuid().nullable().default(null),
   confirmPrimaryMove: z.boolean().optional(),
 });
 
@@ -122,30 +122,15 @@ export async function teamRoutes(app: FastifyInstance) {
     const input = parse(teamInput, request.body, reply);
     if (!input) return;
     return sendLegacyMutation(reply, async () => {
-      const before = await getOrganization(request.user.workspaceId);
       const result = await createDepartment({
         workspaceId: request.user.workspaceId,
         actorId: request.user.sub,
-        expectedRevision: before.revision,
+        expectedRevision: await currentRevision(request.user.workspaceId),
         name: input.name,
         description: input.description,
       });
-      const after = await getOrganization(request.user.workspaceId);
-      const previousIds = new Set(before.departments.map((department) => (
-        department.id
-      )));
-      const created = after.departments.find((department) => (
-        !previousIds.has(department.id)
-        && department.status === 'active'
-        && department.name === input.name
-      ));
-      if (!created) {
-        throw Object.assign(new Error('TEAM_CREATION_RESULT_MISSING'), {
-          statusCode: 500,
-        });
-      }
       reply.header('X-Organization-Revision', String(result.revision));
-      return reply.code(201).send(legacyCreatedTeam(created));
+      return reply.code(201).send(legacyCreatedTeam(result.department));
     });
   }));
 

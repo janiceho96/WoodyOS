@@ -79,7 +79,7 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
   }));
 
   app.post('/install', {
-    preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']),
+    preHandler: (request) => app.authorize(request, ['owner', 'admin']),
   }, asyncRoute(async (request, reply) => {
     const input = parse(installInput, request.body, reply);
     if (!input) return;

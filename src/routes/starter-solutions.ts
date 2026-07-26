@@ -15,7 +15,7 @@ export async function starterSolutionRoutes(app: FastifyInstance) {
   }));
 
   app.post('/:slug/install', {
-    preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']),
+    preHandler: (request) => app.authorize(request, ['owner', 'admin']),
   }, asyncRoute(async (request, reply) => {
     const params = parse(z.object({ slug: z.string().min(2).max(100) }), request.params, reply);
     const input = parse(z.object({

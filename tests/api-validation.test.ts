@@ -110,7 +110,20 @@ const clientQuery = vi.fn(async (sql: string, values?: unknown[]) => {
       name: String(values?.[1]),
       description: String(values?.[2] ?? ''),
     };
-    return { rowCount: 1, rows: [{ id: createdDepartmentId }] };
+    return {
+      rowCount: 1,
+      rows: [{
+        id: createdDepartmentId,
+        workspace_id: workspaceId,
+        name: String(values?.[1]),
+        description: String(values?.[2] ?? ''),
+        status: 'active',
+        display_order: Number(values?.[3] ?? 0),
+        manager_agent_id: values?.[4] ?? null,
+        created_at: now,
+        updated_at: now,
+      }],
+    };
   }
   if (sql.includes('UPDATE workspace_org_settings')) {
     return { rowCount: 1, rows: [{ revision: 3 }] };
@@ -281,7 +294,18 @@ describe('API input validation', () => {
       payload: { name: 'Operations', expectedRevision: 2 },
     });
     expect(createAsAdmin.statusCode, createAsAdmin.body).toBe(201);
-    expect(createAsAdmin.json()).toEqual({ revision: 3 });
+    expect(createAsAdmin.json()).toMatchObject({
+      revision: 3,
+      department: {
+        id: createdDepartmentId,
+        workspaceId,
+        name: 'Operations',
+        description: '',
+        status: 'active',
+        displayOrder: 0,
+        managerAgentId: null,
+      },
+    });
 
     const readAsMember = await app.inject({
       method: 'GET',
@@ -492,6 +516,7 @@ describe('API input validation', () => {
       }],
     });
 
+    clientQuery.mockClear();
     const created = await app.inject({
       method: 'POST',
       url: '/v1/teams',
@@ -506,6 +531,9 @@ describe('API input validation', () => {
       name: 'Customer Success',
       description: 'Supports customers',
     });
+    expect(clientQuery.mock.calls.filter(([sql]) => (
+      String(sql).includes('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+    ))).toHaveLength(1);
 
     const membership = await app.inject({
       method: 'PUT',
@@ -524,6 +552,32 @@ describe('API input validation', () => {
       ...query.mock.calls,
       ...clientQuery.mock.calls,
     ].every(([sql]) => !/\b(?:agent_teams|team_memberships)\b/i.test(String(sql)))).toBe(true);
+  });
+
+  it('blocks members from solution installs before organization mutation', async () => {
+    const memberHeaders = {
+      authorization: `Bearer ${app.jwt.sign({
+        sub: memberUserId,
+        workspaceId,
+        role: 'member',
+      })}`,
+    };
+    const starterInstall = await app.inject({
+      method: 'POST',
+      url: '/v1/starter-solutions/executive-daily-brief/install',
+      headers: memberHeaders,
+      payload: {},
+    });
+    expect(starterInstall.statusCode, starterInstall.body).toBe(403);
+
+    const generatedInstall = await app.inject({
+      method: 'POST',
+      url: '/v1/agent-solutions/install',
+      headers: memberHeaders,
+      payload: {},
+    });
+    expect(generatedInstall.statusCode, generatedInstall.body).toBe(403);
+    expect(clientQuery).not.toHaveBeenCalled();
   });
 
   it('preserves stable legacy team not-found errors', async () => {
