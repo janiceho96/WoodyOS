@@ -8,6 +8,12 @@ import { assertWorkspaceAiBudgetAvailable } from '../lib/ai-usage.js';
 import { requestTaskArtifacts } from '../artifacts/service.js';
 import { artifactFormatSchema, inferredArtifactFormats } from '../artifacts/types.js';
 import { buildTaskManifest } from '../runtime/manifest.js';
+import { childTraceContext, createTraceContext } from '../runtime/trace.js';
+import {
+  redactRuntimeMessage,
+  redactRuntimeValue,
+  serializeRuntimeError,
+} from '../runtime/errors.js';
 
 const taskInput = z.object({
   agentId: z.string().uuid(),
@@ -17,6 +23,28 @@ const taskInput = z.object({
   attachmentIds: z.array(z.string().uuid()).max(10).default([]),
 });
 const feedbackInput = z.object({ rating: z.number().int().min(1).max(5), comment: z.string().max(4000).optional() });
+
+function publicTask(row: Record<string, unknown>) {
+  return { ...row, error: row.error == null ? null : serializeRuntimeError(row.error) };
+}
+
+function publicEvent(row: Record<string, unknown>) {
+  return {
+    ...row,
+    message: redactRuntimeMessage(String(row.message ?? '')),
+    payload: redactRuntimeValue(row.payload ?? {}),
+  };
+}
+
+function publicAuthorization(row: Record<string, unknown>) {
+  const error = row.runtime_error ?? row.error_message;
+  const serialized = error == null ? null : serializeRuntimeError(error);
+  return {
+    ...row,
+    error_message: serialized?.message ?? null,
+    runtime_error: serialized,
+  };
+}
 
 export async function taskRoutes(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => {
@@ -40,7 +68,7 @@ export async function taskRoutes(app: FastifyInstance) {
        LIMIT 100`,
       [request.user.workspaceId],
     );
-    return { data: result.rows };
+    return { data: result.rows.map((row) => publicTask(row)) };
   }));
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(taskInput, request.body, reply); if (!input) return;
@@ -56,8 +84,9 @@ export async function taskRoutes(app: FastifyInstance) {
       if (available.rowCount !== attachmentIds.length) return reply.code(409).send({ error: 'FILE_ATTACHMENTS_NOT_READY_OR_MISSING' });
     }
     await assertWorkspaceAiBudgetAvailable(request.user.workspaceId);
+    const trace = createTraceContext();
     const client = await db.connect();
-    let task: { id: string; title: string; [key: string]: unknown };
+    let task: { id: string; title: string; trace_id: string; [key: string]: unknown };
     try {
       await client.query('BEGIN');
       const manifest = await buildTaskManifest({
@@ -66,10 +95,11 @@ export async function taskRoutes(app: FastifyInstance) {
       }, client);
       const versionId = manifest.agents[input.agentId]?.versionId;
       if (!versionId) throw Object.assign(new Error('AGENT_VERSION_REQUIRED'), { statusCode: 409 });
-      task = (await client.query<{ id: string; title: string; [key: string]: unknown }>(
+      task = (await client.query<{ id: string; title: string; trace_id: string; [key: string]: unknown }>(
         `INSERT INTO tasks(
-           workspace_id,agent_id,agent_version_id,title,input,requested_by,manifest_version,execution_manifest
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+           workspace_id,agent_id,agent_version_id,title,input,requested_by,manifest_version,execution_manifest,
+           trace_id,span_id,parent_span_id
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
         [
           request.user.workspaceId,
           input.agentId,
@@ -79,6 +109,9 @@ export async function taskRoutes(app: FastifyInstance) {
           request.user.sub,
           manifest.manifestVersion,
           JSON.stringify(manifest),
+          trace.traceId,
+          trace.spanId,
+          trace.parentSpanId,
         ],
       )).rows[0];
       await client.query('COMMIT');
@@ -89,6 +122,7 @@ export async function taskRoutes(app: FastifyInstance) {
       client.release();
     }
     if (attachmentIds.length) {
+      const attachmentTrace = childTraceContext(trace);
       await query(
         `INSERT INTO task_attachments(task_id,file_id,workspace_id,attached_by)
          SELECT $1,id,$2,$3 FROM files WHERE workspace_id=$2 AND id=ANY($4::uuid[])
@@ -96,8 +130,19 @@ export async function taskRoutes(app: FastifyInstance) {
         [task.id, request.user.workspaceId, request.user.sub, attachmentIds],
       );
       await query(
-        'INSERT INTO task_events(workspace_id,task_id,event_type,message,payload) VALUES($1,$2,$3,$4,$5)',
-        [request.user.workspaceId, task.id, 'attachments.ready', `${attachmentIds.length} attachment${attachmentIds.length === 1 ? '' : 's'} added`, JSON.stringify({ fileIds: attachmentIds })],
+        `INSERT INTO task_events(
+           workspace_id,task_id,event_type,message,payload,trace_id,span_id,parent_span_id
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          request.user.workspaceId,
+          task.id,
+          'attachments.ready',
+          `${attachmentIds.length} attachment${attachmentIds.length === 1 ? '' : 's'} added`,
+          JSON.stringify({ fileIds: attachmentIds }),
+          attachmentTrace.traceId,
+          attachmentTrace.spanId,
+          attachmentTrace.parentSpanId,
+        ],
       );
     }
     const taskPayload = input.input ?? {};
@@ -106,8 +151,22 @@ export async function taskRoutes(app: FastifyInstance) {
     if (artifactFormats.length) {
       await requestTaskArtifacts({ workspaceId: request.user.workspaceId, createdBy: request.user.sub, taskId: task.id, title: task.title, formats: artifactFormats, ready: false });
     }
-    await query('INSERT INTO task_events(workspace_id,task_id,event_type,message) VALUES($1,$2,$3,$4)', [request.user.workspaceId, task.id, 'task.queued', 'Task queued for execution']);
-    await enqueueTask(task.id);
+    const queuedTrace = childTraceContext(trace);
+    await query(
+      `INSERT INTO task_events(
+         workspace_id,task_id,event_type,message,trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        request.user.workspaceId,
+        task.id,
+        'task.queued',
+        'Task queued for execution',
+        queuedTrace.traceId,
+        queuedTrace.spanId,
+        queuedTrace.parentSpanId,
+      ],
+    );
+    await enqueueTask(task.id, task.id, task.trace_id);
     await audit(request.user.workspaceId, request.user.sub, 'task.created', 'task', task.id, { agentId: input.agentId, attachmentIds });
     return reply.code(202).send({ ...task, attachmentIds });
   }));
@@ -125,7 +184,7 @@ export async function taskRoutes(app: FastifyInstance) {
         const events = await query<{ created_at: Date; event_type: string; message: string; payload: Record<string, unknown> }>('SELECT created_at,event_type,message,payload FROM task_events WHERE task_id=$1 AND workspace_id=$2 AND created_at > $3 ORDER BY created_at', [id, request.user.workspaceId, lastTimestamp]);
         for (const event of events.rows) {
           lastTimestamp = event.created_at.toISOString();
-          reply.raw.write(`event: task-event\ndata: ${JSON.stringify(event)}\n\n`);
+          reply.raw.write(`event: task-event\ndata: ${JSON.stringify(publicEvent(event))}\n\n`);
         }
       } catch { reply.raw.write('event: error\ndata: {"error":"STREAM_QUERY_FAILED"}\n\n'); }
     };
@@ -143,7 +202,7 @@ export async function taskRoutes(app: FastifyInstance) {
       query('SELECT * FROM task_events WHERE task_id=$1 AND workspace_id=$2 ORDER BY created_at', [id, request.user.workspaceId]),
       query('SELECT * FROM artifacts WHERE task_id=$1 AND workspace_id=$2 ORDER BY created_at', [id, request.user.workspaceId]),
       query(`SELECT id,adapter,resource_id,operation,target_summary,risk_level,arguments_summary,arguments_hash,
-             status,requested_at,expires_at,resolved_at,consumed_at,error_message
+             status,requested_at,expires_at,resolved_at,consumed_at,error_message,runtime_error
              FROM action_authorizations WHERE task_id=$1 AND workspace_id=$2 ORDER BY requested_at`, [id, request.user.workspaceId]),
       query(
         `SELECT file.id,file.original_name,file.extension,file.mime_type,file.size_bytes,file.status,file.scan_status,
@@ -155,7 +214,13 @@ export async function taskRoutes(app: FastifyInstance) {
         [id, request.user.workspaceId],
       ),
     ]);
-    return { ...task.rows[0], events: events.rows, artifacts: artifacts.rows, actionAuthorizations: actionAuthorizations.rows, attachments: attachments.rows };
+    return {
+      ...publicTask(task.rows[0]),
+      events: events.rows.map((row) => publicEvent(row)),
+      artifacts: artifacts.rows,
+      actionAuthorizations: actionAuthorizations.rows.map((row) => publicAuthorization(row)),
+      attachments: attachments.rows,
+    };
   }));
   app.post('/:id/cancel', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const result = await query("UPDATE tasks SET status='cancelled',completed_at=now(),updated_at=now() WHERE id=$1 AND workspace_id=$2 AND status IN ('queued','running','awaiting_approval') RETURNING *", [(request.params as { id: string }).id, request.user.workspaceId]);
@@ -169,7 +234,25 @@ export async function taskRoutes(app: FastifyInstance) {
     await query("UPDATE mcp_tool_confirmations SET status='expired',resolved_at=now() WHERE tool_call_id IN (SELECT id FROM mcp_tool_calls WHERE task_id=$1) AND status='pending'", [result.rows[0].id]);
     await query("UPDATE mcp_tool_calls SET status='cancelled',completed_at=now() WHERE task_id=$1 AND status IN ('pending','awaiting_confirmation')", [result.rows[0].id]);
     await query("UPDATE artifacts SET status='failed',error_message='Source task was cancelled',updated_at=now() WHERE task_id=$1 AND status='pending'", [result.rows[0].id]);
-    await query('INSERT INTO task_events(workspace_id,task_id,event_type,message) VALUES($1,$2,$3,$4)', [request.user.workspaceId, result.rows[0].id, 'task.cancelled', 'Task cancelled by user']);
+    const cancellationTrace = childTraceContext({
+      traceId: result.rows[0].trace_id,
+      spanId: result.rows[0].span_id,
+      parentSpanId: result.rows[0].parent_span_id,
+    });
+    await query(
+      `INSERT INTO task_events(
+         workspace_id,task_id,event_type,message,trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        request.user.workspaceId,
+        result.rows[0].id,
+        'task.cancelled',
+        'Task cancelled by user',
+        cancellationTrace.traceId,
+        cancellationTrace.spanId,
+        cancellationTrace.parentSpanId,
+      ],
+    );
     return result.rows[0];
   }));
   app.put('/:id/feedback', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {

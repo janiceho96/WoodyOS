@@ -12,6 +12,8 @@ import { agentSolutionSchema, parseAgentSolution } from '../solutions/schema.js'
 import { assertWorkspaceAiBudgetAvailable } from '../lib/ai-usage.js';
 import type { WorkflowDefinition } from '../workflows/definition.js';
 import { retrieveExplicitFileContext } from '../files/context.js';
+import { createTraceContext } from '../runtime/trace.js';
+import { serializeRuntimeError } from '../runtime/errors.js';
 
 const compileInput = z.object({
   prompt: z.string().min(20).max(50_000),
@@ -155,12 +157,16 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     const trigger = definition.nodes.find((node) => node.type === 'trigger');
     if (!trigger) return reply.code(409).send({ error: 'SOLUTION_WORKFLOW_TRIGGER_MISSING' });
     const initialState = { ...runInput, input: runInput, nodes: {}, variables: {} };
+    const trace = createTraceContext();
     const run = await query(
-      `INSERT INTO workflow_runs(workspace_id,workflow_id,input,definition_snapshot,state,cursor,run_mode,draft_revision)
-       VALUES($1,$2,$3,$4,$5,$6,'test',$7) RETURNING *`,
+      `INSERT INTO workflow_runs(
+         workspace_id,workflow_id,input,definition_snapshot,state,cursor,run_mode,draft_revision,
+         trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,'test',$7,$8,$9,$10) RETURNING *`,
       [
         request.user.workspaceId, workflowId, JSON.stringify(runInput), JSON.stringify(definition),
         JSON.stringify(initialState), JSON.stringify({ nodeId: trigger.id, loops: {}, attempt: 1 }), workflow.rows[0].draft_revision,
+        trace.traceId, trace.spanId, trace.parentSpanId,
       ],
     );
     await query(
@@ -168,11 +174,12 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
       [run.rows[0].id, params.id],
     );
     try {
-      await enqueueWorkflowRun(run.rows[0].id);
-    } catch {
+      await enqueueWorkflowRun(run.rows[0].id, run.rows[0].id, 0, run.rows[0].trace_id);
+    } catch (queueError) {
+      const error = serializeRuntimeError(queueError);
       await query(
-        "UPDATE workflow_runs SET status='failed',output=$1,completed_at=now(),updated_at=now() WHERE id=$2",
-        [JSON.stringify({ error: 'Workflow queue is unavailable' }), run.rows[0].id],
+        "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3",
+        [JSON.stringify({ error }), JSON.stringify(error), run.rows[0].id],
       );
       return reply.code(503).send({ error: 'WORKFLOW_QUEUE_UNAVAILABLE' });
     }

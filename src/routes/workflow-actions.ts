@@ -6,6 +6,7 @@ import { asyncRoute, parse } from '../lib/http.js';
 import { enqueueWorkflowRun } from '../queue/task-queue.js';
 import { assertWorkflowManifestDependencies } from '../runtime/manifest.js';
 import type { WorkflowDefinition } from '../workflows/definition.js';
+import { serializeRuntimeError } from '../runtime/errors.js';
 
 const paramsSchema = z.object({ id: z.string().uuid() });
 const decisionSchema = z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2_000).optional() });
@@ -25,9 +26,10 @@ export async function workflowActionRoutes(app: FastifyInstance) {
         workflow_version_id: string;
         definition_snapshot: WorkflowDefinition;
         execution_manifest: unknown;
+        trace_id: string;
       }>(
         `SELECT authorization.workflow_run_id,run.run_mode,run.workflow_version_id,
-                run.definition_snapshot,run.execution_manifest
+                run.definition_snapshot,run.execution_manifest,run.trace_id
          FROM action_authorizations authorization
          JOIN workflow_runs run ON run.id=authorization.workflow_run_id
          WHERE authorization.id=$1 AND authorization.workspace_id=$2
@@ -65,10 +67,11 @@ export async function workflowActionRoutes(app: FastifyInstance) {
           [workflowRunId, request.user.workspaceId],
         );
       } else {
+        const error = serializeRuntimeError('External action was rejected by the user');
         await client.query(
-          `UPDATE workflow_runs SET status='cancelled',output=$1,completed_at=now(),updated_at=now()
-           WHERE id=$2 AND workspace_id=$3 AND status='awaiting_approval'`,
-          [JSON.stringify({ error: 'External action was rejected by the user' }), workflowRunId, request.user.workspaceId],
+          `UPDATE workflow_runs SET status='cancelled',output=$1,error=$2,completed_at=now(),updated_at=now()
+           WHERE id=$3 AND workspace_id=$4 AND status='awaiting_approval'`,
+          [JSON.stringify({ error }), JSON.stringify(error), workflowRunId, request.user.workspaceId],
         );
         await client.query(
           "UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'",
@@ -84,9 +87,17 @@ export async function workflowActionRoutes(app: FastifyInstance) {
     }
     if (input.decision === 'approved') {
       try {
-        await enqueueWorkflowRun(workflowRunId, `${workflowRunId}-action-${params.id}-approved`);
+        const traceId = (await query<{ trace_id: string }>(
+          'SELECT trace_id FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
+          [workflowRunId, request.user.workspaceId],
+        )).rows[0]?.trace_id;
+        await enqueueWorkflowRun(workflowRunId, `${workflowRunId}-action-${params.id}-approved`, 0, traceId);
       } catch (error) {
-        await query("UPDATE workflow_runs SET status='failed',output=$1,completed_at=now(),updated_at=now() WHERE id=$2 AND status='queued'", [JSON.stringify({ error: 'Workflow could not resume after action confirmation' }), workflowRunId]);
+        const serialized = serializeRuntimeError(error);
+        await query(
+          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued'",
+          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), workflowRunId],
+        );
         throw error;
       }
     }

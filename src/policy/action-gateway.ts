@@ -2,6 +2,8 @@ import { query } from '../db/client.js';
 import { actionArgumentHash, limitedActionResult, safeActionSummary } from '../lib/action-safety.js';
 import { decryptJsonWithContext, encryptJsonWithContext, type EncryptedPayload } from '../lib/crypto.js';
 import type { WorkflowNodeRisk } from '../workflows/registry.js';
+import { serializeRuntimeError } from '../runtime/errors.js';
+import type { TraceContext } from '../runtime/trace.js';
 
 export type ActionAdapter = 'api' | 'mcp' | 'browser';
 export type ActionSubject =
@@ -29,6 +31,7 @@ export type ActionRequest = {
   arguments: Record<string, unknown>;
   requestedBy: string;
   targetSummary?: string | null;
+  trace: TraceContext;
 };
 
 export type WorkflowActionAdapter = ActionAdapter;
@@ -47,6 +50,7 @@ export type WorkflowActionRequest = WorkflowActionIdentity & {
   arguments: Record<string, unknown>;
   requestedBy: string;
   targetSummary?: string | null;
+  trace: TraceContext;
 };
 
 type AuthorizationRow = {
@@ -130,8 +134,9 @@ export async function authorizeAction(input: ActionRequest) {
     inserted = await query<{ id: string }>(
       `INSERT INTO action_authorizations(
          workspace_id,subject_type,workflow_run_id,task_id,agent_id,node_id,iteration_key,attempt,action_key,
-         adapter,resource_id,operation,target_summary,risk_level,arguments_summary,arguments_hash,status,requested_by,resolved_at
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,CASE WHEN $17='approved' THEN now() ELSE NULL END)
+         adapter,resource_id,operation,target_summary,risk_level,arguments_summary,arguments_hash,status,requested_by,resolved_at,
+         trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,CASE WHEN $17='approved' THEN now() ELSE NULL END,$19,$20,$21)
        RETURNING id`,
       [
         input.workspaceId,
@@ -152,6 +157,9 @@ export async function authorizeAction(input: ActionRequest) {
         hash,
         status,
         input.requestedBy,
+        input.trace.traceId,
+        input.trace.spanId,
+        input.trace.parentSpanId,
       ],
     );
   } catch (error) {
@@ -181,6 +189,7 @@ export function authorizeWorkflowAction(input: WorkflowActionRequest) {
     arguments: input.arguments,
     requestedBy: input.requestedBy,
     targetSummary: input.targetSummary,
+    trace: input.trace,
   });
 }
 
@@ -212,11 +221,12 @@ export async function completeAction(authorizationId: string, result: unknown) {
 export const completeWorkflowAction = completeAction;
 
 export async function failAction(authorizationId: string, error: unknown) {
-  const message = (error instanceof Error ? error.message : 'External action failed').slice(0, 2_000);
+  const serialized = serializeRuntimeError(error);
   await query(
-    `UPDATE action_authorizations SET status='failed',error_message=$1,consumed_at=now()
-     WHERE id=$2 AND status='executing'`,
-    [message, authorizationId],
+    `UPDATE action_authorizations
+        SET status='failed',error_message=$1,runtime_error=$2,consumed_at=now()
+      WHERE id=$3 AND status='executing'`,
+    [serialized.message, JSON.stringify(serialized), authorizationId],
   );
 }
 

@@ -1,5 +1,16 @@
 import type { WorkflowDefinition, WorkflowNode } from '../definition.js';
 import type { ExecutionManifest } from '../../runtime/manifest.js';
+import type { TraceContext } from '../../runtime/trace.js';
+
+type BaseExecutionContext = {
+  trace: TraceContext;
+  signal: AbortSignal;
+};
+
+export type ExecutionContext = BaseExecutionContext & (
+  | { mode: 'production'; manifest: ExecutionManifest }
+  | { mode: 'test'; manifest: null }
+);
 
 export type LoopCursor = { iteration: number };
 export type WorkflowCursor = { nodeId: string; loops: Record<string, LoopCursor>; attempt: number; previousNodeId?: string };
@@ -15,13 +26,16 @@ export type WorkflowRunRecord = {
   step_count: number;
   run_mode?: 'test' | 'production';
   execution_manifest?: ExecutionManifest | null;
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string | null;
   test_target_node_id?: string | null;
   name: string;
   created_by: string;
 };
 
 export type AgentTaskResult = null | Record<string, unknown>;
-export type AgentTaskExecutor = (taskId: string) => Promise<AgentTaskResult>;
+export type AgentTaskExecutor = (taskId: string, traceId?: string) => Promise<AgentTaskResult>;
 
 export type WorkflowAdapterExecution = {
   output: unknown;
@@ -32,12 +46,13 @@ export type WorkflowAdapterExecution = {
 };
 
 export type WorkflowAdapterContext = {
+  execution: ExecutionContext;
   run: WorkflowRunRecord;
   node: WorkflowNode;
   cursor: WorkflowCursor;
   iterationKey: string;
   executeAgentTask: AgentTaskExecutor;
-  emitEvent: (type: string, message: string, payload?: Record<string, unknown>) => Promise<void>;
+  emitEvent: (type: string, message: string, payload?: Record<string, unknown>, trace?: TraceContext) => Promise<void>;
   resolve: (value: unknown) => unknown;
   setNodeOutput: (value: unknown) => void;
 };

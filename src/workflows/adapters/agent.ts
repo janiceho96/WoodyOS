@@ -1,21 +1,23 @@
 import { query } from '../../db/client.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { resolveNodeInput } from './templates.js';
+import { childTraceContext } from '../../runtime/trace.js';
 
 function json(value: unknown) {
   return JSON.stringify(value === undefined ? null : value);
 }
 
 export async function executeAgentNode(context: WorkflowAdapterContext) {
-  const { run, node, cursor, iterationKey, executeAgentTask, setNodeOutput } = context;
+  const { execution, run, node, cursor, iterationKey, executeAgentTask, setNodeOutput } = context;
   const agentId = node.config.agentId;
   if (typeof agentId !== 'string') throw new Error(`Agent node ${node.id} has no agentId`);
-  let task = (await query<{ id: string; status: string; output: unknown; error: unknown }>(
-    `SELECT id,status,output,error FROM tasks
+  let task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
+    `SELECT id,status,output,error,trace_id FROM tasks
      WHERE workflow_run_id=$1 AND workflow_node_id=$2 AND workflow_iteration_key=$3 AND workflow_attempt=$4`,
     [run.id, node.id, iterationKey, cursor.attempt],
   )).rows[0];
   if (!task) {
+    const agentTrace = childTraceContext(execution.trace);
     const inputMapping = node.config.inputMapping && typeof node.config.inputMapping === 'object' && !Array.isArray(node.config.inputMapping)
       ? node.config.inputMapping as Record<string, unknown>
       : undefined;
@@ -31,11 +33,13 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
         retryable: false,
       });
     }
-    task = (await query<{ id: string; status: string; output: unknown; error: unknown }>(
+    task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
       `INSERT INTO tasks(
          workspace_id,agent_id,agent_version_id,workflow_run_id,workflow_node_id,workflow_iteration_key,
-         workflow_attempt,title,input,requested_by,manifest_version,execution_manifest
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,status,output,error`,
+         workflow_attempt,title,input,requested_by,manifest_version,execution_manifest,
+         trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       RETURNING id,status,output,error,trace_id`,
       [
         run.workspace_id,
         agentId,
@@ -49,14 +53,17 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
         run.created_by,
         run.execution_manifest?.manifestVersion ?? 1,
         run.execution_manifest ? json(run.execution_manifest) : null,
+        agentTrace.traceId,
+        agentTrace.spanId,
+        agentTrace.parentSpanId,
       ],
     )).rows[0];
   }
   if (task.status === 'failed') throw new Error(typeof task.error === 'object' && task.error && 'message' in task.error ? String((task.error as { message: unknown }).message) : `Agent node ${node.id} failed`);
-  let output = task.status === 'completed' ? task.output : await executeAgentTask(task.id);
+  let output = task.status === 'completed' ? task.output : await executeAgentTask(task.id, task.trace_id);
   if (output && typeof output === 'object' && 'awaitingApproval' in output) return { waiting: true, waitingMessage: 'Agent tool confirmation is required', output };
   if (output === null) {
-    task = (await query<{ id: string; status: string; output: unknown; error: unknown }>('SELECT id,status,output,error FROM tasks WHERE id=$1', [task.id])).rows[0];
+    task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>('SELECT id,status,output,error,trace_id FROM tasks WHERE id=$1', [task.id])).rows[0];
     if (task?.status === 'completed') output = task.output as Record<string, unknown>;
     else if (task?.status === 'awaiting_approval') return { waiting: true, waitingMessage: 'Agent tool confirmation is required', output: null };
     else throw new Error(`Agent node ${node.id} did not produce an output`);

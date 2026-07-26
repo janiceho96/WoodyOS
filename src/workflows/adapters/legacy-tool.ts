@@ -3,9 +3,10 @@ import { invokeTool, toolRequiresApproval, type ToolRecord } from '../../tools/r
 import { retryPolicy } from '../definition.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
+import { childTraceContext } from '../../runtime/trace.js';
 
 export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
-  const { run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
   await assertWorkflowRunManifestDependencies(run);
   const toolId = node.config.toolId;
   if (typeof toolId !== 'string') throw new Error(`Action node ${node.id} has no toolId`);
@@ -25,9 +26,10 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   }
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : run.state;
   const input = resolve(configuredInput) as Record<string, unknown>;
-  await emitEvent('tool.called', `Calling ${tool.name}`, { toolId: tool.id, iterationKey, attempt: cursor.attempt });
+  const actionTrace = childTraceContext(execution.trace);
+  await emitEvent('tool.called', `Calling ${tool.name}`, { toolId: tool.id, iterationKey, attempt: cursor.attempt }, actionTrace);
   const output = await invokeTool(tool, input);
-  await emitEvent('tool.completed', `${tool.name} completed`, { toolId: tool.id, iterationKey, attempt: cursor.attempt });
+  await emitEvent('tool.completed', `${tool.name} completed`, { toolId: tool.id, iterationKey, attempt: cursor.attempt }, actionTrace);
   setNodeOutput(output);
   return { output, result: output };
 }

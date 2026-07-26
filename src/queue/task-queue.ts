@@ -7,8 +7,10 @@ export const WORKFLOW_QUEUE = 'workflow-runs';
 export const KNOWLEDGE_QUEUE = 'knowledge-ingestion';
 export const ARTIFACT_QUEUE = 'artifact-generation';
 export const FILE_QUEUE = 'file-processing';
-let queue: Queue<{ taskId: string }> | undefined;
-let workflowQueue: Queue<{ workflowRunId: string }> | undefined;
+export type TaskJobData = { taskId: string; traceId: string };
+export type WorkflowJobData = { workflowRunId: string; traceId: string };
+let queue: Queue<TaskJobData> | undefined;
+let workflowQueue: Queue<WorkflowJobData> | undefined;
 let knowledgeQueue: Queue<{ documentId: string }> | undefined;
 let artifactQueue: Queue<{ artifactId: string }> | undefined;
 let fileQueue: Queue<{ fileId: string }> | undefined;
@@ -20,21 +22,31 @@ export function queueJobId(phaseId: string) {
 function taskQueue() {
   if (!queue) {
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
-    queue = new Queue<{ taskId: string }>(TASK_QUEUE, { connection });
+    queue = new Queue<TaskJobData>(TASK_QUEUE, { connection });
   }
   return queue;
 }
 
-export async function enqueueTask(taskId: string, phaseId = taskId) {
-  await taskQueue().add('execute', { taskId }, { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+export function taskJobData(taskId: string, traceId: string): TaskJobData {
+  return { taskId, traceId };
 }
 
-export async function enqueueWorkflowRun(workflowRunId: string, phaseId = workflowRunId, delay = 0) {
+export function workflowJobData(workflowRunId: string, traceId: string): WorkflowJobData {
+  return { workflowRunId, traceId };
+}
+
+export async function enqueueTask(taskId: string, phaseId = taskId, traceId?: string) {
+  if (!traceId) throw new Error('TRACE_CONTEXT_REQUIRED');
+  await taskQueue().add('execute', taskJobData(taskId, traceId), { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+}
+
+export async function enqueueWorkflowRun(workflowRunId: string, phaseId = workflowRunId, delay = 0, traceId?: string) {
+  if (!traceId) throw new Error('TRACE_CONTEXT_REQUIRED');
   if (!workflowQueue) {
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
-    workflowQueue = new Queue<{ workflowRunId: string }>(WORKFLOW_QUEUE, { connection });
+    workflowQueue = new Queue<WorkflowJobData>(WORKFLOW_QUEUE, { connection });
   }
-  await workflowQueue.add('execute', { workflowRunId }, { jobId: queueJobId(phaseId), delay, removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+  await workflowQueue.add('execute', workflowJobData(workflowRunId, traceId), { jobId: queueJobId(phaseId), delay, removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
 }
 
 export async function enqueueKnowledgeDocument(documentId: string) {

@@ -2,9 +2,10 @@ import { authorizedMcpTool, executeAuthorizedMcpTool } from '../../mcp/runtime.j
 import { authorizeWorkflowAction, beginWorkflowAction, completeWorkflowAction, failWorkflowAction } from '../../policy/action-gateway.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
+import { childTraceContext } from '../../runtime/trace.js';
 
 export async function executeMcpActionNode(context: WorkflowAdapterContext) {
-  const { run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
   await assertWorkflowRunManifestDependencies(run);
   const agentId = node.config.agentId;
   const mcpToolId = node.config.mcpToolId;
@@ -14,6 +15,7 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : {};
   const arguments_ = resolve(configuredInput) as Record<string, unknown>;
   const actionName = tool.title ?? tool.remote_name;
+  const actionTrace = childTraceContext(execution.trace);
   const authorization = await authorizeWorkflowAction({
     workspaceId: run.workspace_id,
     workflowRunId: run.id,
@@ -27,9 +29,10 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
     arguments: arguments_,
     requestedBy: run.created_by,
     targetSummary: `${actionName} via ${tool.connection_name}`,
+    trace: actionTrace,
   });
   if (authorization.status === 'awaiting_confirmation') {
-    await emitEvent('action.confirmation_requested', `Confirmation is required before ${actionName}`, { authorizationId: authorization.authorizationId, toolId: tool.id, riskLevel: tool.risk_level });
+    await emitEvent('action.confirmation_requested', `Confirmation is required before ${actionName}`, { authorizationId: authorization.authorizationId, toolId: tool.id, riskLevel: tool.risk_level }, actionTrace);
     return { waiting: true, waitingMessage: `Confirm ${actionName} before Woody continues`, output: null };
   }
   if (authorization.status === 'denied') throw Object.assign(new Error(authorization.reason), { retryable: false });
@@ -38,7 +41,7 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
     return { output: authorization.result, result: authorization.result };
   }
   if (!(await beginWorkflowAction(authorization.authorizationId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
-  await emitEvent('mcp.tool.called', `Calling ${actionName}`, { authorizationId: authorization.authorizationId, toolId: tool.id });
+  await emitEvent('mcp.tool.called', `Calling ${actionName}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
   try {
     const executed = await executeAuthorizedMcpTool({
       tool,
@@ -50,9 +53,10 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
       workflowIterationKey: iterationKey,
       workflowAttempt: cursor.attempt,
       actionAuthorizationId: authorization.authorizationId,
+      trace: childTraceContext(actionTrace),
     });
     await completeWorkflowAction(authorization.authorizationId, executed.result);
-    await emitEvent('mcp.tool.completed', `${actionName} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.callId, toolId: tool.id });
+    await emitEvent('mcp.tool.completed', `${actionName} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.callId, toolId: tool.id }, actionTrace);
     setNodeOutput(executed.result);
     return { output: executed.result, result: executed.result };
   } catch (error) {

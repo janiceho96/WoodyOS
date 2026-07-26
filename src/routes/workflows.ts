@@ -16,6 +16,12 @@ import {
   validateManifestCompatibility,
   type ExecutionManifest,
 } from '../runtime/manifest.js';
+import { createTraceContext } from '../runtime/trace.js';
+import {
+  redactRuntimeMessage,
+  redactRuntimeValue,
+  serializeRuntimeError,
+} from '../runtime/errors.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -31,6 +37,29 @@ type WorkflowRecord = {
   draft_revision: number;
   published_version_id: string | null;
 };
+
+function publicWorkflowError(value: unknown) {
+  return value == null ? null : serializeRuntimeError(value);
+}
+
+function publicWorkflowEvent(row: Record<string, unknown>) {
+  return {
+    ...row,
+    message: redactRuntimeMessage(String(row.message ?? '')),
+    payload: redactRuntimeValue(row.payload ?? {}),
+  };
+}
+
+function publicWorkflowAuthorization(row: Record<string, unknown>) {
+  const error = publicWorkflowError(row.runtime_error ?? row.error_message);
+  return { ...row, error_message: error?.message ?? null, runtime_error: error };
+}
+
+function publicWorkflowOutput(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !('error' in value)) return value;
+  const output = value as Record<string, unknown>;
+  return { ...output, error: publicWorkflowError(output.error) };
+}
 
 export { workflowDefinitionErrors } from '../workflows/definition.js';
 
@@ -132,6 +161,7 @@ async function createQueuedRun(input: {
   if (!trigger) return { error: 'WORKFLOW_TRIGGER_MISSING' as const };
   const initialState = { ...input.runInput, input: input.runInput, nodes: {}, variables: {} };
   const cursor = { nodeId: trigger.id, loops: {}, attempt: 1 };
+  const trace = createTraceContext();
   const client = await db.connect();
   let run: { rows: Array<{ id: string; [key: string]: unknown }> };
   try {
@@ -146,13 +176,15 @@ async function createQueuedRun(input: {
     run = await client.query<{ id: string; [key: string]: unknown }>(
       `INSERT INTO workflow_runs(
          workspace_id,workflow_id,input,definition_snapshot,state,cursor,workflow_version_id,run_mode,
-         draft_revision,test_target_node_id,manifest_version,execution_manifest
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+         draft_revision,test_target_node_id,manifest_version,execution_manifest,
+         trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
       [
         input.workspaceId, input.workflow.id, JSON.stringify(input.runInput), JSON.stringify(input.definition),
         JSON.stringify(initialState), JSON.stringify(cursor), input.workflowVersionId ?? null, input.mode,
         input.mode === 'test' ? input.workflow.draft_revision : null, input.testTargetNodeId ?? null,
         manifest?.manifestVersion ?? 1, manifest ? JSON.stringify(manifest) : null,
+        trace.traceId, trace.spanId, trace.parentSpanId,
       ],
     );
     await client.query('COMMIT');
@@ -167,10 +199,13 @@ async function createQueuedRun(input: {
     .flatMap((node) => (node.config.artifactFormats as unknown[]).map((item) => artifactFormatSchema.safeParse(item)).filter((item) => item.success).map((item) => item.data)))];
   if (formats.length) await requestWorkflowArtifacts({ workspaceId: input.workspaceId, createdBy: input.userId, workflowRunId: run.rows[0].id, title: input.workflow.name, formats, ready: false });
   try {
-    await enqueueWorkflowRun(run.rows[0].id);
+    await enqueueWorkflowRun(run.rows[0].id, run.rows[0].id, 0, String(run.rows[0].trace_id));
   } catch (queueError) {
-    const message = (queueError instanceof Error ? queueError.message : 'Workflow queue unavailable').slice(0, 2000);
-    await query("UPDATE workflow_runs SET status='failed',output=$1,completed_at=now(),updated_at=now() WHERE id=$2", [JSON.stringify({ error: message }), run.rows[0].id]);
+    const error = serializeRuntimeError(queueError);
+    await query(
+      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3",
+      [JSON.stringify({ error }), JSON.stringify(error), run.rows[0].id],
+    );
     await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.rows[0].id]);
     throw queueError;
   }
@@ -456,7 +491,7 @@ export async function workflowRoutes(app: FastifyInstance) {
       query('SELECT * FROM workflow_run_events WHERE workflow_run_id=$1 ORDER BY created_at', [runId]),
       query('SELECT * FROM workflow_approvals WHERE workflow_run_id=$1 ORDER BY requested_at', [runId]),
       query(`SELECT id,node_id,iteration_key,attempt,adapter,resource_id,operation,target_summary,risk_level,
-             arguments_summary,arguments_hash,status,requested_at,expires_at,resolved_at,consumed_at,error_message
+             arguments_summary,arguments_hash,status,requested_at,expires_at,resolved_at,consumed_at,error_message,runtime_error
              FROM action_authorizations WHERE workflow_run_id=$1 ORDER BY requested_at`, [runId]),
       query('SELECT * FROM workflow_run_node_states WHERE workflow_run_id=$1 ORDER BY started_at,attempt', [runId]),
       query('SELECT * FROM artifacts WHERE workflow_run_id=$1 ORDER BY created_at', [runId]),
@@ -472,10 +507,15 @@ export async function workflowRoutes(app: FastifyInstance) {
     const totals = usage.rows[0] ?? { agent_tasks: 0, input_tokens: 0, output_tokens: 0, estimated_cost_usd: '0' };
     return {
       ...run.rows[0],
-      events: events.rows,
+      error: publicWorkflowError(run.rows[0].error),
+      output: publicWorkflowOutput(run.rows[0].output),
+      events: events.rows.map((row) => publicWorkflowEvent(row)),
       approvals: approvals.rows,
-      actionAuthorizations: actionAuthorizations.rows,
-      nodeStates: nodeStates.rows,
+      actionAuthorizations: actionAuthorizations.rows.map((row) => publicWorkflowAuthorization(row)),
+      nodeStates: nodeStates.rows.map((row) => ({
+        ...row,
+        error: publicWorkflowError(row.error),
+      })),
       artifacts: artifacts.rows,
       usage: {
         agentTasks: Number(totals.agent_tasks),
@@ -489,8 +529,8 @@ export async function workflowRoutes(app: FastifyInstance) {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;
     const params = request.params as { runId: string; approvalId: string };
     if (input.decision === 'approved') {
-      const run = (await query<{ run_mode: 'test' | 'production'; execution_manifest: ExecutionManifest | null }>(
-        'SELECT run_mode,execution_manifest FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
+      const run = (await query<{ run_mode: 'test' | 'production'; execution_manifest: ExecutionManifest | null; trace_id: string }>(
+        'SELECT run_mode,execution_manifest,trace_id FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
         [params.runId, request.user.workspaceId],
       )).rows[0];
       const compatibility = run?.run_mode === 'production'
@@ -512,7 +552,11 @@ export async function workflowRoutes(app: FastifyInstance) {
     else {
       await query("UPDATE workflow_runs SET status='queued',updated_at=now() WHERE id=$1", [params.runId]);
       try {
-        await enqueueWorkflowRun(params.runId, `${params.runId}-${params.approvalId}`);
+        const traceId = (await query<{ trace_id: string }>(
+          'SELECT trace_id FROM workflow_runs WHERE id=$1 AND workspace_id=$2',
+          [params.runId, request.user.workspaceId],
+        )).rows[0]?.trace_id;
+        await enqueueWorkflowRun(params.runId, `${params.runId}-${params.approvalId}`, 0, traceId);
       } catch (queueError) {
         await query("UPDATE workflow_approvals SET status='pending',resolved_at=NULL,resolved_by=NULL,comment=NULL WHERE id=$1", [params.approvalId]);
         await query("UPDATE workflow_runs SET status='awaiting_approval',updated_at=now() WHERE id=$1", [params.runId]);

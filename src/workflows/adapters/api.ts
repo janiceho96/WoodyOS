@@ -4,9 +4,10 @@ import { invokeTool, toolRiskLevel, type ToolRecord } from '../../tools/runtime.
 import type { WorkflowAdapterContext } from './types.js';
 import { limitedActionResult } from '../../lib/action-safety.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
+import { childTraceContext } from '../../runtime/trace.js';
 
 export async function executeApiActionNode(context: WorkflowAdapterContext) {
-  const { run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
   await assertWorkflowRunManifestDependencies(run);
   const toolId = node.config.toolId;
   if (typeof toolId !== 'string') throw new Error(`API action ${node.id} has no toolId`);
@@ -17,6 +18,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
   if (!tool) throw Object.assign(new Error(`API action ${node.id} references an unavailable tool`), { retryable: false });
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : run.state;
   const arguments_ = resolve(configuredInput) as Record<string, unknown>;
+  const actionTrace = childTraceContext(execution.trace);
   const authorization = await authorizeWorkflowAction({
     workspaceId: run.workspace_id,
     workflowRunId: run.id,
@@ -30,9 +32,10 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     arguments: arguments_,
     requestedBy: run.created_by,
     targetSummary: tool.name,
+    trace: actionTrace,
   });
   if (authorization.status === 'awaiting_confirmation') {
-    await emitEvent('action.confirmation_requested', `Confirmation is required before ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id });
+    await emitEvent('action.confirmation_requested', `Confirmation is required before ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
     return { waiting: true, waitingMessage: `Confirm ${tool.name} before Woody continues`, output: null };
   }
   if (authorization.status === 'denied') throw Object.assign(new Error(authorization.reason), { retryable: false });
@@ -41,11 +44,11 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     return { output: authorization.result, result: authorization.result };
   }
   if (!(await beginWorkflowAction(authorization.authorizationId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
-  await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id });
+  await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
   try {
     const output = limitedActionResult(await invokeTool(tool, arguments_));
     await completeWorkflowAction(authorization.authorizationId, output);
-    await emitEvent('api.completed', `${tool.name} completed`, { authorizationId: authorization.authorizationId, toolId: tool.id });
+    await emitEvent('api.completed', `${tool.name} completed`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
     setNodeOutput(output);
     return { output, result: output };
   } catch (error) {

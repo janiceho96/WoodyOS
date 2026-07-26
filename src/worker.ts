@@ -5,7 +5,16 @@ import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { lookup } from 'node:dns/promises';
 import { query } from './db/client.js';
-import { ARTIFACT_QUEUE, TASK_QUEUE, WORKFLOW_QUEUE, KNOWLEDGE_QUEUE, FILE_QUEUE, enqueueWorkflowRun } from './queue/task-queue.js';
+import {
+  ARTIFACT_QUEUE,
+  TASK_QUEUE,
+  WORKFLOW_QUEUE,
+  KNOWLEDGE_QUEUE,
+  FILE_QUEUE,
+  enqueueWorkflowRun,
+  type TaskJobData,
+  type WorkflowJobData,
+} from './queue/task-queue.js';
 import { definitionFor, invokeTool, toolRiskLevel, type ToolRecord } from './tools/runtime.js';
 import { embeddingFor } from './lib/embeddings.js';
 import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from './lib/ai-provider.js';
@@ -39,6 +48,12 @@ import {
 } from './runtime/manifest.js';
 import type { AgentVersionSnapshot } from './agents/versions.js';
 import type { WorkflowDefinition } from './workflows/definition.js';
+import { redactRuntimeMessage, redactRuntimeValue, serializeRuntimeError } from './runtime/errors.js';
+import {
+  authoritativeTraceContext,
+  childTraceContext,
+  type TraceContext,
+} from './runtime/trace.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
 type Agent = {
@@ -63,6 +78,9 @@ type Task = {
   workflow_node_id: string | null;
   agent_version_id: string | null;
   execution_manifest: ExecutionManifest | null;
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string | null;
 };
 function openAiToolDefinitions(tools: ToolRecord[]): ChatCompletionTool[] {
   return tools.map((tool) => {
@@ -97,13 +115,36 @@ async function assertPublicHttpsUrl(raw: string) {
   return address;
 }
 
-async function taskEvent(workspaceId: string, taskId: string, type: string, message: string, payload: Record<string, unknown> = {}) {
-  await query('INSERT INTO task_events(workspace_id,task_id,event_type,message,payload) VALUES($1,$2,$3,$4,$5)', [workspaceId, taskId, type, message, JSON.stringify(payload)]);
+async function taskEvent(
+  workspaceId: string,
+  taskId: string,
+  type: string,
+  message: string,
+  payload: Record<string, unknown> = {},
+  parentTrace?: TraceContext,
+) {
+  const authoritative = parentTrace ?? authoritativeTraceContext((await query<{
+    trace_id: string;
+    span_id: string;
+    parent_span_id: string | null;
+  }>('SELECT trace_id,span_id,parent_span_id FROM tasks WHERE id=$1 AND workspace_id=$2', [taskId, workspaceId])).rows[0] ?? {});
+  const trace = childTraceContext(authoritative);
+  await query(
+    `INSERT INTO task_events(
+       workspace_id,task_id,event_type,message,payload,trace_id,span_id,parent_span_id
+     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [
+      workspaceId,
+      taskId,
+      type,
+      redactRuntimeMessage(message),
+      JSON.stringify(redactRuntimeValue(payload)),
+      trace.traceId,
+      trace.spanId,
+      trace.parentSpanId,
+    ],
+  );
 }
-async function workflowEvent(workspaceId: string, runId: string, nodeId: string | null, type: string, message: string, payload: Record<string, unknown> = {}) {
-  await query('INSERT INTO workflow_run_events(workspace_id,workflow_run_id,node_id,event_type,message,payload) VALUES($1,$2,$3,$4,$5,$6)', [workspaceId, runId, nodeId, type, message, JSON.stringify(payload)]);
-}
-
 type TaskToolAction =
   | { adapter: 'api'; tool: ToolRecord }
   | { adapter: 'mcp'; tool: AuthorizedMcpTool };
@@ -142,10 +183,17 @@ async function assertTaskExecutionDependencies(task: Task) {
   return { testRun: false };
 }
 
-async function authorizeTaskToolAction(task: Task, providerCallId: string, action: TaskToolAction, arguments_: Record<string, unknown>) {
+async function authorizeTaskToolAction(
+  task: Task,
+  providerCallId: string,
+  action: TaskToolAction,
+  arguments_: Record<string, unknown>,
+  parentTrace: TraceContext,
+) {
   await assertTaskExecutionDependencies(task);
   if (action.adapter === 'mcp') assertMcpPermission(action.tool);
-  return authorizeAction({
+  const trace = childTraceContext(parentTrace);
+  const authorization = await authorizeAction({
     workspaceId: task.workspace_id,
     subject: { type: 'task', taskId: task.id, agentId: task.agent_id },
     actionKey: providerCallId,
@@ -156,7 +204,9 @@ async function authorizeTaskToolAction(task: Task, providerCallId: string, actio
     arguments: arguments_,
     requestedBy: task.requested_by,
     targetSummary: action.adapter === 'api' ? action.tool.name : `${actionName(action)} via ${action.tool.connection_name}`,
+    trace,
   });
+  return { ...authorization, trace };
 }
 
 async function executeTaskToolAction(input: {
@@ -165,6 +215,7 @@ async function executeTaskToolAction(input: {
   arguments_: Record<string, unknown>;
   authorizationId: string;
   mcpToolCallId?: string | null;
+  trace: TraceContext;
 }) {
   await assertTaskExecutionDependencies(input.task);
   if (!(await beginAction(input.authorizationId))) throw new Error('External action execution could not be claimed safely');
@@ -178,6 +229,7 @@ async function executeTaskToolAction(input: {
         workflowRunId: input.task.workflow_run_id,
         actionAuthorizationId: input.authorizationId,
         toolCallId: input.mcpToolCallId ?? undefined,
+        trace: childTraceContext(input.trace),
       });
       await completeAction(input.authorizationId, executed.result);
       return { result: executed.result, toolCallId: executed.callId };
@@ -228,22 +280,32 @@ async function runtimeAgentForTask(task: Task): Promise<{ agent: Agent; exactMan
   throw new Error('Agent is missing');
 }
 
-export async function executeAgentTask(taskId: string) {
+export async function executeAgentTask(taskId: string, queuedTraceId?: string) {
+  if (queuedTraceId) {
+    const queuedTask = (await query<Pick<Task, 'trace_id' | 'span_id' | 'parent_span_id'>>(
+      "SELECT trace_id,span_id,parent_span_id FROM tasks WHERE id=$1 AND status='queued'",
+      [taskId],
+    )).rows[0];
+    if (!queuedTask) return null;
+    authoritativeTraceContext(queuedTask, queuedTraceId);
+  }
   const task = (await query<Task>(
     `UPDATE tasks SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
      WHERE id=$1 AND status='queued' RETURNING *`,
     [taskId],
   )).rows[0];
   if (!task) return null;
+  const taskTrace = authoritativeTraceContext(task, queuedTraceId);
   try {
     const { agent, exactManifest } = await runtimeAgentForTask(task);
     const checkpoint = await loadTaskActionCheckpoint(task.workspace_id, task.id);
-    await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`);
+    await taskEvent(task.workspace_id, task.id, checkpoint ? 'task.resumed' : 'task.started', checkpoint ? `${agent.name} resumed after action confirmation` : `${agent.name} started execution`, {}, taskTrace);
     await assertWorkspaceAiBudgetAvailable(task.workspace_id);
     const runtime = assertConfiguredAiProvider(await configuredAiProviderForWorkspace(task.workspace_id));
     const { provider, anthropic, openAiCompatible } = runtime;
     if (checkpoint && checkpoint.state.provider !== provider) throw Object.assign(new Error('The workspace AI provider changed while this task was waiting for confirmation. Start a new run so Woody can build a compatible request.'), { code: 'AI_PROVIDER_CHANGED_DURING_RUN' });
-    await taskEvent(task.workspace_id, task.id, 'model.requested', `Sending task to ${agent.model}`);
+    const modelTrace = childTraceContext(taskTrace);
+    await taskEvent(task.workspace_id, task.id, 'model.requested', `Sending task to ${agent.model}`, {}, modelTrace);
     const toolIds = Array.isArray(agent.tool_ids) ? agent.tool_ids.filter((id): id is string => typeof id === 'string') : [];
     const assignedTools = toolIds.length ? (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE workspace_id=$1 AND enabled=true AND id = ANY($2::uuid[])', [task.workspace_id, toolIds])).rows : [];
     const runtimePolicy = resolveAgentRuntimePolicy(agent, assignedTools);
@@ -313,9 +375,9 @@ export async function executeAgentTask(taskId: string) {
           isError = true;
           if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
         } else {
-          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments);
+          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace);
           if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
-          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId });
+          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId, trace: authorization.trace });
           content = JSON.stringify(executed.result).slice(0, 50_000);
         }
         messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: pending.providerCallId, content, is_error: isError }] });
@@ -362,13 +424,13 @@ export async function executeAgentTask(taskId: string) {
           const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
           const arguments_ = use.input as Record<string, unknown>;
           try {
-            const authorization = await authorizeTaskToolAction(task, use.id, action, arguments_);
+            const authorization = await authorizeTaskToolAction(task, use.id, action, arguments_, modelTrace);
             await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
               authorizationId: authorization.authorizationId,
               adapter: action.adapter,
               toolId: action.tool.id,
               input: safeActionSummary(arguments_),
-            });
+            }, authorization.trace);
             if (authorization.status === 'awaiting_confirmation') {
               const state: TaskActionCheckpointState = {
                 provider: 'anthropic', system, messages, finalText, inputTokens, outputTokens, toolCallCount, nextTurn: turn + 1,
@@ -383,20 +445,21 @@ export async function executeAgentTask(taskId: string) {
                 authorizationId: authorization.authorizationId,
                 state,
                 mcpTool: action.adapter === 'mcp' ? action.tool : undefined,
+                trace: childTraceContext(authorization.trace),
               });
               await taskEvent(task.workspace_id, task.id, 'action.confirmation.requested', 'Human confirmation is required before this action', {
                 authorizationId: authorization.authorizationId,
                 toolCallId: paused.toolCallId,
                 toolId: action.tool.id,
                 riskLevel: action.adapter === 'api' ? toolRiskLevel(action.tool) : action.tool.risk_level,
-              });
+              }, authorization.trace);
               return { awaitingApproval: true, authorizationId: authorization.authorizationId };
             }
             if (authorization.status === 'denied') throw new Error(authorization.reason);
             const executed = authorization.status === 'completed'
               ? { result: authorization.result, toolCallId: null }
-              : await executeTaskToolAction({ task, action, arguments_, authorizationId: authorization.authorizationId });
-            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id });
+              : await executeTaskToolAction({ task, action, arguments_, authorizationId: authorization.authorizationId, trace: authorization.trace });
+            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
             const message = error instanceof Error ? error.message : 'Action failed';
@@ -425,9 +488,9 @@ export async function executeAgentTask(taskId: string) {
           content = 'Tool access was revoked before the approved action executed.';
           if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
         } else {
-          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments);
+          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace);
           if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
-          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId });
+          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId, trace: authorization.trace });
           content = JSON.stringify(executed.result).slice(0, 50_000);
         }
         messages.push({ role: 'tool', tool_call_id: pending.providerCallId, content });
@@ -484,13 +547,13 @@ export async function executeAgentTask(taskId: string) {
           toolCallCount++;
           const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
           try {
-            const authorization = await authorizeTaskToolAction(task, use.id, action, input);
+            const authorization = await authorizeTaskToolAction(task, use.id, action, input, modelTrace);
             await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
               authorizationId: authorization.authorizationId,
               adapter: action.adapter,
               toolId: action.tool.id,
               input: safeActionSummary(input),
-            });
+            }, authorization.trace);
             if (authorization.status === 'awaiting_confirmation') {
               const state: TaskActionCheckpointState = {
                 provider: 'openai-compatible', system, messages, finalText, inputTokens, outputTokens, toolCallCount, nextTurn: turn + 1,
@@ -505,20 +568,21 @@ export async function executeAgentTask(taskId: string) {
                 authorizationId: authorization.authorizationId,
                 state,
                 mcpTool: action.adapter === 'mcp' ? action.tool : undefined,
+                trace: childTraceContext(authorization.trace),
               });
               await taskEvent(task.workspace_id, task.id, 'action.confirmation.requested', 'Human confirmation is required before this action', {
                 authorizationId: authorization.authorizationId,
                 toolCallId: paused.toolCallId,
                 toolId: action.tool.id,
                 riskLevel: action.adapter === 'api' ? toolRiskLevel(action.tool) : action.tool.risk_level,
-              });
+              }, authorization.trace);
               return { awaitingApproval: true, authorizationId: authorization.authorizationId };
             }
             if (authorization.status === 'denied') throw new Error(authorization.reason);
             const executed = authorization.status === 'completed'
               ? { result: authorization.result, toolCallId: null }
-              : await executeTaskToolAction({ task, action, arguments_: input, authorizationId: authorization.authorizationId });
-            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id });
+              : await executeTaskToolAction({ task, action, arguments_: input, authorizationId: authorization.authorizationId, trace: authorization.trace });
+            await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
             const detail = error instanceof Error ? error.message : 'Action failed';
@@ -545,24 +609,28 @@ export async function executeAgentTask(taskId: string) {
     if (checkpoint && task.workflow_run_id && task.workflow_node_id) {
       try {
         await query("UPDATE workflow_runs SET status='queued',updated_at=now() WHERE id=$1 AND status='awaiting_approval'", [task.workflow_run_id]);
-        await enqueueWorkflowRun(task.workflow_run_id, `${task.workflow_run_id}:${task.id}:mcp-resume`);
+        await enqueueWorkflowRun(task.workflow_run_id, `${task.workflow_run_id}:${task.id}:mcp-resume`, 0, task.trace_id);
       } catch (resumeError) {
-        await query("UPDATE workflow_runs SET status='failed',output=$1,completed_at=now(),updated_at=now() WHERE id=$2 AND status='queued'", [JSON.stringify({ error: 'Workflow could not resume after tool approval' }), task.workflow_run_id]);
+        const serialized = serializeRuntimeError(resumeError);
+        await query(
+          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued'",
+          [JSON.stringify({ error: serialized }), JSON.stringify(serialized), task.workflow_run_id],
+        );
         await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [task.workflow_run_id]);
         await taskEvent(task.workspace_id, task.id, 'workflow.resume_failed', 'Task completed, but its workflow could not resume', { error: resumeError instanceof Error ? resumeError.message : 'Workflow queue unavailable' });
       }
     }
     return output;
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown worker error';
-    await query("UPDATE tasks SET status='failed',error=$1,completed_at=now(),updated_at=now() WHERE id=$2", [JSON.stringify({ message }), task.id]);
+    const serialized = serializeRuntimeError(error);
+    await query("UPDATE tasks SET status='failed',error=$1,completed_at=now(),updated_at=now() WHERE id=$2", [JSON.stringify(serialized), task.id]);
     await query("UPDATE artifacts SET status='failed',error_message='Source task failed',updated_at=now() WHERE task_id=$1 AND status='pending'", [task.id]);
-    await taskEvent(task.workspace_id, task.id, 'task.failed', message);
+    await taskEvent(task.workspace_id, task.id, 'task.failed', serialized.message, { error: serialized }, taskTrace);
     throw error;
   }
 }
 
-new Worker<{ taskId: string }>(TASK_QUEUE, (job) => executeAgentTask(job.data.taskId), { connection, concurrency: 5 });
+new Worker<TaskJobData>(TASK_QUEUE, (job) => executeAgentTask(job.data.taskId, job.data.traceId), { connection, concurrency: 5 });
 
 new Worker<{ artifactId: string }>(ARTIFACT_QUEUE, async (job) => {
   await generateArtifact(job.data.artifactId);
@@ -601,27 +669,33 @@ new Worker<{ documentId: string }>(KNOWLEDGE_QUEUE, async (job) => {
   }
 }, { connection, concurrency: 2 });
 
-new Worker<{ workflowRunId: string }>(WORKFLOW_QUEUE, async (job) => {
+new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
   const run = (await query<{
     workspace_id: string;
     workflow_version_id: string | null;
     definition_snapshot: WorkflowDefinition;
     run_mode: 'test' | 'production';
     execution_manifest: ExecutionManifest | null;
+    trace_id: string;
+    span_id: string;
+    parent_span_id: string | null;
   }>(
-    'SELECT workspace_id,workflow_version_id,definition_snapshot,run_mode,execution_manifest FROM workflow_runs WHERE id=$1',
+    `SELECT workspace_id,workflow_version_id,definition_snapshot,run_mode,execution_manifest,
+            trace_id,span_id,parent_span_id
+       FROM workflow_runs WHERE id=$1`,
     [job.data.workflowRunId],
   )).rows[0];
+  if (run) authoritativeTraceContext(run, job.data.traceId);
   if (run?.run_mode === 'production') {
     try {
       await assertWorkflowRunManifestDependencies(run);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'RUN_MANIFEST_INCOMPATIBLE';
+      const serialized = serializeRuntimeError(error);
       await query(
         `UPDATE workflow_runs
-            SET status='failed',output=$1,completed_at=now(),updated_at=now()
-          WHERE id=$2 AND status IN ('queued','awaiting_approval')`,
-        [JSON.stringify({ error: message }), job.data.workflowRunId],
+            SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now()
+          WHERE id=$3 AND status IN ('queued','awaiting_approval')`,
+        [JSON.stringify({ error: serialized }), JSON.stringify(serialized), job.data.workflowRunId],
       );
       await query(
         "UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'",

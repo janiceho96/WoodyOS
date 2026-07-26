@@ -6,6 +6,8 @@ import { decryptMcpCredentials, requestHeaders } from './credentials.js';
 import { McpError } from './errors.js';
 import { mcpTransport } from './transports/index.js';
 import { actionArgumentHash, limitedActionResult, safeActionSummary } from '../lib/action-safety.js';
+import { serializeRuntimeError } from '../runtime/errors.js';
+import type { TraceContext } from '../runtime/trace.js';
 
 export type AuthorizedMcpTool = {
   id: string;
@@ -111,6 +113,7 @@ export async function executeAuthorizedMcpTool(input: {
   workflowAttempt?: number | null;
   actionAuthorizationId?: string | null;
   toolCallId?: string;
+  trace: TraceContext;
 }) {
   assertMcpPermission(input.tool);
   let callId = input.toolCallId;
@@ -119,8 +122,8 @@ export async function executeAuthorizedMcpTool(input: {
       `INSERT INTO mcp_tool_calls(
          workspace_id,connection_id,mcp_tool_id,agent_id,task_id,workflow_run_id,
          workflow_node_id,workflow_iteration_key,workflow_attempt,action_authorization_id,
-         status,risk_level,arguments_summary,arguments_hash,started_at
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',$11,$12,$13,now()) RETURNING id`,
+         status,risk_level,arguments_summary,arguments_hash,started_at,trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'running',$11,$12,$13,now(),$14,$15,$16) RETURNING id`,
       [
         input.tool.workspace_id,
         input.tool.connection_id,
@@ -135,6 +138,9 @@ export async function executeAuthorizedMcpTool(input: {
         input.tool.risk_level,
         JSON.stringify(safeArgumentsSummary(input.arguments_)),
         argumentHash(input.arguments_),
+        input.trace.traceId,
+        input.trace.spanId,
+        input.trace.parentSpanId,
       ],
     )).rows[0].id;
   } else {
@@ -166,10 +172,12 @@ export async function executeAuthorizedMcpTool(input: {
     const error = cause instanceof McpError
       ? cause
       : new McpError('MCP_TOOL_CALL_FAILED', cause instanceof Error ? cause.message.slice(0, 500) : 'MCP tool call failed', 502, { cause });
+    const serialized = serializeRuntimeError(error);
     await query(
-      `UPDATE mcp_tool_calls SET status='failed',error_code=$1,error_message=$2,duration_ms=$3,completed_at=now()
-       WHERE id=$4 AND workspace_id=$5`,
-      [error.code, error.message, Date.now() - started, callId, input.tool.workspace_id],
+      `UPDATE mcp_tool_calls
+          SET status='failed',error_code=$1,error_message=$2,runtime_error=$3,duration_ms=$4,completed_at=now()
+        WHERE id=$5 AND workspace_id=$6`,
+      [error.code, serialized.message, JSON.stringify(serialized), Date.now() - started, callId, input.tool.workspace_id],
     );
     throw error;
   }

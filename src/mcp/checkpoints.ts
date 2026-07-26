@@ -3,6 +3,7 @@ import { safeActionSummary } from '../lib/action-safety.js';
 import { decryptJsonWithContext, encryptJsonWithContext, type EncryptedPayload } from '../lib/crypto.js';
 import type { AuthorizedMcpTool } from './runtime.js';
 import { argumentHash, safeArgumentsSummary } from './runtime.js';
+import type { TraceContext } from '../runtime/trace.js';
 
 export type TaskActionCheckpointState = {
   provider: 'anthropic' | 'openai-compatible';
@@ -43,6 +44,7 @@ export async function pauseForActionConfirmation(input: {
   authorizationId: string;
   state: TaskActionCheckpointState;
   mcpTool?: AuthorizedMcpTool;
+  trace: TraceContext;
 }) {
   const encrypted = encryptJsonWithContext(input.state as unknown as Record<string, unknown>, checkpointContext(input.workspaceId, input.taskId));
   const client = await db.connect();
@@ -53,8 +55,8 @@ export async function pauseForActionConfirmation(input: {
       const call = await client.query<{ id: string }>(
         `INSERT INTO mcp_tool_calls(
            workspace_id,connection_id,mcp_tool_id,agent_id,task_id,workflow_run_id,action_authorization_id,status,risk_level,
-           arguments_summary,arguments_hash
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,'awaiting_confirmation',$8,$9,$10) RETURNING id`,
+           arguments_summary,arguments_hash,trace_id,span_id,parent_span_id
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,'awaiting_confirmation',$8,$9,$10,$11,$12,$13) RETURNING id`,
         [
           input.workspaceId,
           input.mcpTool.connection_id,
@@ -66,6 +68,9 @@ export async function pauseForActionConfirmation(input: {
           input.mcpTool.risk_level,
           JSON.stringify(safeArgumentsSummary(input.state.pending.arguments)),
           argumentHash(input.state.pending.arguments),
+          input.trace.traceId,
+          input.trace.spanId,
+          input.trace.parentSpanId,
         ],
       );
       callId = call.rows[0].id;

@@ -1,0 +1,8 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-07-26-runtime-trust-foundations.md
+
+Phase 3 base: ab49f17d806cd39df089a5df6e532df72e408309
+Batch 1: complete — immutable agent versions and complete execution manifests (`0a77922`, correction `7abbb3c`)
+Batch 2a: implementation complete, source review pending — trace context and structured runtime errors
+Batch 2b: pending — retry authority
+Batch 3: pending — distributed cancellation, worker leases, and approval expiry
+Acceptance gate: pending

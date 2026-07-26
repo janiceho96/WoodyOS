@@ -9,6 +9,7 @@ import {
   assertWorkflowManifestDependencies,
 } from '../../runtime/manifest.js';
 import type { WorkflowDefinition } from '../../workflows/definition.js';
+import { serializeRuntimeError } from '../../runtime/errors.js';
 
 const idParams = z.object({ id: z.string().uuid() });
 const listQuery = z.object({
@@ -32,7 +33,7 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
     values.push(input.limit);
     const result = await query(
       `SELECT calls.id,calls.status,calls.risk_level,calls.arguments_summary,
-       calls.error_code,calls.error_message,calls.duration_ms,calls.requested_at,calls.completed_at,
+       calls.error_code,calls.error_message,calls.runtime_error,calls.duration_ms,calls.requested_at,calls.completed_at,
        tools.remote_name,tools.title tool_title,connections.name connection_name,agents.id agent_id,agents.name agent_name,agents.role agent_role,agents.avatar_config agent_avatar,
        tasks.title task_title,confirmations.status confirmation_status,confirmations.action_summary,
        confirmations.target_summary,confirmations.expires_at
@@ -46,7 +47,17 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
        ORDER BY calls.requested_at DESC LIMIT $${values.length}`,
       values,
     );
-    return { data: result.rows };
+    return {
+      data: result.rows.map((row) => {
+        const error = row.runtime_error ?? row.error_message;
+        const serialized = error == null ? null : serializeRuntimeError(error);
+        return {
+          ...row,
+          error_message: serialized?.message ?? null,
+          runtime_error: serialized,
+        };
+      }),
+    };
   }));
 
   app.post('/:id/decision', {
@@ -87,11 +98,12 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
         action_authorization_id: string | null;
         execution_manifest: unknown;
         run_execution_manifest: unknown;
+        trace_id: string;
       }>(
         `SELECT calls.task_id,tasks.agent_id,calls.workflow_run_id,run.run_mode,
                 run.workflow_version_id,run.definition_snapshot,
                 calls.action_authorization_id,tasks.execution_manifest,
-                run.execution_manifest run_execution_manifest
+                run.execution_manifest run_execution_manifest,tasks.trace_id
          FROM mcp_tool_calls calls JOIN mcp_tool_confirmations confirmation ON confirmation.tool_call_id=calls.id
          JOIN tasks ON tasks.id=calls.task_id
          LEFT JOIN workflow_runs run ON run.id=tasks.workflow_run_id
@@ -157,7 +169,11 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
-    await enqueueTask(taskId, `${taskId}:${params.id}:${input.decision}`);
+    const traceId = (await query<{ trace_id: string }>(
+      'SELECT trace_id FROM tasks WHERE id=$1 AND workspace_id=$2',
+      [taskId, request.user.workspaceId],
+    )).rows[0]?.trace_id;
+    await enqueueTask(taskId, `${taskId}:${params.id}:${input.decision}`, traceId);
     await audit(request.user.workspaceId, request.user.sub, `mcp.tool_call.${input.decision}`, 'mcp_tool_call', params.id, {
       taskId,
       workflowRunId,

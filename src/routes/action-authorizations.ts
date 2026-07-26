@@ -22,6 +22,7 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
     let taskId = '';
     let workflowRunId: string | null = null;
     let toolCallId: string | null = null;
+    let traceId = '';
     try {
       await client.query('BEGIN');
       const pending = await client.query<{
@@ -34,11 +35,12 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
         pending_tool_call_id: string | null;
         execution_manifest: unknown;
         run_execution_manifest: unknown;
+        trace_id: string;
       }>(
         `SELECT authorization.task_id,tasks.agent_id,tasks.workflow_run_id,run.run_mode,
                 run.workflow_version_id,run.definition_snapshot,
                 checkpoint.pending_tool_call_id,tasks.execution_manifest,
-                run.execution_manifest run_execution_manifest
+                run.execution_manifest run_execution_manifest,tasks.trace_id
          FROM action_authorizations authorization
          JOIN task_runtime_checkpoints checkpoint ON checkpoint.pending_action_authorization_id=authorization.id
          JOIN tasks ON tasks.id=authorization.task_id
@@ -61,6 +63,7 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
       taskId = pending.rows[0].task_id;
       workflowRunId = pending.rows[0].workflow_run_id;
       toolCallId = pending.rows[0].pending_tool_call_id;
+      traceId = pending.rows[0].trace_id;
       if (pending.rows[0].run_mode !== 'test') {
         const row = pending.rows[0];
         if (row.workflow_run_id && row.workflow_version_id && row.definition_snapshot) {
@@ -111,7 +114,7 @@ export async function actionAuthorizationRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
-    await enqueueTask(taskId, `${taskId}:action:${params.id}:${input.decision}`);
+    await enqueueTask(taskId, `${taskId}:action:${params.id}:${input.decision}`, traceId);
     await audit(request.user.workspaceId, request.user.sub, `agent.action.${input.decision}`, 'task', taskId, {
       authorizationId: params.id,
       workflowRunId,
