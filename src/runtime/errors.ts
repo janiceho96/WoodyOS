@@ -18,6 +18,34 @@ export type SerializedRuntimeError = {
   details?: unknown;
 };
 
+export type RetryDecision = {
+  retry: boolean;
+  delayMs: number;
+  reason:
+    | 'retry_scheduled'
+    | 'category_not_retryable'
+    | 'error_not_retryable'
+    | 'attempts_exhausted'
+    | 'node_not_retryable'
+    | 'action_not_retryable'
+    | 'outcome_uncertain'
+    | 'infrastructure_not_allowed';
+};
+
+export type RetryContext = {
+  attempt: number;
+  nodeRetryable: boolean;
+  policy: {
+    maxAttempts: number;
+    initialDelayMs: number;
+    multiplier: number;
+    maxDelayMs: number;
+  };
+  actionRisk?: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown';
+  outcomeUncertain?: boolean;
+  allowInfrastructureRetry?: boolean;
+};
+
 export class WorkflowRuntimeError extends Error {
   readonly code: string;
   readonly category: RuntimeErrorCategory;
@@ -192,4 +220,59 @@ export function serializeRuntimeError(error: unknown): SerializedRuntimeError {
     message: redactRuntimeMessage(normalized.message).slice(0, 2_000),
     ...(normalized.details === undefined ? {} : { details: redactRuntimeValue(normalized.details) }),
   };
+}
+
+function noRetry(reason: RetryDecision['reason']): RetryDecision {
+  return { retry: false, delayMs: 0, reason };
+}
+
+function policyDelay(context: RetryContext) {
+  const calculated = context.policy.initialDelayMs
+    * Math.pow(context.policy.multiplier, Math.max(0, context.attempt - 1));
+  return Math.min(context.policy.maxDelayMs, Math.max(0, calculated));
+}
+
+export function retryDecision(error: unknown, context: RetryContext): RetryDecision {
+  const normalized = serializeRuntimeError(error);
+  if (context.outcomeUncertain) return noRetry('outcome_uncertain');
+  if (context.actionRisk && context.actionRisk !== 'read') return noRetry('action_not_retryable');
+  if (!context.nodeRetryable) return noRetry('node_not_retryable');
+  if (context.attempt >= context.policy.maxAttempts) return noRetry('attempts_exhausted');
+  if (!normalized.retryable) return noRetry('error_not_retryable');
+  if ([
+    'authentication',
+    'validation',
+    'policy_denied',
+    'cancelled',
+    'permanent',
+    'unknown',
+  ].includes(normalized.category)) return noRetry('category_not_retryable');
+  if (normalized.category === 'infrastructure' && !context.allowInfrastructureRetry) {
+    return noRetry('infrastructure_not_allowed');
+  }
+  if (!['rate_limited', 'transient', 'timeout', 'infrastructure'].includes(normalized.category)) {
+    return noRetry('category_not_retryable');
+  }
+  const retryAfterMs = normalized.category === 'rate_limited'
+    && normalized.details
+    && typeof normalized.details === 'object'
+    && !Array.isArray(normalized.details)
+    && typeof (normalized.details as { retryAfterMs?: unknown }).retryAfterMs === 'number'
+    && Number.isFinite((normalized.details as { retryAfterMs: number }).retryAfterMs)
+      ? (normalized.details as { retryAfterMs: number }).retryAfterMs
+      : null;
+  const delayMs = retryAfterMs === null
+    ? policyDelay(context)
+    : Math.min(context.policy.maxDelayMs, Math.max(0, retryAfterMs));
+  return { retry: true, delayMs, reason: 'retry_scheduled' };
+}
+
+export function uncertainActionOutcome(cause: unknown) {
+  return runtimeError('ACTION_OUTCOME_UNCERTAIN', {
+    category: 'permanent',
+    retryable: false,
+    message: 'External action outcome is uncertain; inspect the target before attempting it again',
+    details: { cause: serializeRuntimeError(cause) },
+    cause,
+  });
 }

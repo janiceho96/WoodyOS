@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  retryDecision,
   runtimeError,
   serializeRuntimeError,
+  uncertainActionOutcome,
 } from '../src/runtime/errors.js';
 import {
   authoritativeTraceContext,
@@ -84,6 +86,112 @@ describe('structured runtime errors', () => {
     });
     expect(JSON.stringify(serialized)).not.toContain('do-not-show');
     expect(JSON.stringify(serialized)).not.toContain('hidden');
+  });
+});
+
+describe('runtime retry authority', () => {
+  const context = {
+    attempt: 1,
+    nodeRetryable: true,
+    policy: {
+      maxAttempts: 3,
+      initialDelayMs: 250,
+      multiplier: 2,
+      maxDelayMs: 1_000,
+    },
+  };
+
+  it.each([
+    ['rate_limited', true],
+    ['transient', true],
+    ['timeout', true],
+    ['authentication', false],
+    ['validation', false],
+    ['policy_denied', false],
+    ['cancelled', false],
+    ['permanent', false],
+    ['unknown', false],
+  ] as const)('classifies %s errors without trusting a broad retry flag', (category, expected) => {
+    const decision = retryDecision(runtimeError('TEST_FAILURE', {
+      category,
+      retryable: true,
+      message: 'test failure',
+    }), context);
+
+    expect(decision.retry).toBe(expected);
+  });
+
+  it('requires explicit bounded infrastructure classification', () => {
+    const error = runtimeError('INFRASTRUCTURE_FAILURE', {
+      category: 'infrastructure',
+      retryable: true,
+      message: 'temporary infrastructure failure',
+    });
+
+    expect(retryDecision(error, context).retry).toBe(false);
+    expect(retryDecision(error, { ...context, allowInfrastructureRetry: true })).toMatchObject({
+      retry: true,
+      delayMs: 250,
+    });
+  });
+
+  it('bounds rate-limit retryAfterMs to the persisted node policy', () => {
+    const limited = (retryAfterMs: number) => runtimeError('RATE_LIMITED', {
+      category: 'rate_limited',
+      retryable: true,
+      message: 'rate limited',
+      details: { retryAfterMs },
+    });
+
+    expect(retryDecision(limited(9_000), context).delayMs).toBe(1_000);
+    expect(retryDecision(limited(-50), context).delayMs).toBe(0);
+    expect(retryDecision(limited(Number.NaN), context).delayMs).toBe(250);
+  });
+
+  it('stops when attempts are exhausted or the normalized error vetoes retry', () => {
+    const transient = runtimeError('TRANSIENT_FAILURE', {
+      category: 'transient',
+      retryable: true,
+      message: 'temporary',
+    });
+    const vetoed = runtimeError('TRANSIENT_FAILURE', {
+      category: 'transient',
+      retryable: false,
+      message: 'not safe to retry',
+    });
+
+    expect(retryDecision(transient, { ...context, attempt: 3 })).toMatchObject({
+      retry: false,
+      reason: 'attempts_exhausted',
+    });
+    expect(retryDecision(vetoed, context)).toMatchObject({
+      retry: false,
+      reason: 'error_not_retryable',
+    });
+  });
+
+  it('never retries write-capable or uncertain external outcomes', () => {
+    const transient = runtimeError('TRANSIENT_FAILURE', {
+      category: 'transient',
+      retryable: true,
+      message: 'connection dropped',
+    });
+    const uncertain = uncertainActionOutcome(new Error('connection dropped with token=secret'));
+
+    expect(retryDecision(transient, { ...context, actionRisk: 'write' })).toMatchObject({
+      retry: false,
+      reason: 'action_not_retryable',
+    });
+    expect(retryDecision(transient, { ...context, actionRisk: 'unknown' })).toMatchObject({
+      retry: false,
+      reason: 'action_not_retryable',
+    });
+    expect(serializeRuntimeError(uncertain)).toMatchObject({
+      code: 'ACTION_OUTCOME_UNCERTAIN',
+      category: 'permanent',
+      retryable: false,
+    });
+    expect(JSON.stringify(serializeRuntimeError(uncertain))).not.toContain('secret');
   });
 });
 

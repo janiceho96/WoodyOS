@@ -4,6 +4,7 @@ import { retryPolicy } from '../definition.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 import { childTraceContext } from '../../runtime/trace.js';
+import { uncertainActionOutcome } from '../../runtime/errors.js';
 
 export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -28,7 +29,13 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   const input = resolve(configuredInput) as Record<string, unknown>;
   const actionTrace = childTraceContext(execution.trace);
   await emitEvent('tool.called', `Calling ${tool.name}`, { toolId: tool.id, iterationKey, attempt: cursor.attempt }, actionTrace);
-  const output = await invokeTool(tool, input);
+  let output: unknown;
+  try {
+    output = await invokeTool(tool, input);
+  } catch (error) {
+    if (toolRequiresApproval(tool)) throw uncertainActionOutcome(error);
+    throw error;
+  }
   await emitEvent('tool.completed', `${tool.name} completed`, { toolId: tool.id, iterationKey, attempt: cursor.attempt }, actionTrace);
   setNodeOutput(output);
   return { output, result: output };

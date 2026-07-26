@@ -3,6 +3,7 @@ import { authorizeWorkflowAction, beginWorkflowAction, completeWorkflowAction, f
 import type { WorkflowAdapterContext } from './types.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 import { childTraceContext } from '../../runtime/trace.js';
+import { uncertainActionOutcome } from '../../runtime/errors.js';
 
 export async function executeMcpActionNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -60,7 +61,8 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
     setNodeOutput(executed.result);
     return { output: executed.result, result: executed.result };
   } catch (error) {
-    await failWorkflowAction(authorization.authorizationId, error);
-    throw error;
+    const failure = tool.risk_level === 'read' ? error : uncertainActionOutcome(error);
+    await failWorkflowAction(authorization.authorizationId, failure);
+    throw failure;
   }
 }

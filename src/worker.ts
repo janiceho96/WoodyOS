@@ -51,7 +51,12 @@ import {
 } from './runtime/manifest.js';
 import type { AgentVersionSnapshot } from './agents/versions.js';
 import type { WorkflowDefinition } from './workflows/definition.js';
-import { redactRuntimeMessage, redactRuntimeValue, serializeRuntimeError } from './runtime/errors.js';
+import {
+  redactRuntimeMessage,
+  redactRuntimeValue,
+  serializeRuntimeError,
+  uncertainActionOutcome,
+} from './runtime/errors.js';
 import {
   authoritativeQueuedTraceContext,
   authoritativeTraceContext,
@@ -243,8 +248,12 @@ async function executeTaskToolAction(input: {
     await completeAction(input.authorizationId, result);
     return { result, toolCallId: null };
   } catch (error) {
-    await failAction(input.authorizationId, error);
-    throw error;
+    const risk = input.action.adapter === 'api'
+      ? toolRiskLevel(input.action.tool)
+      : input.action.tool.risk_level;
+    const failure = risk === 'read' ? error : uncertainActionOutcome(error);
+    await failAction(input.authorizationId, failure);
+    throw failure;
   }
 }
 

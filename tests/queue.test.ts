@@ -4,7 +4,10 @@ import {
   fileJobData,
   knowledgeJobData,
   queueJobId,
+  safeReentryQueueJobOptions,
+  taskQueueJobOptions,
   taskJobData,
+  workflowQueueJobOptions,
   workflowJobData,
 } from '../src/queue/task-queue.js';
 
@@ -39,5 +42,11 @@ describe('queue job identifiers', () => {
     expect(knowledgeJobData('document-id', trace)).toEqual({ documentId: 'document-id', trace });
     expect(fileJobData('file-id', trace)).toEqual({ fileId: 'file-id', trace });
     expect(artifactJobData('artifact-id', trace)).toEqual({ artifactId: 'artifact-id', trace });
+  });
+
+  it('gives runtime queues one delivery attempt while safe re-entry queues retain three', () => {
+    expect(taskQueueJobOptions('task-phase').attempts).toBe(1);
+    expect(workflowQueueJobOptions('workflow-phase', 500).attempts).toBe(1);
+    expect(safeReentryQueueJobOptions('ingestion-phase', 1_000).attempts).toBe(3);
   });
 });

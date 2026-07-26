@@ -7,7 +7,12 @@ import { executeRegisteredWorkflowNode } from './adapters/index.js';
 import { resolveWorkflowTemplates } from './adapters/templates.js';
 import type { AgentTaskExecutor, WorkflowCursor, WorkflowRunRecord } from './adapters/types.js';
 import { workflowNodeDefinition } from './registry.js';
-import { redactRuntimeMessage, redactRuntimeValue, serializeRuntimeError } from '../runtime/errors.js';
+import {
+  redactRuntimeMessage,
+  redactRuntimeValue,
+  retryDecision,
+  serializeRuntimeError,
+} from '../runtime/errors.js';
 import {
   authoritativeTraceContext,
   childTraceContext,
@@ -123,39 +128,55 @@ function artifactFormats(node: WorkflowNode): ArtifactFormat[] {
   return [...new Set(raw.map((item) => artifactFormatSchema.safeParse(item)).filter((item) => item.success).map((item) => item.data))];
 }
 
-function retryDelay(node: WorkflowNode, attempt: number) {
-  const policy = retryPolicy(node);
-  return Math.min(policy.maxDelayMs, policy.initialDelayMs * Math.pow(policy.multiplier, Math.max(0, attempt - 1)));
-}
-
 async function failOrRetry(run: WorkflowRunRecord, node: WorkflowNode, cursor: WorkflowCursor, error: unknown, trace: TraceContext) {
   const serialized = serializeRuntimeError(error);
+  const policy = retryPolicy(node);
+  const decision = retryDecision(serialized, {
+    attempt: cursor.attempt,
+    nodeRetryable: Boolean(workflowNodeDefinition(node.type)?.retryable),
+    policy,
+  });
+  const persistedError = { ...serialized, retryDecision: decision };
   const message = serialized.message;
   const key = iterationKey(cursor);
   await query(
     `UPDATE workflow_run_node_states SET status='failed',error=$1,completed_at=now(),updated_at=now()
       WHERE workflow_run_id=$2 AND node_id=$3 AND iteration_key=$4 AND attempt=$5`,
-    [json(serialized), run.id, node.id, key, cursor.attempt],
+    [json(persistedError), run.id, node.id, key, cursor.attempt],
   );
-  await workflowEvent(run, node.id, 'node.failed', message, { iterationKey: key, attempt: cursor.attempt, error: serialized }, trace);
-  const policy = retryPolicy(node);
-  const retryable = !(error && typeof error === 'object' && 'retryable' in error && (error as { retryable?: unknown }).retryable === false);
-  if (retryable && workflowNodeDefinition(node.type)?.retryable && cursor.attempt < policy.maxAttempts) {
+  await workflowEvent(run, node.id, 'node.failed', message, {
+    iterationKey: key,
+    attempt: cursor.attempt,
+    error: serialized,
+    retryDecision: decision,
+  }, trace);
+  if (decision.retry) {
     const nextAttempt = cursor.attempt + 1;
-    const delay = retryDelay(node, cursor.attempt);
+    const delay = decision.delayMs;
     const nextCursor = { ...cursor, attempt: nextAttempt };
     const nextStep = run.step_count + 1;
     await query("UPDATE workflow_runs SET status='queued',cursor=$1,step_count=$2,updated_at=now() WHERE id=$3", [json(nextCursor), nextStep, run.id]);
-    await workflowEvent(run, node.id, 'node.retry_scheduled', `Retry ${nextAttempt} scheduled`, { iterationKey: key, attempt: nextAttempt, delayMs: delay }, trace);
+    await workflowEvent(run, node.id, 'node.retry_scheduled', `Retry ${nextAttempt} scheduled`, {
+      iterationKey: key,
+      attempt: nextAttempt,
+      delayMs: delay,
+      retryDecision: decision,
+    }, trace);
     await enqueueWorkflowRun(run.id, `${run.id}:step:${nextStep}:${node.id}:${key}:${nextAttempt}`, delay, run.trace_id);
     return true;
   }
   await query(
     "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3",
-    [json({ error: serialized, state: run.state }), json(serialized), run.id],
+    [json({ error: persistedError, state: run.state }), json(persistedError), run.id],
   );
   await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id]);
-  await workflowEvent(run, null, 'workflow.failed', message, { nodeId: node.id, iterationKey: key, attempt: cursor.attempt, error: serialized }, trace);
+  await workflowEvent(run, null, 'workflow.failed', message, {
+    nodeId: node.id,
+    iterationKey: key,
+    attempt: cursor.attempt,
+    error: serialized,
+    retryDecision: decision,
+  }, trace);
   return false;
 }
 

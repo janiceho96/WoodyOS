@@ -51,13 +51,39 @@ export function fileJobData(fileId: string, trace: TraceContext): FileJobData {
   return { fileId, trace };
 }
 
+export function taskQueueJobOptions(phaseId: string) {
+  return {
+    jobId: queueJobId(phaseId),
+    removeOnComplete: 1_000,
+    removeOnFail: 1_000,
+    attempts: 1,
+  };
+}
+
+export function workflowQueueJobOptions(phaseId: string, delay = 0) {
+  return {
+    ...taskQueueJobOptions(phaseId),
+    delay,
+  };
+}
+
+export function safeReentryQueueJobOptions(phaseId: string, backoffDelay: number) {
+  return {
+    jobId: queueJobId(phaseId),
+    removeOnComplete: 1_000,
+    removeOnFail: 1_000,
+    attempts: 3,
+    backoff: { type: 'exponential' as const, delay: backoffDelay },
+  };
+}
+
 function standaloneOperationTrace(trace?: TraceContext) {
   return trace ?? childTraceContext(createTraceContext());
 }
 
 export async function enqueueTask(taskId: string, phaseId = taskId, traceId?: string) {
   if (!traceId) throw new Error('TRACE_CONTEXT_REQUIRED');
-  await taskQueue().add('execute', taskJobData(taskId, traceId), { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+  await taskQueue().add('execute', taskJobData(taskId, traceId), taskQueueJobOptions(phaseId));
 }
 
 export async function enqueueWorkflowRun(workflowRunId: string, phaseId = workflowRunId, delay = 0, traceId?: string) {
@@ -66,7 +92,7 @@ export async function enqueueWorkflowRun(workflowRunId: string, phaseId = workfl
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
     workflowQueue = new Queue<WorkflowJobData>(WORKFLOW_QUEUE, { connection });
   }
-  await workflowQueue.add('execute', workflowJobData(workflowRunId, traceId), { jobId: queueJobId(phaseId), delay, removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+  await workflowQueue.add('execute', workflowJobData(workflowRunId, traceId), workflowQueueJobOptions(phaseId, delay));
 }
 
 export async function enqueueKnowledgeDocument(documentId: string, trace?: TraceContext) {
@@ -74,7 +100,7 @@ export async function enqueueKnowledgeDocument(documentId: string, trace?: Trace
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
     knowledgeQueue = new Queue<KnowledgeJobData>(KNOWLEDGE_QUEUE, { connection });
   }
-  await knowledgeQueue.add('ingest', knowledgeJobData(documentId, standaloneOperationTrace(trace)), { jobId: queueJobId(documentId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+  await knowledgeQueue.add('ingest', knowledgeJobData(documentId, standaloneOperationTrace(trace)), safeReentryQueueJobOptions(documentId, 1_000));
 }
 
 export async function enqueueArtifact(artifactId: string, phaseId = artifactId, trace?: TraceContext) {
@@ -82,7 +108,7 @@ export async function enqueueArtifact(artifactId: string, phaseId = artifactId, 
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
     artifactQueue = new Queue<ArtifactJobData>(ARTIFACT_QUEUE, { connection });
   }
-  await artifactQueue.add('generate', artifactJobData(artifactId, standaloneOperationTrace(trace)), { jobId: queueJobId(phaseId), removeOnComplete: 1000, removeOnFail: 1000, attempts: 3, backoff: { type: 'exponential', delay: 1500 } });
+  await artifactQueue.add('generate', artifactJobData(artifactId, standaloneOperationTrace(trace)), safeReentryQueueJobOptions(phaseId, 1_500));
 }
 
 export async function enqueueFile(fileId: string, phaseId = fileId, trace?: TraceContext) {
@@ -90,13 +116,7 @@ export async function enqueueFile(fileId: string, phaseId = fileId, trace?: Trac
     const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
     fileQueue = new Queue<FileJobData>(FILE_QUEUE, { connection });
   }
-  await fileQueue.add('process', fileJobData(fileId, standaloneOperationTrace(trace)), {
-    jobId: queueJobId(phaseId),
-    removeOnComplete: 1000,
-    removeOnFail: 1000,
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 1_500 },
-  });
+  await fileQueue.add('process', fileJobData(fileId, standaloneOperationTrace(trace)), safeReentryQueueJobOptions(phaseId, 1_500));
 }
 
 export async function closeQueues() {
