@@ -142,27 +142,27 @@ UPDATE task_events event
    AND task.span_id IS NOT NULL
    AND (event.trace_id IS NULL OR event.span_id IS NULL OR event.parent_span_id IS NULL);
 
-UPDATE action_authorizations authorization
-   SET trace_id=COALESCE(authorization.trace_id,task.trace_id),
-       span_id=COALESCE(authorization.span_id,gen_random_uuid()),
-       parent_span_id=COALESCE(authorization.parent_span_id,task.span_id)
+UPDATE action_authorizations AS auth
+   SET trace_id=COALESCE(auth.trace_id,task.trace_id),
+       span_id=COALESCE(auth.span_id,gen_random_uuid()),
+       parent_span_id=COALESCE(auth.parent_span_id,task.span_id)
   FROM tasks task
- WHERE authorization.task_id=task.id
+ WHERE auth.task_id=task.id
    AND task.status::text IN ('queued','running','awaiting_approval','cancel_requested','cancelling')
    AND task.trace_id IS NOT NULL
    AND task.span_id IS NOT NULL
-   AND (authorization.trace_id IS NULL OR authorization.span_id IS NULL OR authorization.parent_span_id IS NULL);
+   AND (auth.trace_id IS NULL OR auth.span_id IS NULL OR auth.parent_span_id IS NULL);
 
-UPDATE action_authorizations authorization
-   SET trace_id=COALESCE(authorization.trace_id,run.trace_id),
-       span_id=COALESCE(authorization.span_id,gen_random_uuid()),
-       parent_span_id=COALESCE(authorization.parent_span_id,run.span_id)
+UPDATE action_authorizations AS auth
+   SET trace_id=COALESCE(auth.trace_id,run.trace_id),
+       span_id=COALESCE(auth.span_id,gen_random_uuid()),
+       parent_span_id=COALESCE(auth.parent_span_id,run.span_id)
   FROM workflow_runs run
- WHERE authorization.workflow_run_id=run.id
+ WHERE auth.workflow_run_id=run.id
    AND run.status::text IN ('queued','running','awaiting_approval','cancel_requested','cancelling')
    AND run.trace_id IS NOT NULL
    AND run.span_id IS NOT NULL
-   AND (authorization.trace_id IS NULL OR authorization.span_id IS NULL OR authorization.parent_span_id IS NULL);
+   AND (auth.trace_id IS NULL OR auth.span_id IS NULL OR auth.parent_span_id IS NULL);
 
 UPDATE mcp_tool_calls tool_call
    SET trace_id=COALESCE(tool_call.trace_id,task.trace_id),
