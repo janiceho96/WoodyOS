@@ -16,7 +16,9 @@ export async function searchWorkspaceKnowledge(
   requestText: string,
   limit = 8,
   _trace?: TraceContext,
+  signal?: AbortSignal,
 ): Promise<KnowledgeResult[]> {
+  signal?.throwIfAborted();
   const search = requestText.replace(/\s+/g, ' ').trim().slice(0, 1_000);
   if (search.length < 2) return [];
   const result = await query<{
@@ -36,6 +38,7 @@ export async function searchWorkspaceKnowledge(
      ORDER BY score DESC,c.ordinal LIMIT $3`,
     [workspaceId, search, Math.min(20, Math.max(1, limit))],
   );
+  signal?.throwIfAborted();
   return result.rows.map((row) => ({
     chunkId: row.id,
     documentId: row.document_id,

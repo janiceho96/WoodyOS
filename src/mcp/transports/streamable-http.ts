@@ -2,6 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { McpError } from '../errors.js';
 import { assertSafeMcpEndpoint, createSafeMcpFetch, safeMcpHeaders } from '../network.js';
+import { combineAbortSignals, combinedAbortSignal } from '../../runtime/cancellation.js';
 import type {
   McpCallResult,
   McpDiscoveredTool,
@@ -25,11 +26,15 @@ export class StreamableHttpAdapter implements McpTransportAdapter {
     fetchFactory?: typeof createSafeMcpFetch;
   } = {}) {}
 
-  async connect(input: { endpointUrl: string; headers?: Record<string, string>; authProvider?: import('@modelcontextprotocol/sdk/client/auth.js').OAuthClientProvider }): Promise<McpTransportSession> {
+  async connect(input: { endpointUrl: string; headers?: Record<string, string>; authProvider?: import('@modelcontextprotocol/sdk/client/auth.js').OAuthClientProvider; signal?: AbortSignal }): Promise<McpTransportSession> {
     const endpoint = await (this.dependencies.validateEndpoint ?? assertSafeMcpEndpoint)(input.endpointUrl);
     const headers = safeMcpHeaders(input.headers ?? {});
+    const safeFetch = (this.dependencies.fetchFactory ?? createSafeMcpFetch)(endpoint);
     const transport = new StreamableHTTPClientTransport(endpoint, {
-      fetch: (this.dependencies.fetchFactory ?? createSafeMcpFetch)(endpoint),
+      fetch: (request, init) => safeFetch(request, {
+        ...init,
+        signal: combineAbortSignals([input.signal, init?.signal]),
+      }),
       requestInit: { headers },
       authProvider: input.authProvider,
       reconnectionOptions: {
@@ -45,7 +50,7 @@ export class StreamableHttpAdapter implements McpTransportAdapter {
     );
     try {
       await client.connect(transport, {
-        signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+        signal: combinedAbortSignal(input.signal, CONNECT_TIMEOUT_MS),
         timeout: CONNECT_TIMEOUT_MS,
         maxTotalTimeout: CONNECT_TIMEOUT_MS,
       });
@@ -70,16 +75,16 @@ export class StreamableHttpAdapter implements McpTransportAdapter {
     };
     return {
       info,
-      async ping() {
-        await client.ping({ timeout: CONNECT_TIMEOUT_MS, maxTotalTimeout: CONNECT_TIMEOUT_MS });
+      async ping(signal = input.signal) {
+        await client.ping({ signal: combinedAbortSignal(signal, CONNECT_TIMEOUT_MS), timeout: CONNECT_TIMEOUT_MS, maxTotalTimeout: CONNECT_TIMEOUT_MS });
       },
-      async listTools() {
+      async listTools(signal = input.signal) {
         const discovered: McpDiscoveredTool[] = [];
         let cursor: string | undefined;
         do {
           const page = await client.listTools(
             cursor ? { cursor } : undefined,
-            { timeout: CONNECT_TIMEOUT_MS, maxTotalTimeout: CONNECT_TIMEOUT_MS },
+            { signal: combinedAbortSignal(signal, CONNECT_TIMEOUT_MS), timeout: CONNECT_TIMEOUT_MS, maxTotalTimeout: CONNECT_TIMEOUT_MS },
           );
           for (const tool of page.tools) {
             if (discovered.length >= MAX_DISCOVERED_TOOLS) {
@@ -98,11 +103,11 @@ export class StreamableHttpAdapter implements McpTransportAdapter {
         } while (cursor);
         return discovered;
       },
-      async callTool(name, arguments_) {
+      async callTool(name, arguments_, signal = input.signal) {
         const result = await client.callTool(
           { name, arguments: arguments_ },
           undefined,
-          { timeout: CALL_TIMEOUT_MS, maxTotalTimeout: CALL_TIMEOUT_MS },
+          { signal: combinedAbortSignal(signal, CALL_TIMEOUT_MS), timeout: CALL_TIMEOUT_MS, maxTotalTimeout: CALL_TIMEOUT_MS },
         );
         return {
           content: Array.isArray(result.content) ? result.content.slice(0, 100) : [],

@@ -19,6 +19,7 @@ import {
   type TraceContext,
 } from '../runtime/trace.js';
 import { assertManifestCompatible } from '../runtime/manifest.js';
+import { cancellationError } from '../runtime/cancellation.js';
 
 export type { AgentTaskExecutor } from './adapters/types.js';
 export { loopResult } from './adapters/logic.js';
@@ -68,6 +69,11 @@ function workflowFailure(error: unknown, state: Record<string, unknown>) {
   };
 }
 
+async function transitionActiveRun(sql: string, values: unknown[]) {
+  const transition = await query(sql, values);
+  if (!transition.rowCount) throw cancellationError();
+}
+
 async function startNode(run: WorkflowRunRecord, node: WorkflowNode, cursor: WorkflowCursor, trace: TraceContext) {
   const key = iterationKey(cursor);
   await query(
@@ -109,7 +115,14 @@ async function waitNode(run: WorkflowRunRecord, node: WorkflowNode, cursor: Work
       WHERE workflow_run_id=$1 AND node_id=$2 AND iteration_key=$3 AND attempt=$4`,
     [run.id, node.id, key, cursor.attempt],
   );
-  await query("UPDATE workflow_runs SET status='awaiting_approval',updated_at=now() WHERE id=$1", [run.id]);
+  const waiting = await query(
+    `UPDATE workflow_runs SET status='awaiting_approval',updated_at=now()
+      WHERE id=$1
+        AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+      RETURNING id`,
+    [run.id],
+  );
+  if (!waiting.rowCount) throw cancellationError();
   await workflowEvent(run, node.id, 'node.waiting', message, { iterationKey: key, attempt: cursor.attempt }, trace);
 }
 
@@ -155,7 +168,10 @@ async function failOrRetry(run: WorkflowRunRecord, node: WorkflowNode, cursor: W
     const delay = decision.delayMs;
     const nextCursor = { ...cursor, attempt: nextAttempt };
     const nextStep = run.step_count + 1;
-    await query("UPDATE workflow_runs SET status='queued',cursor=$1,step_count=$2,updated_at=now() WHERE id=$3", [json(nextCursor), nextStep, run.id]);
+    await transitionActiveRun(
+      "UPDATE workflow_runs SET status='queued',cursor=$1,step_count=$2,updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+      [json(nextCursor), nextStep, run.id],
+    );
     await workflowEvent(run, node.id, 'node.retry_scheduled', `Retry ${nextAttempt} scheduled`, {
       iterationKey: key,
       attempt: nextAttempt,
@@ -165,8 +181,8 @@ async function failOrRetry(run: WorkflowRunRecord, node: WorkflowNode, cursor: W
     await enqueueWorkflowRun(run.id, `${run.id}:step:${nextStep}:${node.id}:${key}:${nextAttempt}`, delay, run.trace_id);
     return true;
   }
-  await query(
-    "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3",
+  await transitionActiveRun(
+    "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
     [json({ error: persistedError, state: run.state }), json(persistedError), run.id],
   );
   await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id]);
@@ -180,7 +196,11 @@ async function failOrRetry(run: WorkflowRunRecord, node: WorkflowNode, cursor: W
   return false;
 }
 
-export async function executeWorkflowStep(workflowRunId: string, executeAgentTask: AgentTaskExecutor) {
+export async function executeWorkflowStep(
+  workflowRunId: string,
+  executeAgentTask: AgentTaskExecutor,
+  signal: AbortSignal = new AbortController().signal,
+) {
   const run = (await query<WorkflowRunRecord>(
     `UPDATE workflow_runs r SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
       FROM workflows w WHERE r.id=$1 AND r.workflow_id=w.id AND r.status='queued'
@@ -190,14 +210,20 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
   if (!run) return null;
   if (run.step_count > 10_000) {
     const failure = workflowFailure('Workflow exceeded the 10000-step safety limit', run.state);
-    await query("UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3", [failure.output, failure.error, run.id]);
+    await transitionActiveRun(
+      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+      [failure.output, failure.error, run.id],
+    );
     await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id]);
     return null;
   }
   const cursor = run.cursor;
   if (!cursor?.nodeId) {
     const failure = workflowFailure('Workflow cursor is missing', run.state);
-    await query("UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3", [failure.output, failure.error, run.id]);
+    await transitionActiveRun(
+      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+      [failure.output, failure.error, run.id],
+    );
     await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id]);
     await workflowEvent(run, null, 'workflow.failed', 'Workflow cursor is missing');
     return null;
@@ -208,7 +234,10 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
   if (!node) {
     const message = `Workflow cursor references missing node ${cursor.nodeId}`;
     const failure = workflowFailure(message, run.state);
-    await query("UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3", [failure.output, failure.error, run.id]);
+    await transitionActiveRun(
+      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+      [failure.output, failure.error, run.id],
+    );
     await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id]);
     await workflowEvent(run, null, 'workflow.failed', message);
     return null;
@@ -222,7 +251,7 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
     const execution = await executeRegisteredWorkflowNode({
       execution: {
         trace: nodeTrace,
-        signal: new AbortController().signal,
+        signal,
         ...(run.run_mode === 'production'
           ? { mode: 'production' as const, manifest: assertManifestCompatible(run.execution_manifest) }
           : { mode: 'test' as const, manifest: null }),
@@ -250,7 +279,10 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
     await completeNode(run, node, cursor, execution.output, nodeTrace);
     if (run.test_target_node_id === node.id) {
       const testOutput = execution.output ?? run.state[node.id] ?? null;
-      await query("UPDATE workflow_runs SET status='completed',output=$1,state=$2,cursor=NULL,step_count=step_count+1,completed_at=now(),updated_at=now() WHERE id=$3", [json(testOutput), json(run.state), run.id]);
+      await transitionActiveRun(
+        "UPDATE workflow_runs SET status='completed',output=$1,state=$2,cursor=NULL,step_count=step_count+1,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+        [json(testOutput), json(run.state), run.id],
+      );
       await workflowEvent(run, null, 'workflow.node_test_completed', `${node.type} node test completed`, { nodeId: node.id, steps: run.step_count + 1 });
       return { completed: true, output: testOutput };
     }
@@ -258,12 +290,18 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
       if (run.test_target_node_id) {
         const message = `Test path completed before reaching node ${run.test_target_node_id}`;
         const failure = workflowFailure(message, run.state);
-        await query("UPDATE workflow_runs SET status='failed',output=$1,error=$2,state=$3,cursor=NULL,step_count=step_count+1,completed_at=now(),updated_at=now() WHERE id=$4", [failure.output, failure.error, json(run.state), run.id]);
+        await transitionActiveRun(
+          "UPDATE workflow_runs SET status='failed',output=$1,error=$2,state=$3,cursor=NULL,step_count=step_count+1,completed_at=now(),updated_at=now() WHERE id=$4 AND status='running' RETURNING id",
+          [failure.output, failure.error, json(run.state), run.id],
+        );
         await workflowEvent(run, null, 'workflow.node_test_target_not_reached', message, { nodeId: run.test_target_node_id });
         return { failed: true };
       }
       const finalOutput = execution.output ?? run.state;
-      await query("UPDATE workflow_runs SET status='completed',output=$1,state=$2,cursor=NULL,step_count=step_count+1,completed_at=now(),updated_at=now() WHERE id=$3", [json(finalOutput), json(run.state), run.id]);
+      await transitionActiveRun(
+        "UPDATE workflow_runs SET status='completed',output=$1,state=$2,cursor=NULL,step_count=step_count+1,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+        [json(finalOutput), json(run.state), run.id],
+      );
       await workflowEvent(run, null, 'workflow.completed', `${run.name} completed`, { steps: run.step_count + 1 });
       const formats = artifactFormats(node);
       await query(
@@ -271,7 +309,7 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
         [run.id, formats],
       );
       if (formats.length) {
-        try { await requestWorkflowArtifacts({ workspaceId: run.workspace_id, createdBy: run.created_by, workflowRunId: run.id, title: run.name, formats, ready: true }); }
+        try { await requestWorkflowArtifacts({ workspaceId: run.workspace_id, createdBy: run.created_by, workflowRunId: run.id, title: run.name, formats, ready: true, signal }); }
         catch (artifactError) { await workflowEvent(run, null, 'artifacts.queue_failed', 'Workflow completed, but downloadable files could not be queued', { error: artifactError instanceof Error ? artifactError.message : 'Artifact queue unavailable' }); }
       }
       return { completed: true, output: finalOutput };
@@ -287,19 +325,29 @@ export async function executeWorkflowStep(workflowRunId: string, executeAgentTas
     if (node.type === 'loop' && execution.result === 'done') delete cursor.loops[node.id];
     const nextCursor: WorkflowCursor = { nodeId: edge.target, loops: cursor.loops, attempt: 1, previousNodeId: node.id };
     const nextStep = run.step_count + 1;
-    await query("UPDATE workflow_runs SET status='queued',state=$1,cursor=$2,step_count=$3,updated_at=now() WHERE id=$4", [json(run.state), json(nextCursor), nextStep, run.id]);
+    await transitionActiveRun(
+      "UPDATE workflow_runs SET status='queued',state=$1,cursor=$2,step_count=$3,updated_at=now() WHERE id=$4 AND status='running' RETURNING id",
+      [json(run.state), json(nextCursor), nextStep, run.id],
+    );
     try {
       await enqueueWorkflowRun(run.id, `${run.id}:step:${nextStep}:${edge.target}:${iterationKey(nextCursor)}`, 0, run.trace_id);
     } catch (queueError) {
       const message = `Workflow queue unavailable before node ${edge.target}: ${queueError instanceof Error ? queueError.message : 'unknown queue error'}`.slice(0, 2000);
       const failure = workflowFailure(message, run.state);
-      await query("UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3", [failure.output, failure.error, run.id]);
+      await transitionActiveRun(
+        "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='queued' RETURNING id",
+        [failure.output, failure.error, run.id],
+      );
       await query("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id]);
       await workflowEvent(run, null, 'workflow.queue_failed', message, { nextNodeId: edge.target });
       return { failed: true };
     }
     return { queued: true, nextNodeId: edge.target };
   } catch (error) {
+    const serialized = serializeRuntimeError(error);
+    if (signal.aborted || serialized.category === 'cancelled') {
+      throw serialized.category === 'cancelled' ? error : cancellationError(error);
+    }
     await failOrRetry(run, node, cursor, error, nodeTrace);
     return { failed: true };
   }

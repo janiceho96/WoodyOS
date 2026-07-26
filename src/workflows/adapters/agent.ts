@@ -60,7 +60,9 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
     )).rows[0];
   }
   if (task.status === 'failed') throw new Error(typeof task.error === 'object' && task.error && 'message' in task.error ? String((task.error as { message: unknown }).message) : `Agent node ${node.id} failed`);
-  let output = task.status === 'completed' ? task.output : await executeAgentTask(task.id, task.trace_id);
+  let output = task.status === 'completed'
+    ? task.output
+    : await executeAgentTask(task.id, task.trace_id, execution.signal);
   if (output && typeof output === 'object' && 'awaitingApproval' in output) return { waiting: true, waitingMessage: 'Agent tool confirmation is required', output };
   if (output === null) {
     task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>('SELECT id,status,output,error,trace_id FROM tasks WHERE id=$1', [task.id])).rows[0];

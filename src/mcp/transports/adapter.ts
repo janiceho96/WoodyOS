@@ -22,9 +22,9 @@ export type McpCallResult = {
 
 export interface McpTransportSession {
   readonly info: McpConnectionInfo;
-  ping(): Promise<void>;
-  listTools(): Promise<McpDiscoveredTool[]>;
-  callTool(name: string, arguments_: Record<string, unknown>): Promise<McpCallResult>;
+  ping(signal?: AbortSignal): Promise<void>;
+  listTools(signal?: AbortSignal): Promise<McpDiscoveredTool[]>;
+  callTool(name: string, arguments_: Record<string, unknown>, signal?: AbortSignal): Promise<McpCallResult>;
   close(): Promise<void>;
 }
 
@@ -34,5 +34,6 @@ export interface McpTransportAdapter {
     endpointUrl: string;
     headers?: Record<string, string>;
     authProvider?: import('@modelcontextprotocol/sdk/client/auth.js').OAuthClientProvider;
+    signal?: AbortSignal;
   }): Promise<McpTransportSession>;
 }

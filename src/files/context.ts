@@ -19,7 +19,9 @@ async function searchFiles(
   requestText: string,
   limit = boundedEnvironmentNumber('FILE_CONTEXT_CHUNKS', 4, 1, 12),
   maxCharacters = boundedEnvironmentNumber('FILE_CONTEXT_MAX_CHARACTERS', 7_000, 2_000, 20_000),
+  signal?: AbortSignal,
 ) {
+  signal?.throwIfAborted();
   if (!fileIds.length) return [] as FileCitation[];
   const search = requestText.replace(/\s+/g, ' ').trim().slice(0, 1_000);
   const ranked = search.length >= 2
@@ -66,6 +68,7 @@ async function searchFiles(
     });
     if (result.length >= limit) break;
   }
+  signal?.throwIfAborted();
   return result;
 }
 
@@ -84,11 +87,23 @@ export async function retrieveExplicitFileContext(workspaceId: string, fileIds: 
   return { text: contextText(citations), citations };
 }
 
-export async function retrieveTaskAttachmentContext(taskId: string, requestText: string) {
+export async function retrieveTaskAttachmentContext(
+  taskId: string,
+  requestText: string,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
   const task = (await query<{ workspace_id: string }>('SELECT workspace_id FROM tasks WHERE id=$1', [taskId])).rows[0];
   if (!task) return { text: '', citations: [] as FileCitation[] };
   const files = await query<{ file_id: string }>('SELECT file_id FROM task_attachments WHERE task_id=$1 AND workspace_id=$2', [taskId, task.workspace_id]);
-  const citations = await searchFiles(task.workspace_id, files.rows.map((row) => row.file_id), requestText);
+  const citations = await searchFiles(
+    task.workspace_id,
+    files.rows.map((row) => row.file_id),
+    requestText,
+    undefined,
+    undefined,
+    signal,
+  );
   return { text: contextText(citations), citations };
 }
 

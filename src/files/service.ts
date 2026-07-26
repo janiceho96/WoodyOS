@@ -8,6 +8,7 @@ import {
   createTraceContext,
   type TraceContext,
 } from '../runtime/trace.js';
+import { combinedAbortSignal } from '../runtime/cancellation.js';
 
 type UploadLike = {
   filename: string;
@@ -150,7 +151,8 @@ export async function ingestFileBuffer(input: {
   return { file, deduplicated: false };
 }
 
-async function scanFile(file: FileRecord, content: Buffer) {
+async function scanFile(file: FileRecord, content: Buffer, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   const endpoint = process.env.MALWARE_SCANNER_URL;
   if (!endpoint) {
     await query("UPDATE files SET scan_status='not_configured',updated_at=now() WHERE id=$1", [file.id]);
@@ -162,7 +164,7 @@ async function scanFile(file: FileRecord, content: Buffer) {
     method: 'POST',
     headers: process.env.MALWARE_SCANNER_TOKEN ? { authorization: `Bearer ${process.env.MALWARE_SCANNER_TOKEN}` } : {},
     body: form,
-    signal: AbortSignal.timeout(30_000),
+    signal: combinedAbortSignal(signal, 30_000),
   });
   if (!response.ok) throw new Error(`Malware scanner returned ${response.status}`);
   const result = await response.json() as { clean?: boolean; infected?: boolean; detail?: string };
@@ -177,14 +179,15 @@ function extractionUrl() {
   return `${(process.env.EXTRACTOR_URL ?? 'http://localhost:8000').replace(/\/$/, '')}/extract`;
 }
 
-async function extractFile(file: FileRecord, content: Buffer) {
+async function extractFile(file: FileRecord, content: Buffer, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   const form = new FormData();
   form.append('file', new Blob([new Uint8Array(content)], { type: file.mime_type }), file.original_name);
   const response = await fetch(extractionUrl(), {
     method: 'POST',
     headers: process.env.EXTRACTOR_TOKEN ? { authorization: `Bearer ${process.env.EXTRACTOR_TOKEN}` } : {},
     body: form,
-    signal: AbortSignal.timeout(120_000),
+    signal: combinedAbortSignal(signal, 120_000),
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => null) as { detail?: string } | null;
@@ -219,7 +222,9 @@ function extractedChunks(extracted: ExtractedPayload) {
 export async function processFile(
   fileId: string,
   trace: TraceContext = childTraceContext(createTraceContext()),
+  signal?: AbortSignal,
 ) {
+  signal?.throwIfAborted();
   const file = (await query<FileRecord>(
     `UPDATE files SET status='scanning',error_message=NULL,updated_at=now()
       WHERE id=$1 AND status IN ('scanning','extracting','failed') RETURNING *`,
@@ -228,10 +233,11 @@ export async function processFile(
   if (!file) return null;
   try {
     const content = await privateFileStorage().read(file.storage_key);
-    await scanFile(file, content);
+    await scanFile(file, content, signal);
     await query("UPDATE files SET status='extracting',updated_at=now() WHERE id=$1", [file.id]);
     await query("UPDATE file_extractions SET status='processing',error_message=NULL,updated_at=now() WHERE file_id=$1", [file.id]);
-    const extracted = await extractFile(file, content);
+    const extracted = await extractFile(file, content, signal);
+    signal?.throwIfAborted();
     const chunks = extractedChunks(extracted);
     if (!chunks.length) throw new Error('FILE_HAS_NO_INDEXABLE_CONTENT');
 

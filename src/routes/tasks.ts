@@ -14,6 +14,7 @@ import {
   redactRuntimeValue,
   serializeRuntimeError,
 } from '../runtime/errors.js';
+import { requestCancellation } from '../runtime/cancellation.js';
 
 const taskInput = z.object({
   agentId: z.string().uuid(),
@@ -223,21 +224,18 @@ export async function taskRoutes(app: FastifyInstance) {
     };
   }));
   app.post('/:id/cancel', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
-    const result = await query("UPDATE tasks SET status='cancelled',completed_at=now(),updated_at=now() WHERE id=$1 AND workspace_id=$2 AND status IN ('queued','running','awaiting_approval') RETURNING *", [(request.params as { id: string }).id, request.user.workspaceId]);
-    if (!result.rowCount) return reply.code(409).send({ error: 'TASK_CANNOT_BE_CANCELLED' });
-    await query(
-      `UPDATE action_authorizations SET status='rejected',resolved_by=$1,decision_comment='Source task was cancelled',resolved_at=now()
-       WHERE task_id=$2 AND status='awaiting_confirmation'`,
-      [request.user.sub, result.rows[0].id],
-    );
-    await query("UPDATE task_runtime_checkpoints SET status='failed',updated_at=now() WHERE task_id=$1 AND status='awaiting_confirmation'", [result.rows[0].id]);
-    await query("UPDATE mcp_tool_confirmations SET status='expired',resolved_at=now() WHERE tool_call_id IN (SELECT id FROM mcp_tool_calls WHERE task_id=$1) AND status='pending'", [result.rows[0].id]);
-    await query("UPDATE mcp_tool_calls SET status='cancelled',completed_at=now() WHERE task_id=$1 AND status IN ('pending','awaiting_confirmation')", [result.rows[0].id]);
-    await query("UPDATE artifacts SET status='failed',error_message='Source task was cancelled',updated_at=now() WHERE task_id=$1 AND status='pending'", [result.rows[0].id]);
+    const id = (request.params as { id: string }).id;
+    const result = await requestCancellation({
+      kind: 'task',
+      id,
+      workspaceId: request.user.workspaceId,
+      actorId: request.user.sub,
+    });
+    if (!result) return reply.code(409).send({ error: 'TASK_CANNOT_BE_CANCELLED' });
     const cancellationTrace = childTraceContext({
-      traceId: result.rows[0].trace_id,
-      spanId: result.rows[0].span_id,
-      parentSpanId: result.rows[0].parent_span_id,
+      traceId: result.trace_id,
+      spanId: result.span_id,
+      parentSpanId: result.parent_span_id,
     });
     await query(
       `INSERT INTO task_events(
@@ -245,15 +243,16 @@ export async function taskRoutes(app: FastifyInstance) {
        ) VALUES($1,$2,$3,$4,$5,$6,$7)`,
       [
         request.user.workspaceId,
-        result.rows[0].id,
-        'task.cancelled',
-        'Task cancelled by user',
+        result.id,
+        'task.cancel_requested',
+        'Task cancellation requested by user',
         cancellationTrace.traceId,
         cancellationTrace.spanId,
         cancellationTrace.parentSpanId,
       ],
     );
-    return result.rows[0];
+    await audit(request.user.workspaceId, request.user.sub, 'task.cancel_requested', 'task', result.id);
+    return reply.code(202).send(result);
   }));
   app.put('/:id/feedback', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const input = parse(feedbackInput, request.body, reply); if (!input) return;

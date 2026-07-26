@@ -47,7 +47,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
   if (!(await beginWorkflowAction(authorization.authorizationId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
   await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
   try {
-    const output = limitedActionResult(await invokeTool(tool, arguments_));
+    const output = limitedActionResult(await invokeTool(tool, arguments_, false, execution.signal));
     await completeWorkflowAction(authorization.authorizationId, output);
     await emitEvent('api.completed', `${tool.name} completed`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
     setNodeOutput(output);

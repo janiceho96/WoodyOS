@@ -5,6 +5,7 @@ import type { AuthorizedMcpTool } from './runtime.js';
 import { argumentHash, safeArgumentsSummary } from './runtime.js';
 import type { TraceContext } from '../runtime/trace.js';
 import { redactRuntimeMessage, redactRuntimeValue } from '../runtime/errors.js';
+import { cancellationError } from '../runtime/cancellation.js';
 
 export type TaskActionCheckpointState = {
   provider: 'anthropic' | 'openai-compatible';
@@ -72,6 +73,27 @@ export async function pauseForActionConfirmation(input: {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+    const taskReference = (await client.query<{ workflow_run_id: string | null }>(
+      'SELECT workflow_run_id FROM tasks WHERE id=$1 AND workspace_id=$2',
+      [input.taskId, input.workspaceId],
+    )).rows[0];
+    if (!taskReference) throw cancellationError();
+    if (taskReference.workflow_run_id) {
+      const workflowStatus = (await client.query<{ status: string }>(
+        'SELECT status FROM workflow_runs WHERE id=$1 AND workspace_id=$2 FOR UPDATE',
+        [taskReference.workflow_run_id, input.workspaceId],
+      )).rows[0]?.status;
+      if (['cancel_requested', 'cancelling', 'cancelled', 'cancelled_with_side_effects'].includes(String(workflowStatus))) {
+        throw cancellationError();
+      }
+    }
+    const taskStatus = (await client.query<{ status: string }>(
+      'SELECT status FROM tasks WHERE id=$1 AND workspace_id=$2 FOR UPDATE',
+      [input.taskId, input.workspaceId],
+    )).rows[0]?.status;
+    if (['cancel_requested', 'cancelling', 'cancelled', 'cancelled_with_side_effects'].includes(String(taskStatus))) {
+      throw cancellationError();
+    }
     let callId: string | null = null;
     if (input.mcpTool) {
       const call = await client.query<{ id: string }>(
@@ -117,12 +139,16 @@ export async function pauseForActionConfirmation(input: {
       [input.taskId, input.workspaceId, input.state.provider, JSON.stringify(encrypted), callId, input.authorizationId],
     );
     await client.query(
-      `UPDATE tasks SET status='awaiting_approval',updated_at=now() WHERE id=$1 AND workspace_id=$2`,
+      `UPDATE tasks SET status='awaiting_approval',updated_at=now()
+        WHERE id=$1 AND workspace_id=$2
+          AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')`,
       [input.taskId, input.workspaceId],
     );
     if (input.workflowRunId) {
       await client.query(
-        `UPDATE workflow_runs SET status='awaiting_approval' WHERE id=$1 AND workspace_id=$2`,
+        `UPDATE workflow_runs SET status='awaiting_approval'
+          WHERE id=$1 AND workspace_id=$2
+            AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')`,
         [input.workflowRunId, input.workspaceId],
       );
     }

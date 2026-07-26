@@ -146,12 +146,14 @@ export async function retrieveAgentKnowledge(
   requestText: string,
   limit = 4,
   trace?: TraceContext,
+  signal?: AbortSignal,
 ) {
   const results = await searchWorkspaceKnowledge(
     workspaceId,
     requestText,
     Math.min(8, Math.max(1, limit)),
     trace,
+    signal,
   );
   if (!results.length) return '';
   return results

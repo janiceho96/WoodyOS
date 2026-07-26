@@ -31,7 +31,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   await emitEvent('tool.called', `Calling ${tool.name}`, { toolId: tool.id, iterationKey, attempt: cursor.attempt }, actionTrace);
   let output: unknown;
   try {
-    output = await invokeTool(tool, input);
+    output = await invokeTool(tool, input, false, execution.signal);
   } catch (error) {
     if (toolRequiresApproval(tool)) throw uncertainActionOutcome(error);
     throw error;

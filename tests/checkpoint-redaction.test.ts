@@ -6,6 +6,12 @@ const state = vi.hoisted(() => ({
 
 const client = {
   async query(sql: string) {
+    if (sql.includes('SELECT workflow_run_id FROM tasks')) {
+      return { rowCount: 1, rows: [{ workflow_run_id: null }] };
+    }
+    if (sql.includes('SELECT status FROM tasks')) {
+      return { rowCount: 1, rows: [{ status: 'running' }] };
+    }
     if (sql.includes('INSERT INTO mcp_tool_calls')) {
       return { rowCount: 1, rows: [{ id: '00000000-0000-4000-8000-000000000020' }] };
     }

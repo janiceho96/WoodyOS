@@ -16,12 +16,13 @@ import {
   validateManifestCompatibility,
   type ExecutionManifest,
 } from '../runtime/manifest.js';
-import { authoritativeTraceContext, createTraceContext } from '../runtime/trace.js';
+import { authoritativeTraceContext, childTraceContext, createTraceContext } from '../runtime/trace.js';
 import {
   redactRuntimeMessage,
   redactRuntimeValue,
   serializeRuntimeError,
 } from '../runtime/errors.js';
+import { requestCancellation } from '../runtime/cancellation.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -524,6 +525,38 @@ export async function workflowRoutes(app: FastifyInstance) {
         estimatedCostUsd: Number(totals.estimated_cost_usd),
       },
     };
+  }));
+  app.post('/runs/:runId/cancel', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const runId = (request.params as { runId: string }).runId;
+    const result = await requestCancellation({
+      kind: 'workflow_run',
+      id: runId,
+      workspaceId: request.user.workspaceId,
+      actorId: request.user.sub,
+    });
+    if (!result) return reply.code(409).send({ error: 'WORKFLOW_RUN_CANNOT_BE_CANCELLED' });
+    const trace = childTraceContext({
+      traceId: result.trace_id,
+      spanId: result.span_id,
+      parentSpanId: result.parent_span_id,
+    });
+    await query(
+      `INSERT INTO workflow_run_events(
+         workspace_id,workflow_run_id,node_id,event_type,message,payload,trace_id,span_id,parent_span_id
+       ) VALUES($1,$2,NULL,$3,$4,$5,$6,$7,$8)`,
+      [
+        request.user.workspaceId,
+        result.id,
+        'workflow.cancel_requested',
+        'Workflow cancellation requested by user',
+        '{}',
+        trace.traceId,
+        trace.spanId,
+        trace.parentSpanId,
+      ],
+    );
+    await audit(request.user.workspaceId, request.user.sub, 'workflow.cancel_requested', 'workflow_run', result.id);
+    return reply.code(202).send(result);
   }));
   app.post('/runs/:runId/approvals/:approvalId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;

@@ -10,6 +10,7 @@ import {
   createTraceContext,
   type TraceContext,
 } from '../runtime/trace.js';
+import { combinedAbortSignal } from '../runtime/cancellation.js';
 
 type ArtifactSource = { title: string; output: unknown; created_by: string | null; status: string };
 
@@ -81,7 +82,12 @@ function generatorUrl() {
   return `${(process.env.EXTRACTOR_URL ?? 'http://localhost:8000').replace(/\/$/, '')}/generate`;
 }
 
-export async function generateArtifact(artifactId: string, _trace?: TraceContext) {
+export async function generateArtifact(
+  artifactId: string,
+  _trace?: TraceContext,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
   const artifact = (await query<ArtifactRecord>(
     `UPDATE artifacts SET status='generating',error_message=NULL,updated_at=now()
       WHERE id=$1 AND status IN ('queued','generating','failed') RETURNING *`,
@@ -103,7 +109,7 @@ export async function generateArtifact(artifactId: string, _trace?: TraceContext
         : null;
     const response = await fetch(generatorUrl(), {
       method: 'POST',
-      signal: AbortSignal.timeout(90_000),
+      signal: combinedAbortSignal(signal, 90_000),
       headers: {
         'content-type': 'application/json',
         ...(process.env.EXTRACTOR_TOKEN ? { authorization: `Bearer ${process.env.EXTRACTOR_TOKEN}` } : {}),
@@ -115,6 +121,7 @@ export async function generateArtifact(artifactId: string, _trace?: TraceContext
       throw new Error(detail?.detail ?? `Artifact generator returned ${response.status}`);
     }
     const bytes = Buffer.from(await response.arrayBuffer());
+    signal?.throwIfAborted();
     if (!bytes.length) throw new Error('ARTIFACT_GENERATOR_RETURNED_EMPTY_FILE');
     if (bytes.length > 50 * 1024 * 1024) throw new Error('ARTIFACT_EXCEEDS_50_MB_LIMIT');
     const storage = artifactStorage();
@@ -145,10 +152,12 @@ async function requestArtifacts(input: {
   title: string;
   formats: ArtifactFormat[];
   ready: boolean;
+  signal?: AbortSignal;
 }) {
   const records: ArtifactRecord[] = [];
   const enqueueIds = new Set<string>();
   for (const format of [...new Set(input.formats)]) {
+    input.signal?.throwIfAborted();
     const info = artifactFormatInfo[format];
     const inserted = (await query<ArtifactRecord>(
       `INSERT INTO artifacts(
@@ -172,15 +181,16 @@ async function requestArtifacts(input: {
       if (reset) { records.push(reset); if (input.ready) enqueueIds.add(reset.id); }
     } else if (selected) records.push(selected);
   }
+  input.signal?.throwIfAborted();
   if (input.ready) await enqueuePreparedArtifacts(records.filter((record) => enqueueIds.has(record.id)));
   return records;
 }
 
-export function requestTaskArtifacts(input: { workspaceId: string; createdBy: string | null; taskId: string; title: string; formats: ArtifactFormat[]; ready: boolean }) {
+export function requestTaskArtifacts(input: { workspaceId: string; createdBy: string | null; taskId: string; title: string; formats: ArtifactFormat[]; ready: boolean; signal?: AbortSignal }) {
   return requestArtifacts(input);
 }
 
-export function requestWorkflowArtifacts(input: { workspaceId: string; createdBy: string | null; workflowRunId: string; title: string; formats: ArtifactFormat[]; ready: boolean }) {
+export function requestWorkflowArtifacts(input: { workspaceId: string; createdBy: string | null; workflowRunId: string; title: string; formats: ArtifactFormat[]; ready: boolean; signal?: AbortSignal }) {
   return requestArtifacts(input);
 }
 
@@ -207,8 +217,10 @@ export async function requestTaskVersionArtifacts(input: {
   }
 }
 
-export async function releaseTaskArtifacts(taskId: string) {
+export async function releaseTaskArtifacts(taskId: string, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   const rows = (await query<ArtifactRecord>("UPDATE artifacts SET status='queued',updated_at=now() WHERE task_id=$1 AND status='pending' RETURNING *", [taskId])).rows;
+  signal?.throwIfAborted();
   await enqueuePreparedArtifacts(rows);
   return rows;
 }

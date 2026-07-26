@@ -97,7 +97,33 @@ function subjectColumns(subject: ActionSubject) {
     };
 }
 
+async function subjectAllowsActions(input: Pick<ActionRequest, 'workspaceId' | 'subject'>) {
+  const result = input.subject.type === 'task'
+    ? await query<{ subject_allows_actions: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM tasks WHERE id=$1 AND workspace_id=$2
+           AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+       ) subject_allows_actions`,
+      [input.subject.taskId, input.workspaceId],
+    )
+    : await query<{ subject_allows_actions: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM workflow_runs WHERE id=$1 AND workspace_id=$2
+           AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+       ) subject_allows_actions`,
+      [input.subject.workflowRunId, input.workspaceId],
+    );
+  return result.rows[0]?.subject_allows_actions !== false;
+}
+
 export async function authorizeAction(input: ActionRequest) {
+  if (!(await subjectAllowsActions(input))) {
+    return {
+      status: 'denied' as const,
+      authorizationId: null,
+      reason: 'Execution cancellation has been requested',
+    };
+  }
   const hash = actionArgumentHash(input.arguments);
   const subject = subjectColumns(input.subject);
   const existing = (await query<AuthorizationRow>(
@@ -136,7 +162,26 @@ export async function authorizeAction(input: ActionRequest) {
          workspace_id,subject_type,workflow_run_id,task_id,agent_id,node_id,iteration_key,attempt,action_key,
          adapter,resource_id,operation,target_summary,risk_level,arguments_summary,arguments_hash,status,requested_by,resolved_at,
          trace_id,span_id,parent_span_id
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,CASE WHEN $17='approved' THEN now() ELSE NULL END,$19,$20,$21)
+       ) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                CASE WHEN $17='approved' THEN now() ELSE NULL END,$19,$20,$21
+         WHERE (
+           (
+             $2='task'
+             AND EXISTS(
+               SELECT 1 FROM tasks task
+               WHERE task.id=$4 AND task.workspace_id=$1
+                 AND task.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+             )
+           )
+           OR (
+             $2='workflow_run'
+             AND EXISTS(
+               SELECT 1 FROM workflow_runs run
+               WHERE run.id=$3 AND run.workspace_id=$1
+                 AND run.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+             )
+           )
+         )
        RETURNING id`,
       [
         input.workspaceId,
@@ -165,6 +210,13 @@ export async function authorizeAction(input: ActionRequest) {
   } catch (error) {
     if ((error as { code?: string }).code === '23505') return authorizeAction(input);
     throw error;
+  }
+  if (!inserted.rowCount) {
+    return {
+      status: 'denied' as const,
+      authorizationId: null,
+      reason: 'Execution cancellation has been requested',
+    };
   }
   return status === 'approved'
     ? { status: 'allowed' as const, authorizationId: inserted.rows[0].id }
@@ -195,7 +247,27 @@ export function authorizeWorkflowAction(input: WorkflowActionRequest) {
 
 export async function beginAction(authorizationId: string) {
   const claimed = await query<{ id: string }>(
-    "UPDATE action_authorizations SET status='executing' WHERE id=$1 AND status='approved' RETURNING id",
+    `UPDATE action_authorizations authorization SET status='executing'
+      WHERE authorization.id=$1 AND authorization.status='approved'
+        AND (
+          (
+            authorization.subject_type='task'
+            AND EXISTS(
+              SELECT 1 FROM tasks task
+              WHERE task.id=authorization.task_id
+                AND task.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+            )
+          )
+          OR (
+            authorization.subject_type='workflow_run'
+            AND EXISTS(
+              SELECT 1 FROM workflow_runs run
+              WHERE run.id=authorization.workflow_run_id
+                AND run.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+            )
+          )
+        )
+      RETURNING authorization.id`,
     [authorizationId],
   );
   return Boolean(claimed.rowCount);

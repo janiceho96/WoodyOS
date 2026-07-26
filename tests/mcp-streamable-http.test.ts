@@ -62,4 +62,40 @@ describe('Streamable HTTP MCP adapter', () => {
     expect(requests.find((request) => request.body?.method === 'initialize')?.session).toBeNull();
     expect(requests.find((request) => request.body?.method === 'tools/list')?.session).toBe('test-session');
   });
+
+  it('propagates caller cancellation into a tool transport request', async () => {
+    let toolSignal: AbortSignal | null = null;
+    const fakeFetch: typeof fetch = async (_input, init) => {
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) as Record<string, unknown> : null;
+      if (body?.method === 'tools/call') toolSignal = init?.signal as AbortSignal;
+      if (!body || body.method === 'notifications/initialized') return new Response(null, { status: 202 });
+      return Response.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: body.method === 'initialize'
+          ? {
+            protocolVersion: '2025-11-25',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'Test MCP', version: '1.0.0' },
+          }
+          : body.method === 'tools/call'
+            ? { content: [], isError: false }
+            : {},
+      });
+    };
+    const adapter = new StreamableHttpAdapter({
+      validateEndpoint: async (raw) => new URL(raw),
+      fetchFactory: () => fakeFetch,
+    });
+    const controller = new AbortController();
+    const session = await adapter.connect({
+      endpointUrl: 'https://203.0.113.10/mcp',
+      signal: controller.signal,
+    });
+    await session.callTool('lookup', {}, controller.signal);
+    controller.abort();
+
+    expect(toolSignal?.aborted).toBe(true);
+    await session.close();
+  });
 });

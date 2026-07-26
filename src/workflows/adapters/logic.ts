@@ -1,6 +1,7 @@
 import { query } from '../../db/client.js';
 import { evaluateCondition, valueAtPath, type WorkflowNode } from '../definition.js';
 import type { WorkflowAdapterContext, WorkflowCursor } from './types.js';
+import { cancellationError } from '../../runtime/cancellation.js';
 
 export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Record<string, unknown>) {
   const mode = String(node.config.mode ?? 'forEach');
@@ -74,7 +75,7 @@ export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Re
 }
 
 export async function executeLogicNode(context: WorkflowAdapterContext) {
-  const { run, node, cursor, iterationKey, emitEvent, setNodeOutput } = context;
+  const { execution, run, node, cursor, iterationKey, emitEvent, setNodeOutput } = context;
   if (node.type === 'trigger') return { result: run.input, output: run.input };
   if (node.type === 'condition') {
     const result = evaluateCondition(node.config, run.state);
@@ -94,7 +95,19 @@ export async function executeLogicNode(context: WorkflowAdapterContext) {
     [run.id, node.id, iterationKey, cursor.attempt],
   )).rows[0];
   if (!approval) {
-    await query('INSERT INTO workflow_approvals(workspace_id,workflow_run_id,node_id,iteration_key,attempt) VALUES($1,$2,$3,$4,$5)', [run.workspace_id, run.id, node.id, iterationKey, cursor.attempt]);
+    execution.signal.throwIfAborted();
+    const inserted = await query(
+      `INSERT INTO workflow_approvals(workspace_id,workflow_run_id,node_id,iteration_key,attempt)
+       SELECT $1,$2,$3,$4,$5
+       WHERE EXISTS(
+         SELECT 1 FROM workflow_runs
+         WHERE id=$2 AND workspace_id=$1
+           AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+       )
+       RETURNING id`,
+      [run.workspace_id, run.id, node.id, iterationKey, cursor.attempt],
+    );
+    if (!inserted.rowCount) throw cancellationError();
     return { waiting: true, waitingMessage: 'Human approval is required', output: null };
   }
   if (approval.status === 'pending') return { waiting: true, waitingMessage: 'Human approval is required', output: null };

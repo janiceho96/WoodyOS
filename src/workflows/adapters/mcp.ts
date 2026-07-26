@@ -55,6 +55,7 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
       workflowAttempt: cursor.attempt,
       actionAuthorizationId: authorization.authorizationId,
       trace: childTraceContext(actionTrace),
+      signal: execution.signal,
     });
     await completeWorkflowAction(authorization.authorizationId, executed.result);
     await emitEvent('mcp.tool.completed', `${actionName} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.callId, toolId: tool.id }, actionTrace);

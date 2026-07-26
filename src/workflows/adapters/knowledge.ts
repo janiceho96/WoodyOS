@@ -10,7 +10,13 @@ export async function executeKnowledgeSearchNode(context: WorkflowAdapterContext
   if (!search || search.length < 2) throw new Error(`Knowledge search ${node.id} resolved to an empty query`);
   const limit = Math.min(20, Math.max(1, Number(node.config.limit ?? 8)));
   await emitEvent('knowledge.search_started', 'Searching workspace Knowledge', { limit }, operationTrace);
-  const results = await searchWorkspaceKnowledge(run.workspace_id, search, limit, operationTrace);
+  const results = await searchWorkspaceKnowledge(
+    run.workspace_id,
+    search,
+    limit,
+    operationTrace,
+    execution.signal,
+  );
   const output = { query: search, count: results.length, results };
   await emitEvent('knowledge.search_completed', `Found ${results.length} Knowledge result${results.length === 1 ? '' : 's'}`, { count: results.length }, operationTrace);
   setNodeOutput(output);

@@ -35,7 +35,11 @@ export type WorkflowRunRecord = {
 };
 
 export type AgentTaskResult = null | Record<string, unknown>;
-export type AgentTaskExecutor = (taskId: string, traceId?: string) => Promise<AgentTaskResult>;
+export type AgentTaskExecutor = (
+  taskId: string,
+  traceId?: string,
+  signal?: AbortSignal,
+) => Promise<AgentTaskResult>;
 
 export type WorkflowAdapterExecution = {
   output: unknown;

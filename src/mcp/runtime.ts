@@ -114,6 +114,7 @@ export async function executeAuthorizedMcpTool(input: {
   actionAuthorizationId?: string | null;
   toolCallId?: string;
   trace: TraceContext;
+  signal?: AbortSignal;
 }) {
   assertMcpPermission(input.tool);
   let callId = input.toolCallId;
@@ -154,9 +155,13 @@ export async function executeAuthorizedMcpTool(input: {
   try {
     const credentials = decryptMcpCredentials(input.tool.workspace_id, input.tool.connection_id, input.tool.encrypted_credentials);
     const headers = requestHeaders(input.tool.auth_type, credentials);
-    const session = await mcpTransport(input.tool.transport).connect({ endpointUrl: input.tool.endpoint_url, headers });
+    const session = await mcpTransport(input.tool.transport).connect({
+      endpointUrl: input.tool.endpoint_url,
+      headers,
+      signal: input.signal,
+    });
     try {
-      const result = await session.callTool(input.tool.remote_name, input.arguments_);
+      const result = await session.callTool(input.tool.remote_name, input.arguments_, input.signal);
       const safeResult = limitedActionResult(result);
       await query(
         `UPDATE mcp_tool_calls SET status=$1,result_summary=$2,duration_ms=$3,completed_at=now()

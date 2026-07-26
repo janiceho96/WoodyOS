@@ -4,6 +4,7 @@ import { isPublicIp } from '../lib/network.js';
 import type { Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
 import { invokeJobTool, isJobToolConfig } from './jobs/index.js';
 import { invokeWebTool, isWebToolConfig } from './web/index.js';
+import { combinedAbortSignal } from '../runtime/cancellation.js';
 
 export type StoredConfig = { version: 1; iv: string; tag: string; data: string };
 export type ToolRecord = { id: string; name: string; kind: 'mcp' | 'api' | 'plugin' | 'internal'; config: StoredConfig; permissions: string[] };
@@ -55,7 +56,12 @@ export function definitionFor(tool: ToolRecord): Tool {
   return { name: `tool_${tool.id.replaceAll('-', '_')}`, description: String(config.agentDescription ?? tool.name), input_schema: inputSchema as Tool['input_schema'] };
 }
 
-export async function invokeTool(tool: ToolRecord, input: Record<string, unknown>, healthCheck = false) {
+export async function invokeTool(
+  tool: ToolRecord,
+  input: Record<string, unknown>,
+  healthCheck = false,
+  callerSignal?: AbortSignal,
+) {
   const config = decryptJson(tool.config);
   if (isWebToolConfig(config)) return invokeWebTool(config, input, healthCheck);
   if (isJobToolConfig(config)) return invokeJobTool(config, input, healthCheck);
@@ -63,7 +69,7 @@ export async function invokeTool(tool: ToolRecord, input: Record<string, unknown
   if (healthCheck && typeof healthUrl !== 'string') throw new Error('A healthCheckUrl is required to test this tool safely');
   const endpoint = await safeEndpoint(String(healthCheck ? healthUrl : config.endpoint ?? ''));
   const headers = headersFrom(config.headers);
-  const timeout = AbortSignal.timeout(20_000);
+  const timeout = combinedAbortSignal(callerSignal, 20_000);
   let response: Response;
   if (healthCheck) {
     response = await fetch(endpoint, { method: 'GET', signal: timeout, headers });
