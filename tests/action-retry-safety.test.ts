@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const gateway = vi.hoisted(() => ({
+  failWorkflowAction: vi.fn(async () => undefined),
+}));
 
 vi.mock('../src/db/client.js', () => ({
   query: vi.fn(async (sql: string) => {
@@ -30,7 +34,7 @@ vi.mock('../src/policy/action-gateway.js', () => ({
   })),
   beginWorkflowAction: vi.fn(async () => true),
   completeWorkflowAction: vi.fn(async () => undefined),
-  failWorkflowAction: vi.fn(async () => undefined),
+  failWorkflowAction: gateway.failWorkflowAction,
 }));
 vi.mock('../src/runtime/manifest.js', () => ({
   assertWorkflowRunManifestDependencies: vi.fn(async () => undefined),
@@ -40,6 +44,11 @@ import { executeApiActionNode } from '../src/workflows/adapters/api.js';
 import { serializeRuntimeError } from '../src/runtime/errors.js';
 
 describe('action retry safety', () => {
+  beforeEach(() => {
+    gateway.failWorkflowAction.mockReset();
+    gateway.failWorkflowAction.mockResolvedValue(undefined);
+  });
+
   it('maps an uncertain write outcome before it reaches workflow retry authority', async () => {
     let failure: unknown;
     try {
@@ -81,5 +90,63 @@ describe('action retry safety', () => {
       retryable: false,
     });
     expect(JSON.stringify(serializeRuntimeError(failure))).not.toContain('remote-secret');
+  });
+
+  it('preserves an uncertain workflow action error when ledger failure persistence rejects', async () => {
+    gateway.failWorkflowAction.mockRejectedValueOnce(
+      new Error('ledger update failed with token=ledger-secret'),
+    );
+
+    let failure: unknown;
+    try {
+      await executeApiActionNode({
+        execution: {
+          mode: 'test',
+          manifest: null,
+          signal: new AbortController().signal,
+          trace: {
+            traceId: '00000000-0000-4000-8000-000000000001',
+            spanId: '00000000-0000-4000-8000-000000000002',
+            parentSpanId: null,
+          },
+        },
+        run: {
+          id: '00000000-0000-4000-8000-000000000003',
+          workspace_id: '00000000-0000-4000-8000-000000000004',
+          created_by: '00000000-0000-4000-8000-000000000005',
+          state: {},
+        },
+        node: {
+          id: 'write',
+          type: 'api_action',
+          config: { toolId: '00000000-0000-4000-8000-000000000010', input: {} },
+        },
+        cursor: { nodeId: 'write', loops: {}, attempt: 1 },
+        iterationKey: 'root',
+        resolve: (value: unknown) => value,
+        emitEvent: async () => undefined,
+        setNodeOutput: () => undefined,
+      } as never);
+    } catch (error) {
+      failure = error;
+    }
+
+    const serialized = serializeRuntimeError(failure);
+    expect(serialized).toMatchObject({
+      code: 'ACTION_OUTCOME_UNCERTAIN',
+      category: 'permanent',
+      retryable: false,
+      details: {
+        operatorContext: {
+          actionFailurePersistence: {
+            code: 'RUNTIME_ERROR',
+            category: 'unknown',
+            retryable: false,
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(serialized)).not.toContain('remote-secret');
+    expect(JSON.stringify(serialized)).not.toContain('ledger-secret');
   });
 });

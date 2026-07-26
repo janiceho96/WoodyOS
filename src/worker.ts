@@ -52,6 +52,7 @@ import {
 import type { AgentVersionSnapshot } from './agents/versions.js';
 import type { WorkflowDefinition } from './workflows/definition.js';
 import {
+  preserveActionFailure,
   redactRuntimeMessage,
   redactRuntimeValue,
   serializeRuntimeError,
@@ -219,7 +220,7 @@ async function authorizeTaskToolAction(
   return { ...authorization, trace };
 }
 
-async function executeTaskToolAction(input: {
+export async function executeTaskToolAction(input: {
   task: Task;
   action: TaskToolAction;
   arguments_: Record<string, unknown>;
@@ -252,8 +253,10 @@ async function executeTaskToolAction(input: {
       ? toolRiskLevel(input.action.tool)
       : input.action.tool.risk_level;
     const failure = risk === 'read' ? error : uncertainActionOutcome(error);
-    await failAction(input.authorizationId, failure);
-    throw failure;
+    throw await preserveActionFailure(
+      failure,
+      () => failAction(input.authorizationId, failure),
+    );
   }
 }
 

@@ -5,7 +5,7 @@ import type { WorkflowAdapterContext } from './types.js';
 import { limitedActionResult } from '../../lib/action-safety.js';
 import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
 import { childTraceContext } from '../../runtime/trace.js';
-import { uncertainActionOutcome } from '../../runtime/errors.js';
+import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/errors.js';
 
 export async function executeApiActionNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -54,7 +54,9 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     return { output, result: output };
   } catch (error) {
     const failure = toolRiskLevel(tool) === 'read' ? error : uncertainActionOutcome(error);
-    await failWorkflowAction(authorization.authorizationId, failure);
-    throw failure;
+    throw await preserveActionFailure(
+      failure,
+      () => failWorkflowAction(authorization.authorizationId, failure),
+    );
   }
 }

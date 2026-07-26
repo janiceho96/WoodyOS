@@ -276,3 +276,32 @@ export function uncertainActionOutcome(cause: unknown) {
     cause,
   });
 }
+
+export async function preserveActionFailure(
+  failure: unknown,
+  persist: () => Promise<unknown>,
+) {
+  try {
+    await persist();
+    return failure;
+  } catch (persistenceFailure) {
+    const primary = serializeRuntimeError(failure);
+    const primaryDetails = primary.details && typeof primary.details === 'object' && !Array.isArray(primary.details)
+      ? primary.details as Record<string, unknown>
+      : primary.details === undefined
+        ? {}
+        : { primaryDetails: primary.details };
+    return runtimeError(primary.code, {
+      category: primary.category,
+      retryable: primary.retryable,
+      message: primary.message,
+      details: {
+        ...primaryDetails,
+        operatorContext: {
+          actionFailurePersistence: serializeRuntimeError(persistenceFailure),
+        },
+      },
+      cause: failure,
+    });
+  }
+}
