@@ -88,7 +88,7 @@ export function AgentBuilderPage() {
         name: draft.name.trim(), role: draft.role.trim(), goal: draft.goal.trim(), personality: draft.personality.trim() || null,
         instructions: draft.instructions, model: draft.model.trim(), status,
         modelConfig: { temperature: Number(draft.temperature), maxTokens: Number(draft.maxTokens), topP: Number(draft.topP) },
-        capabilities: draft.capabilities, toolIds: draft.toolIds,
+        capabilities: draft.capabilities, toolIds: draft.toolIds.filter((toolId) => apiTools.some((tool) => tool.id === toolId)),
         memoryConfig: { shortTerm: true, longTerm: true, knowledgeBase: draft.capabilities.knowledgeBase },
         ...(draft.avatar ? { avatar: draft.avatar } : {}),
       };

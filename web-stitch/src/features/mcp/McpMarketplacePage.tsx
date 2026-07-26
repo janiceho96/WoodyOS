@@ -36,9 +36,10 @@ type McpSection = (typeof MCP_SECTIONS)[number]['id'];
 // oxlint-disable-next-line react/only-export-components -- the MCP access deep-link contract is intentionally testable.
 export function mcpRouteState(params: URLSearchParams) {
   const tab = params.get('tab');
+  const connectionId = params.get('connection');
   return {
-    tab: MCP_SECTIONS.some((section) => section.id === tab) ? tab as McpSection : 'discover',
-    connectionId: params.get('connection'),
+    tab: MCP_SECTIONS.some((section) => section.id === tab) ? tab as McpSection : connectionId ? 'connected' : 'discover',
+    connectionId,
   };
 }
 
@@ -88,6 +89,10 @@ export function McpMarketplacePage() {
         .some((value) => value.toLowerCase().includes(needle)));
   }, [featured.data, query]);
   useEffect(() => {
+    setTab(routeState.tab);
+    setSelectedId(routeState.connectionId);
+  }, [routeState.connectionId, routeState.tab]);
+  useEffect(() => {
     const url = new URL(window.location.href);
     const oauth = url.searchParams.get('oauth');
     const connectionId = url.searchParams.get('connection');
@@ -104,16 +109,6 @@ export function McpMarketplacePage() {
     url.searchParams.delete('connection');
     window.history.replaceState({}, '', url);
   }, [queryClient, report, reportError]);
-  useEffect(() => {
-    const url = new URL(window.location.href);
-    const connectionId = url.searchParams.get('connection');
-    if (!connectionId || !connections.data?.data.some((connection) => connection.id === connectionId)) return;
-    setTab('connected');
-    setSelectedId(connectionId);
-    url.searchParams.delete('connection');
-    window.history.replaceState({}, '', url);
-  }, [connections.data]);
-
   return <div className="mcp-page">
     <PageHeader eyebrow="Advanced integrations" title="MCP" description="Connect application servers, review their exact actions, and grant least-privilege agent access." actions={<>
       <button className="button" onClick={() => setInstallTarget({ kind: 'custom' })}><Plus size={15}/>Custom server</button>

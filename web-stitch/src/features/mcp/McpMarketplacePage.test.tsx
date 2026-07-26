@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter, useNavigate } from 'react-router-dom';
 import type { McpConnection, Session } from '../../api';
 import { api } from '../../api';
 import { WorkspaceContext, type WorkspaceContextValue } from '../../app/workspace';
@@ -29,6 +30,11 @@ const connection = {
   consecutive_failures: 0,
 } as McpConnection;
 
+function RouteNavigator() {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate('/mcp?tab=access&connection=docs-mcp')}>Open Agent Access target</button>;
+}
+
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const workspace: WorkspaceContextValue = {
@@ -44,7 +50,7 @@ function renderPage() {
     signOut: vi.fn(),
     openOnboarding: vi.fn(),
   };
-  return render(<QueryClientProvider client={queryClient}><WorkspaceContext.Provider value={workspace}><McpMarketplacePage/></WorkspaceContext.Provider></QueryClientProvider>);
+  return render(<MemoryRouter initialEntries={['/mcp']}><RouteNavigator/><QueryClientProvider client={queryClient}><WorkspaceContext.Provider value={workspace}><McpMarketplacePage/></WorkspaceContext.Provider></QueryClientProvider></MemoryRouter>);
 }
 
 beforeEach(() => {
@@ -85,6 +91,16 @@ describe('MCP workspace tabs', () => {
 
     await user.click(await screen.findByRole('button', { name: /Docs MCP/ }));
 
+    expect(await screen.findByRole('combobox', { name: 'Agent' })).toBeTruthy();
+  });
+
+  it('synchronizes an already-mounted page to an MCP Agent Access deep link', async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('button', { name: 'Open Agent Access target' }));
+
+    expect(screen.getByRole('tab', { name: 'Agent Access' }).getAttribute('aria-selected')).toBe('true');
     expect(await screen.findByRole('combobox', { name: 'Agent' })).toBeTruthy();
   });
 });

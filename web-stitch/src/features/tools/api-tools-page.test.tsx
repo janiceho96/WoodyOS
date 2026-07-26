@@ -69,6 +69,13 @@ describe('resource navigation', () => {
     });
   });
 
+  it('keeps legacy connection deep links on the Connected tab', () => {
+    expect(mcpRouteState(new URLSearchParams('connection=connection-2'))).toEqual({
+      tab: 'connected',
+      connectionId: 'connection-2',
+    });
+  });
+
   it('keeps legacy MCP workspace tools out of API Tools and available for compatibility controls', () => {
     expect(legacyMcpTools([
       { id: 'legacy-mcp', kind: 'mcp', name: 'Legacy server' },
