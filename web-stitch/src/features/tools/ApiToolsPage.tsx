@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Activity, BriefcaseBusiness, CheckCircle2, Code2, FileSearch, Globe2, LoaderCircle, Plus, Search, ShieldCheck, Unplug, Wrench } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
-import { api, type Tool } from '../../api';
+import { api, isApiTool, type ApiTool } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
 import { handleTabListKeyDown } from '../../lib/a11y';
@@ -31,15 +31,15 @@ export function ApiToolsPage({ openConnect }: { openConnect: () => void }) {
   const [params, setParams] = useSearchParams();
   const queryClient = useQueryClient();
   const section = sectionFromQuery(params.get('section'));
-  const tools = data.tools.filter((tool) => tool.kind !== 'mcp');
+  const tools = data.tools.filter(isApiTool);
   const activeTools = tools.filter((tool) => tool.enabled).length;
   const test = useMutation({
-    mutationFn: (tool: Tool) => api.testTool(tool.id).then(() => tool),
+    mutationFn: (tool: ApiTool) => api.testTool(tool.id).then(() => tool),
     onSuccess: (tool) => report(`${tool.name} connection is healthy`),
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Tool health test failed'),
   });
   const toggle = useMutation({
-    mutationFn: (tool: Tool) => api.updateTool(tool.id, { enabled: !tool.enabled }).then(() => tool),
+    mutationFn: (tool: ApiTool) => api.updateTool(tool.id, { enabled: !tool.enabled }).then(() => tool),
     onSuccess: async (tool) => {
       report(`${tool.name} ${tool.enabled ? 'disabled' : 'enabled'}`);
       await queryClient.invalidateQueries({ queryKey: ['workspace'] });

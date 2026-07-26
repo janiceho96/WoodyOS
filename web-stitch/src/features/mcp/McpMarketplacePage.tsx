@@ -5,6 +5,7 @@ import {
   ShieldCheck, Sparkles, Trash2, Unplug, Users, Wrench,
 } from 'lucide-react';
 import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   api, type CuratedMcpApp, type McpAgentAccess, type McpCatalogServer, type McpConnection,
   type McpTool, type McpToolCall, type Tool,
@@ -32,6 +33,15 @@ export const MCP_SECTIONS = [
 
 type McpSection = (typeof MCP_SECTIONS)[number]['id'];
 
+// oxlint-disable-next-line react/only-export-components -- the MCP access deep-link contract is intentionally testable.
+export function mcpRouteState(params: URLSearchParams) {
+  const tab = params.get('tab');
+  return {
+    tab: MCP_SECTIONS.some((section) => section.id === tab) ? tab as McpSection : 'discover',
+    connectionId: params.get('connection'),
+  };
+}
+
 // oxlint-disable-next-line react/only-export-components -- the access-selection behavior is intentionally testable.
 export function selectMcpConnection(connections: McpConnection[], selectedId: string | null) {
   return connections.find((connection) => connection.id === selectedId) ?? null;
@@ -45,12 +55,14 @@ export function legacyMcpTools(tools: Tool[]) {
 export function McpMarketplacePage() {
   const { data, report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<McpSection>('discover');
+  const [params] = useSearchParams();
+  const routeState = mcpRouteState(params);
+  const [tab, setTab] = useState<McpSection>(routeState.tab);
   const [catalogView, setCatalogView] = useState<'top' | 'community'>('top');
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState('');
   const [installTarget, setInstallTarget] = useState<InstallTarget>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(routeState.connectionId);
   const featured = useQuery({ queryKey: ['mcp-featured'], queryFn: api.featuredMcpApps });
   const catalog = useQuery({
     queryKey: ['mcp-catalog', search],

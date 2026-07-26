@@ -1,7 +1,8 @@
 import { Activity, BarChart3, Bot, BookOpen, CircleHelp, LayoutDashboard, LogOut, Menu, Minus, Moon, Plus, PlugZap, RefreshCw, Search, Settings, Sun, Workflow, X } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { api, auth, type Onboarding, type Session } from '../api';
+import { api, auth, isApiTool, type Onboarding, type Session } from '../api';
 import { Modal, Notice } from '../components/ui';
 import { BrandMark } from '../components/BrandMark';
 import { TaskDialogBody } from '../features/execution/ExecutionPage';
@@ -21,7 +22,8 @@ const nav = [
   { path: '/agents', label: 'Agents', Icon: Bot, group: 'Build' },
   { path: '/workflows', label: 'Workflows', Icon: Workflow, group: 'Build' },
   { path: '/knowledge', label: 'Knowledge', Icon: BookOpen, group: 'Resources' },
-  { path: '/tools', label: 'Integrations', Icon: PlugZap, group: 'Resources' },
+  { path: '/api-tools', label: 'API Tools', Icon: PlugZap, group: 'Resources' },
+  { path: '/mcp', label: 'MCP', Icon: PlugZap, group: 'Resources' },
   { path: '/executions', label: 'Outputs', Icon: Activity, group: 'Activity' },
   { path: '/analytics', label: 'Analytics', Icon: BarChart3, group: 'Activity' },
 ];
@@ -30,6 +32,15 @@ const emptyWorkspaceData: WorkspaceData = { agents: [], tasks: [], workflows: []
 const workspaceZoomKey = 'woody.workspaceZoom';
 const minimumWorkspaceZoom = 80;
 const maximumWorkspaceZoom = 120;
+
+export type ResourceSearchDomain = 'api' | 'mcp-connection' | 'mcp-action';
+
+// oxlint-disable-next-line react/only-export-components -- the user-facing resource naming contract is intentionally testable.
+export function resourceSearchKind({ domain }: { domain: ResourceSearchDomain }) {
+  if (domain === 'api') return 'API Tool';
+  if (domain === 'mcp-connection') return 'MCP Connection';
+  return 'MCP Action';
+}
 
 function initialWorkspaceZoom() {
   try {
@@ -121,6 +132,13 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
 function WorkspaceSearch({ data, close, go }: { data: ReturnType<typeof useWorkspaceData>['data'] extends infer T ? NonNullable<T> : never; close: () => void; go: (path: string) => void }) {
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const resourceCatalog = useQuery({
+    queryKey: ['workspace-search-resource-catalog'],
+    queryFn: async () => {
+      const [connections, workflowResources] = await Promise.all([api.mcpConnections(), api.workflowResources()]);
+      return { connections: connections.data, mcpActions: workflowResources.mcpTools };
+    },
+  });
   useEffect(() => { inputRef.current?.focus(); }, []);
   if (!data) return null;
   const normalized = query.toLowerCase().trim();
@@ -129,6 +147,9 @@ function WorkspaceSearch({ data, close, go }: { data: ReturnType<typeof useWorks
     ...data.agents.map((agent) => ({ title: agent.name, detail: `${agent.role} · ${agent.status}`, path: `/agents/${agent.id}`, kind: 'Agent' })),
     ...data.tasks.map((task) => ({ title: task.title, detail: `${task.agent_name ?? 'Agent'} · ${task.status}`, path: `/agents/${task.agent_id}?section=workspace&task=${task.id}`, kind: 'Output' })),
     ...data.documents.map((doc) => ({ title: doc.name, detail: `${doc.source_type} · ${doc.status}`, path: '/knowledge', kind: 'Knowledge' })),
+    ...data.tools.filter(isApiTool).map((tool) => ({ title: tool.name, detail: tool.description || tool.permissions.join(', ') || 'API Tool', path: '/api-tools', kind: resourceSearchKind({ domain: 'api' }) })),
+    ...(resourceCatalog.data?.connections ?? []).map((connection) => ({ title: connection.name, detail: connection.description || `${connection.tool_count ?? 0} actions`, path: `/mcp?tab=access&connection=${encodeURIComponent(connection.id)}`, kind: resourceSearchKind({ domain: 'mcp-connection' }) })),
+    ...(resourceCatalog.data?.mcpActions ?? []).map((action) => ({ title: action.title || action.remoteName, detail: `${action.connectionName} · ${action.description || action.remoteName}`, path: `/mcp?tab=access&connection=${encodeURIComponent(action.connectionId)}`, kind: resourceSearchKind({ domain: 'mcp-action' }) })),
   ].filter((item) => !normalized || `${item.title} ${item.detail} ${item.kind}`.toLowerCase().includes(normalized)).slice(0, 12);
   return <Modal title="Search workspace" close={close} wide><div className="search-dialog"><label><Search size={18}/><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search commands, agents, executions, knowledge…"/></label><div>{results.map((result, index) => <button key={`${result.kind}-${result.title}-${index}`} onClick={() => go(result.path)}><span>{result.kind}</span><div><strong>{result.title}</strong><small>{result.detail}</small></div><Activity size={15}/></button>)}{!results.length && <div className="empty-state"><strong>No results</strong><p>Try another name, status, or command.</p></div>}</div></div></Modal>;
 }

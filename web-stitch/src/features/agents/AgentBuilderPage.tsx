@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, House, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, type Agent, type AgentAvatarConfig, type AgentPromptTone } from '../../api';
+import { api, isApiTool, type Agent, type AgentAvatarConfig, type AgentPromptTone } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { Status } from '../../components/ui';
 import { humanize } from '../../lib/format';
@@ -74,7 +74,8 @@ export function AgentBuilderPage() {
     review: false,
   };
   const ready = validation.purpose && validation.model;
-  const activeTools = data.tools.filter((tool) => draft.toolIds.includes(tool.id));
+  const apiTools = data.tools.filter(isApiTool);
+  const activeTools = apiTools.filter((tool) => draft.toolIds.includes(tool.id));
   const activeWebTools = activeTools.filter((tool) => tool.permissions.includes('web.read'));
   const webReady = !draft.capabilities.webBrowser || activeWebTools.length > 0;
   const currentIndex = steps.findIndex((item) => item.id === step);
@@ -204,8 +205,9 @@ export function AgentBuilderPage() {
             ['codeInterpreter', 'Code-oriented work', 'Allow compatible execution tools for code and data tasks.', Code2],
             ['knowledgeBase', 'Workspace knowledge', 'Search indexed workspace documents. Per-document assignment is not available yet.', Database],
           ] as const).map(([key, label, text, Icon]) => <button className={`permission-card ${draft.capabilities[key] ? 'active' : ''}`} key={key} onClick={() => toggleCapability(key)} type="button"><span><Icon size={18}/></span><div><strong>{label}</strong><small>{text}</small></div><i>{draft.capabilities[key] ? <Check size={13}/> : <X size={13}/>}</i></button>)}</div>
-          <div className="resource-group"><div><h3>Connected integrations</h3><p>Only enabled API tools appear here. MCP access remains controlled by its agent allowlist.</p></div>{data.tools.filter((tool) => tool.enabled).length ? <div className="permission-list">{data.tools.filter((tool) => tool.enabled).map((tool) => <label key={tool.id}><input type="checkbox" checked={draft.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><b>{draft.toolIds.includes(tool.id) ? 'Allowed' : 'No access'}</b></label>)}</div> : <div className="resource-empty"><Wrench size={18}/><span><strong>No enabled integrations</strong><small>Connect an API or MCP application from Integrations first.</small></span><button className="button" onClick={() => navigate('/tools')}>Open Integrations</button></div>}</div>
-          {draft.capabilities.webBrowser && !activeWebTools.length && <div className="inline-warning"><AlertTriangle size={16}/><span>Web access is enabled, but no Web Research tool is assigned. The agent still cannot search the internet. <button type="button" className="text-button" onClick={() => navigate('/tools')}>Configure Web Research</button></span></div>}
+          <div className="resource-group"><div><h3>API Tools</h3><p>Choose enabled API tools to save in this agent’s API Tool access list.</p></div>{apiTools.filter((tool) => tool.enabled).length ? <div className="permission-list">{apiTools.filter((tool) => tool.enabled).map((tool) => <label key={tool.id}><input type="checkbox" checked={draft.toolIds.includes(tool.id)} onChange={() => toggleTool(tool.id)}/><span><strong>{tool.name}</strong><small>{tool.kind.toUpperCase()} · {tool.description || 'No description'}</small></span><b>{draft.toolIds.includes(tool.id) ? 'Allowed' : 'No access'}</b></label>)}</div> : <div className="resource-empty"><Wrench size={18}/><span><strong>No enabled API Tools</strong><small>Connect or enable an API Tool before assigning it to this agent.</small></span><button className="button" onClick={() => navigate('/api-tools')}>Open API Tools</button></div>}</div>
+          <div className="resource-group"><div><h3>MCP access</h3><p>MCP connections and actions use separate per-agent allowlists. Connection IDs are never added to this agent’s API Tool list.</p></div><button type="button" className="button" onClick={() => navigate('/mcp?tab=access')}>Manage MCP access</button></div>
+          {draft.capabilities.webBrowser && !activeWebTools.length && <div className="inline-warning"><AlertTriangle size={16}/><span>Web access is enabled, but no Web Research tool is assigned. The agent still cannot search the internet. <button type="button" className="text-button" onClick={() => navigate('/api-tools')}>Configure Web Research</button></span></div>}
           {!draft.capabilities.webBrowser && activeWebTools.length > 0 && <div className="inline-warning"><AlertTriangle size={16}/>Assigned web tools will remain unavailable until Web access is enabled above.</div>}
         </BuilderSection>}
 

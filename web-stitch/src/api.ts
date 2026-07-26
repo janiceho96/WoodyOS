@@ -399,7 +399,7 @@ export type WorkflowNodeCatalogEntry = {
 export type WorkflowResources = {
   version: number;
   agents: Array<Pick<Agent, 'id' | 'name' | 'role' | 'status' | 'avatar_config' | 'updated_at'>>;
-  apiTools: Array<Pick<Tool, 'id' | 'name' | 'kind' | 'description' | 'permissions'>>;
+  apiTools: Array<Pick<ApiTool, 'id' | 'name' | 'kind' | 'description' | 'permissions'>>;
   mcpTools: Array<{ id: string; connectionId: string; connectionName: string; remoteName: string; title?: string | null; description: string; inputSchema: Record<string, unknown>; riskLevel: 'read' | 'write' | 'external_write' | 'destructive' | 'unknown'; agentId: string; connectionPermission: 'read' | 'read_write'; toolPermission: 'read' | 'read_write'; appId?: string | null; appTitle?: string | null; brandColor?: string | null }>;
   knowledge: { scope: 'workspace'; total: number; ready: number; processing: number; failed: number };
 };
@@ -505,16 +505,27 @@ export type KnowledgeResult = {
   content: string;
   score: number;
 };
-export type Tool = {
+type ToolFields = {
   id: string;
   name: string;
-  kind: 'mcp' | 'api' | 'plugin' | 'internal';
   description: string;
   permissions: string[];
   enabled: boolean;
   created_at: string;
   updated_at?: string;
 };
+export type ApiTool = ToolFields & {
+  kind: 'api' | 'plugin' | 'internal';
+};
+export type LegacyMcpTool = ToolFields & {
+  kind: 'mcp';
+};
+/** Broad compatibility record for `/v1/tools`, which can still return legacy MCP rows. */
+export type Tool = ApiTool | LegacyMcpTool;
+
+export function isApiTool(tool: Tool): tool is ApiTool {
+  return tool.kind === 'api' || tool.kind === 'plugin' || tool.kind === 'internal';
+}
 export type DemoApi = {
   slug: string;
   name: string;
