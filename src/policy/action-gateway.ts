@@ -31,6 +31,7 @@ export type ActionRequest = {
   arguments: Record<string, unknown>;
   requestedBy: string;
   targetSummary?: string | null;
+  leaseOwnerId?: string;
   trace: TraceContext;
 };
 
@@ -50,6 +51,7 @@ export type WorkflowActionRequest = WorkflowActionIdentity & {
   arguments: Record<string, unknown>;
   requestedBy: string;
   targetSummary?: string | null;
+  leaseOwnerId?: string;
   trace: TraceContext;
   precedingApproval?: {
     nodeId: string;
@@ -101,21 +103,37 @@ function subjectColumns(subject: ActionSubject) {
     };
 }
 
-async function subjectAllowsActions(input: Pick<ActionRequest, 'workspaceId' | 'subject'>) {
+async function subjectAllowsActions(input: Pick<ActionRequest, 'workspaceId' | 'subject' | 'leaseOwnerId'>) {
   const result = input.subject.type === 'task'
     ? await query<{ subject_allows_actions: boolean }>(
       `SELECT EXISTS(
          SELECT 1 FROM tasks WHERE id=$1 AND workspace_id=$2
            AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+           AND (
+             $3::text IS NULL
+             OR EXISTS(
+               SELECT 1 FROM execution_leases lease
+               WHERE lease.subject_type='task' AND lease.subject_id=$1
+                 AND lease.owner_id=$3 AND lease.expires_at>now()
+             )
+           )
        ) subject_allows_actions`,
-      [input.subject.taskId, input.workspaceId],
+      [input.subject.taskId, input.workspaceId, input.leaseOwnerId ?? null],
     )
     : await query<{ subject_allows_actions: boolean }>(
       `SELECT EXISTS(
          SELECT 1 FROM workflow_runs WHERE id=$1 AND workspace_id=$2
            AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+           AND (
+             $3::text IS NULL
+             OR EXISTS(
+               SELECT 1 FROM execution_leases lease
+               WHERE lease.subject_type='workflow_run' AND lease.subject_id=$1
+                 AND lease.owner_id=$3 AND lease.expires_at>now()
+             )
+           )
        ) subject_allows_actions`,
-      [input.subject.workflowRunId, input.workspaceId],
+      [input.subject.workflowRunId, input.workspaceId, input.leaseOwnerId ?? null],
     );
   return result.rows[0]?.subject_allows_actions !== false;
 }
@@ -177,6 +195,14 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
                SELECT 1 FROM tasks task
                WHERE task.id=$4 AND task.workspace_id=$1
                  AND task.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+                 AND (
+                   $22::text IS NULL
+                   OR EXISTS(
+                     SELECT 1 FROM execution_leases lease
+                     WHERE lease.subject_type='task' AND lease.subject_id=$4
+                       AND lease.owner_id=$22 AND lease.expires_at>now()
+                   )
+                 )
              )
            )
            OR (
@@ -185,6 +211,14 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
                SELECT 1 FROM workflow_runs run
                WHERE run.id=$3 AND run.workspace_id=$1
                  AND run.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+                 AND (
+                   $22::text IS NULL
+                   OR EXISTS(
+                     SELECT 1 FROM execution_leases lease
+                     WHERE lease.subject_type='workflow_run' AND lease.subject_id=$3
+                       AND lease.owner_id=$22 AND lease.expires_at>now()
+                   )
+                 )
              )
            )
          )
@@ -211,6 +245,7 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
         input.trace.traceId,
         input.trace.spanId,
         input.trace.parentSpanId,
+        input.leaseOwnerId ?? null,
       ],
     );
   } catch (error) {
@@ -257,11 +292,12 @@ export function authorizeWorkflowAction(input: WorkflowActionRequest) {
     arguments: input.arguments,
     requestedBy: input.requestedBy,
     targetSummary: input.targetSummary,
+    leaseOwnerId: input.leaseOwnerId,
     trace: input.trace,
   }, precedingApprovalSatisfied);
 }
 
-export async function beginAction(authorizationId: string) {
+export async function beginAction(authorizationId: string, leaseOwnerId?: string) {
   const claimed = await query<{ id: string }>(
     `UPDATE action_authorizations authorization SET status='executing'
       WHERE authorization.id=$1 AND authorization.status='approved'
@@ -272,6 +308,14 @@ export async function beginAction(authorizationId: string) {
               SELECT 1 FROM tasks task
               WHERE task.id=authorization.task_id
                 AND task.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+                AND (
+                  $2::text IS NULL
+                  OR EXISTS(
+                    SELECT 1 FROM execution_leases lease
+                    WHERE lease.subject_type='task' AND lease.subject_id=task.id
+                      AND lease.owner_id=$2 AND lease.expires_at>now()
+                  )
+                )
             )
           )
           OR (
@@ -280,11 +324,19 @@ export async function beginAction(authorizationId: string) {
               SELECT 1 FROM workflow_runs run
               WHERE run.id=authorization.workflow_run_id
                 AND run.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+                AND (
+                  $2::text IS NULL
+                  OR EXISTS(
+                    SELECT 1 FROM execution_leases lease
+                    WHERE lease.subject_type='workflow_run' AND lease.subject_id=run.id
+                      AND lease.owner_id=$2 AND lease.expires_at>now()
+                  )
+                )
             )
           )
         )
       RETURNING authorization.id`,
-    [authorizationId],
+    [authorizationId, leaseOwnerId ?? null],
   );
   return Boolean(claimed.rowCount);
 }

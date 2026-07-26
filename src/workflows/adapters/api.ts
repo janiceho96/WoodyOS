@@ -9,6 +9,7 @@ import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/err
 
 export async function executeApiActionNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  execution.signal.throwIfAborted();
   await assertWorkflowRunManifestDependencies(run);
   const toolId = node.config.toolId;
   if (typeof toolId !== 'string') throw new Error(`API action ${node.id} has no toolId`);
@@ -17,6 +18,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     [toolId, run.workspace_id],
   )).rows[0];
   if (!tool) throw Object.assign(new Error(`API action ${node.id} references an unavailable tool`), { retryable: false });
+  execution.signal.throwIfAborted();
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : run.state;
   const arguments_ = resolve(configuredInput) as Record<string, unknown>;
   const actionTrace = childTraceContext(execution.trace);
@@ -34,7 +36,9 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     requestedBy: run.created_by,
     targetSummary: tool.name,
     trace: actionTrace,
+    leaseOwnerId: execution.leaseOwnerId,
   });
+  execution.signal.throwIfAborted();
   if (authorization.status === 'awaiting_confirmation') {
     await emitEvent('action.confirmation_requested', `Confirmation is required before ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
     return { waiting: true, waitingMessage: `Confirm ${tool.name} before Woody continues`, output: null };
@@ -44,7 +48,7 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     setNodeOutput(authorization.result);
     return { output: authorization.result, result: authorization.result };
   }
-  if (!(await beginWorkflowAction(authorization.authorizationId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
+  if (!(await beginWorkflowAction(authorization.authorizationId, execution.leaseOwnerId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
   await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
   try {
     const output = limitedActionResult(await invokeTool(tool, arguments_, false, execution.signal));

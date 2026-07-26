@@ -8,6 +8,8 @@ const ids = vi.hoisted(() => ({
   trace: '00000000-0000-4000-8000-000000000005',
   span: '00000000-0000-4000-8000-000000000006',
   workflowRun: '00000000-0000-4000-8000-000000000008',
+  tool: '00000000-0000-4000-8000-000000000010',
+  authorization: '00000000-0000-4000-8000-000000000011',
 }));
 const state = vi.hoisted(() => ({
   taskStatus: 'queued',
@@ -19,6 +21,19 @@ const state = vi.hoisted(() => ({
   providerError: false,
   workflowManifestError: false,
   processors: {} as Record<string, (job: { data: Record<string, string> }) => Promise<unknown>>,
+  leaseAvailable: true,
+  leaseController: new AbortController(),
+  leaseAcquisitions: [] as string[],
+  leaseStops: [] as string[],
+  leaseReleases: [] as string[],
+  leaseReleaseError: null as Error | null,
+  withTool: false,
+  abortLeaseOnProviderResponse: false,
+  providerTurns: 0,
+  authorizationCalls: 0,
+  cancelWinsFailure: true,
+  workflowStepCalls: 0,
+  abortLeaseOnWorkflowStep: false,
 }));
 
 const manifest = {
@@ -34,7 +49,7 @@ const manifest = {
   },
   prompts: {},
   models: {},
-  apiTools: {},
+  apiTools: { [ids.tool]: {} },
   mcpActions: {},
   policy: { version: '1' },
   adapters: {},
@@ -115,8 +130,12 @@ vi.mock('../src/db/client.js', () => ({
       return { rowCount: 1, rows: [{ ...task }] };
     }
     if (sql.includes("UPDATE tasks SET status='failed'")) {
-      state.taskStatus = 'cancel_requested';
-      return { rowCount: sql.includes("status='running'") ? 0 : 1, rows: [] };
+      if (state.cancelWinsFailure) {
+        state.taskStatus = 'cancel_requested';
+        return { rowCount: sql.includes("status='running'") ? 0 : 1, rows: [] };
+      }
+      state.taskStatus = 'failed';
+      return { rowCount: 1, rows: [{ id: ids.task }] };
     }
     if (sql.includes('UPDATE workflow_runs') && sql.includes("SET status='failed'")) {
       state.workflowStatus = 'cancel_requested';
@@ -140,7 +159,7 @@ vi.mock('../src/db/client.js', () => ({
             model: 'model-a',
             modelConfig: { temperature: 0.2, maxTokens: 128, topP: 1 },
             capabilities: { webBrowser: false, codeInterpreter: false, knowledgeBase: false },
-            apiToolIds: [],
+            apiToolIds: state.withTool ? [ids.tool] : [],
             memoryConfig: {},
           },
         }],
@@ -150,6 +169,18 @@ vi.mock('../src/db/client.js', () => ({
       return {
         rowCount: 1,
         rows: [{ trace_id: ids.trace, span_id: ids.span, parent_span_id: null }],
+      };
+    }
+    if (sql.includes('SELECT id,name,kind,config,permissions FROM tools')) {
+      return {
+        rowCount: 1,
+        rows: [{
+          id: ids.tool,
+          name: 'lookup',
+          kind: 'api',
+          config: {},
+          permissions: ['read'],
+        }],
       };
     }
     if (sql.includes('FROM artifacts WHERE task_id=')) return { rowCount: 0, rows: [] };
@@ -176,6 +207,44 @@ vi.mock('../src/runtime/cancellation.js', async (importOriginal) => ({
     return 'cancelled';
   }),
 }));
+vi.mock('../src/runtime/leases.js', () => ({
+  acquireLease: vi.fn(async (subject: { id: string }) => {
+    state.leaseAcquisitions.push(subject.id);
+    return state.leaseAvailable;
+  }),
+  startLeaseHeartbeat: vi.fn((subject: { id: string }) => ({
+    signal: state.leaseController.signal,
+    stop: vi.fn(async () => {
+      state.leaseStops.push(subject.id);
+    }),
+  })),
+  releaseLease: vi.fn(async (subject: { id: string }) => {
+    state.leaseReleases.push(subject.id);
+    if (state.leaseReleaseError) throw state.leaseReleaseError;
+    return true;
+  }),
+  isLeaseFailure: vi.fn((error: unknown) => (
+    Boolean(error && typeof error === 'object' && (error as { code?: string }).code === 'EXECUTION_LEASE_LOST')
+  )),
+}));
+vi.mock('../src/tools/runtime.js', () => ({
+  definitionFor: vi.fn((tool: { id: string; name: string }) => ({
+    name: `tool_${tool.id.replaceAll('-', '_')}`,
+    description: tool.name,
+    input_schema: { type: 'object', properties: {} },
+  })),
+  invokeTool: vi.fn(async () => ({ ok: true })),
+  toolRiskLevel: vi.fn(() => 'read'),
+}));
+vi.mock('../src/policy/action-gateway.js', () => ({
+  authorizeAction: vi.fn(async () => {
+    state.authorizationCalls += 1;
+    return { status: 'allowed', authorizationId: ids.authorization };
+  }),
+  beginAction: vi.fn(async () => true),
+  completeAction: vi.fn(async () => undefined),
+  failAction: vi.fn(async () => undefined),
+}));
 vi.mock('../src/runtime/manifest.js', () => ({
   assertManifestCompatible: vi.fn(() => manifest),
   assertTaskManifestDependencies: vi.fn(async () => undefined),
@@ -197,6 +266,28 @@ vi.mock('../src/lib/ai-provider.js', () => ({
           return {
             withResponse: vi.fn(async () => {
               if (state.providerError) throw new Error('provider unavailable');
+              state.providerTurns += 1;
+              if (state.withTool && state.providerTurns === 1) {
+                if (state.abortLeaseOnProviderResponse) {
+                  state.leaseController.abort(Object.assign(
+                    new Error('lease ownership lost'),
+                    { code: 'EXECUTION_LEASE_LOST' },
+                  ));
+                }
+                return {
+                  data: {
+                    usage: { input_tokens: 1, output_tokens: 1 },
+                    content: [{
+                      type: 'tool_use',
+                      id: 'provider-call',
+                      name: `tool_${ids.tool.replaceAll('-', '_')}`,
+                      input: {},
+                    }],
+                  },
+                  request_id: 'request-a',
+                  response: { headers: new Headers() },
+                };
+              }
               return {
                 data: {
                   usage: { input_tokens: 1, output_tokens: 1 },
@@ -248,7 +339,21 @@ vi.mock('../src/files/service.js', () => ({
   purgeExpiredFiles: vi.fn(),
 }));
 vi.mock('../src/workflows/runtime.js', () => ({
-  executeWorkflowStep: vi.fn(),
+  executeWorkflowStep: vi.fn(async (
+    _id: string,
+    _executeTask: unknown,
+    signal: AbortSignal,
+  ) => {
+    state.workflowStepCalls += 1;
+    if (state.abortLeaseOnWorkflowStep) {
+      state.leaseController.abort(Object.assign(
+        new Error('lease ownership lost'),
+        { code: 'EXECUTION_LEASE_LOST' },
+      ));
+      signal.throwIfAborted();
+    }
+    return { queued: true };
+  }),
 }));
 
 import { executeAgentTask } from '../src/worker.js';
@@ -263,6 +368,19 @@ describe('task worker cancellation', () => {
     state.statements = [];
     state.providerError = false;
     state.workflowManifestError = false;
+    state.leaseAvailable = true;
+    state.leaseController = new AbortController();
+    state.leaseAcquisitions = [];
+    state.leaseStops = [];
+    state.leaseReleases = [];
+    state.leaseReleaseError = null;
+    state.withTool = false;
+    state.abortLeaseOnProviderResponse = false;
+    state.providerTurns = 0;
+    state.authorizationCalls = 0;
+    state.cancelWinsFailure = true;
+    state.workflowStepCalls = 0;
+    state.abortLeaseOnWorkflowStep = false;
   });
 
   it('finalizes queued cancellation without starting the provider', async () => {
@@ -273,12 +391,17 @@ describe('task worker cancellation', () => {
     expect(state.finalized).toEqual([ids.task]);
     expect(state.providerSignals).toEqual([]);
     expect(state.statements.some((sql) => sql.includes("SET status='running'"))).toBe(false);
+    expect(state.leaseStops).toEqual([ids.task]);
+    expect(state.leaseReleases).toEqual([ids.task]);
   });
 
   it('passes the worker cancellation signal into the AI provider request', async () => {
     await executeAgentTask(ids.task, ids.trace);
 
-    expect(state.providerSignals).toEqual([state.controller.signal]);
+    expect(state.providerSignals).toHaveLength(1);
+    expect(state.providerSignals[0]?.aborted).toBe(false);
+    expect(state.leaseStops).toEqual([ids.task]);
+    expect(state.leaseReleases).toEqual([ids.task]);
   });
 
   it('finalizes when cancellation wins before a task failure write observes the poll signal', async () => {
@@ -302,5 +425,72 @@ describe('task worker cancellation', () => {
 
     expect(state.finalized).toEqual([ids.workflowRun]);
     expect(state.workflowStatus).toBe('cancel_requested');
+  });
+
+  it('returns a duplicate delivery without claiming or executing when a live owner holds the lease', async () => {
+    state.leaseAvailable = false;
+
+    await expect(executeAgentTask(ids.task, ids.trace)).resolves.toBeNull();
+
+    expect(state.leaseAcquisitions).toEqual([ids.task]);
+    expect(state.statements.some((sql) => sql.includes("SET status='running'"))).toBe(false);
+    expect(state.providerSignals).toEqual([]);
+    expect(state.leaseStops).toEqual([]);
+    expect(state.leaseReleases).toEqual([]);
+  });
+
+  it('aborts after heartbeat ownership loss before creating the next action authorization', async () => {
+    state.withTool = true;
+    state.abortLeaseOnProviderResponse = true;
+
+    await expect(executeAgentTask(ids.task, ids.trace)).resolves.toBeNull();
+
+    expect(state.authorizationCalls).toBe(0);
+    expect(state.finalized).toEqual([]);
+    expect(state.taskStatus).toBe('running');
+    expect(state.leaseStops).toEqual([ids.task]);
+    expect(state.leaseReleases).toEqual([ids.task]);
+  });
+
+  it('does not let lease cleanup failure mask the primary worker error', async () => {
+    state.providerError = true;
+    state.cancelWinsFailure = false;
+    state.leaseReleaseError = new Error('release failed with token=cleanup-secret');
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(executeAgentTask(ids.task, ids.trace)).rejects.toThrow('provider unavailable');
+
+    expect(state.leaseStops).toEqual([ids.task]);
+    expect(state.leaseReleases).toEqual([ids.task]);
+    expect(JSON.stringify(logged.mock.calls)).not.toContain('cleanup-secret');
+    logged.mockRestore();
+  });
+
+  it('does not execute a duplicate workflow delivery while another owner holds the lease', async () => {
+    state.leaseAvailable = false;
+    const processor = state.processors.workflows;
+
+    await expect(processor({
+      data: { workflowRunId: ids.workflowRun, traceId: ids.trace },
+    })).resolves.toBeNull();
+
+    expect(state.workflowStepCalls).toBe(0);
+    expect(state.leaseAcquisitions).toEqual([ids.workflowRun]);
+    expect(state.leaseStops).toEqual([]);
+    expect(state.leaseReleases).toEqual([]);
+  });
+
+  it('fails workflow execution closed when heartbeat ownership is lost', async () => {
+    state.abortLeaseOnWorkflowStep = true;
+    const processor = state.processors.workflows;
+
+    await expect(processor({
+      data: { workflowRunId: ids.workflowRun, traceId: ids.trace },
+    })).resolves.toBeNull();
+
+    expect(state.workflowStepCalls).toBe(1);
+    expect(state.finalized).toEqual([]);
+    expect(state.leaseStops).toEqual([ids.workflowRun]);
+    expect(state.leaseReleases).toEqual([ids.workflowRun]);
   });
 });

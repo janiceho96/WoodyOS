@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import type { MessageParam, Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { Worker } from 'bullmq';
@@ -70,8 +71,16 @@ import {
   createCancellationContext,
   finalizeCancellation,
 } from './runtime/cancellation.js';
+import {
+  acquireLease,
+  isLeaseFailure,
+  releaseLease,
+  startLeaseHeartbeat,
+  type LeaseSubject,
+} from './runtime/leases.js';
 
 const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
+const workerProcessOwner = `${process.pid}:${randomUUID()}`;
 type Agent = {
   name: string;
   role: string;
@@ -99,6 +108,17 @@ type Task = {
   parent_span_id: string | null;
   created_at: string;
 };
+
+function executionOwnerId() {
+  return `${workerProcessOwner}:${randomUUID()}`;
+}
+
+function reportLeaseCleanupFailure(subject: LeaseSubject, error: unknown) {
+  console.error('Execution lease cleanup failed', {
+    subject: subject.kind,
+    error: serializeRuntimeError(error),
+  });
+}
 
 async function finalizeIfCancellationRequested(subject: {
   kind: 'task' | 'workflow_run';
@@ -222,8 +242,12 @@ async function authorizeTaskToolAction(
   action: TaskToolAction,
   arguments_: Record<string, unknown>,
   parentTrace: TraceContext,
+  signal: AbortSignal,
+  leaseOwnerId: string,
 ) {
+  signal.throwIfAborted();
   await assertTaskExecutionDependencies(task);
+  signal.throwIfAborted();
   if (action.adapter === 'mcp') assertMcpPermission(action.tool);
   const trace = childTraceContext(parentTrace);
   const authorization = await authorizeAction({
@@ -237,8 +261,10 @@ async function authorizeTaskToolAction(
     arguments: arguments_,
     requestedBy: task.requested_by,
     targetSummary: action.adapter === 'api' ? action.tool.name : `${actionName(action)} via ${action.tool.connection_name}`,
+    leaseOwnerId,
     trace,
   });
+  signal.throwIfAborted();
   return { ...authorization, trace };
 }
 
@@ -250,11 +276,12 @@ export async function executeTaskToolAction(input: {
   mcpToolCallId?: string | null;
   trace: TraceContext;
   signal?: AbortSignal;
+  leaseOwnerId?: string;
 }) {
   const signal = input.signal ?? new AbortController().signal;
   signal.throwIfAborted();
   await assertTaskExecutionDependencies(input.task);
-  if (!(await beginAction(input.authorizationId))) throw new Error('External action execution could not be claimed safely');
+  if (!(await beginAction(input.authorizationId, input.leaseOwnerId))) throw new Error('External action execution could not be claimed safely');
   try {
     if (input.action.adapter === 'mcp') {
       const executed = await executeAuthorizedMcpTool({
@@ -330,12 +357,12 @@ export async function executeAgentTask(
 ) {
   const queuedTask = (await query<Pick<Task, 'trace_id' | 'span_id' | 'parent_span_id' | 'created_at'> & {
     runtime_trust_migration_applied_at: string | null;
-    status: 'queued' | 'cancel_requested';
+    status: 'queued' | 'running' | 'cancel_requested';
   }>(
     `SELECT trace_id,span_id,parent_span_id,created_at,status,
             (SELECT applied_at FROM schema_migrations WHERE name='031_runtime_trust.sql')
               runtime_trust_migration_applied_at
-       FROM tasks WHERE id=$1 AND status IN ('queued','cancel_requested')`,
+       FROM tasks WHERE id=$1 AND status IN ('queued','running','cancel_requested')`,
     [taskId],
   )).rows[0];
   if (!queuedTask) return null;
@@ -344,16 +371,22 @@ export async function executeAgentTask(
     queuedTraceId,
     queuedTask.runtime_trust_migration_applied_at,
   );
-  const cancellation = await createCancellationContext({ kind: 'task', id: taskId });
-  const signal = combineAbortSignals([callerSignal, cancellation.signal]);
+  const leaseSubject: LeaseSubject = { kind: 'task', id: taskId };
+  const leaseOwnerId = executionOwnerId();
+  if (!await acquireLease(leaseSubject, leaseOwnerId)) return null;
+  const lease = startLeaseHeartbeat(leaseSubject, leaseOwnerId);
+  let cancellation: Awaited<ReturnType<typeof createCancellationContext>> | null = null;
+  let signal: AbortSignal = lease.signal;
   try {
+    cancellation = await createCancellationContext({ kind: 'task', id: taskId });
+    signal = combineAbortSignals([callerSignal, cancellation.signal, lease.signal]);
     if (signal.aborted || queuedTask.status === 'cancel_requested') {
       await finalizeCancellation({ kind: 'task', id: taskId });
       return null;
     }
     const task = (await query<Task>(
       `UPDATE tasks SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
-       WHERE id=$1 AND status='queued' RETURNING *`,
+       WHERE id=$1 AND status IN ('queued','running') RETURNING *`,
       [taskId],
     )).rows[0];
     if (!task) {
@@ -443,9 +476,9 @@ export async function executeAgentTask(
           isError = true;
           if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
         } else {
-          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace);
+          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace, signal, leaseOwnerId);
           if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
-          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId, trace: authorization.trace, signal });
+          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId, trace: authorization.trace, signal, leaseOwnerId });
           content = JSON.stringify(executed.result).slice(0, 50_000);
         }
         messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: pending.providerCallId, content, is_error: isError }] });
@@ -492,7 +525,7 @@ export async function executeAgentTask(
           const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
           const arguments_ = use.input as Record<string, unknown>;
           try {
-            const authorization = await authorizeTaskToolAction(task, use.id, action, arguments_, modelTrace);
+            const authorization = await authorizeTaskToolAction(task, use.id, action, arguments_, modelTrace, signal, leaseOwnerId);
             await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
               authorizationId: authorization.authorizationId,
               adapter: action.adapter,
@@ -526,11 +559,14 @@ export async function executeAgentTask(
             if (authorization.status === 'denied') throw new Error(authorization.reason);
             const executed = authorization.status === 'completed'
               ? { result: authorization.result, toolCallId: null }
-              : await executeTaskToolAction({ task, action, arguments_, authorizationId: authorization.authorizationId, trace: authorization.trace, signal });
+              : await executeTaskToolAction({ task, action, arguments_, authorizationId: authorization.authorizationId, trace: authorization.trace, signal, leaseOwnerId });
             await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ type: 'tool_result', tool_use_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
             const serialized = serializeRuntimeError(error);
+            if (lease.signal.aborted || isLeaseFailure(signal.reason) || isLeaseFailure(error)) {
+              throw signal.reason ?? error;
+            }
             if (signal.aborted || serialized.category === 'cancelled') throw cancellationError(error);
             await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, {
               adapter: action.adapter,
@@ -566,9 +602,9 @@ export async function executeAgentTask(
           content = 'Tool access was revoked before the approved action executed.';
           if (checkpoint.callId) await query("UPDATE mcp_tool_calls SET status='failed',error_code='MCP_ACCESS_REVOKED',error_message=$1,completed_at=now() WHERE id=$2", [content, checkpoint.callId]);
         } else {
-          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace);
+          const authorization = await authorizeTaskToolAction(task, pending.providerCallId, action, pending.arguments, modelTrace, signal, leaseOwnerId);
           if (authorization.status !== 'allowed') throw new Error(authorization.status === 'denied' ? authorization.reason : 'Approved action is no longer executable');
-          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId, trace: authorization.trace, signal });
+          const executed = await executeTaskToolAction({ task, action, arguments_: pending.arguments, authorizationId: authorization.authorizationId, mcpToolCallId: checkpoint.callId, trace: authorization.trace, signal, leaseOwnerId });
           content = JSON.stringify(executed.result).slice(0, 50_000);
         }
         messages.push({ role: 'tool', tool_call_id: pending.providerCallId, content });
@@ -625,7 +661,7 @@ export async function executeAgentTask(
           toolCallCount++;
           const action: TaskToolAction = mcpTool ? { adapter: 'mcp', tool: mcpTool } : { adapter: 'api', tool: tool! };
           try {
-            const authorization = await authorizeTaskToolAction(task, use.id, action, input, modelTrace);
+            const authorization = await authorizeTaskToolAction(task, use.id, action, input, modelTrace, signal, leaseOwnerId);
             await taskEvent(task.workspace_id, task.id, 'action.requested', `Requesting ${actionName(action)}`, {
               authorizationId: authorization.authorizationId,
               adapter: action.adapter,
@@ -659,11 +695,14 @@ export async function executeAgentTask(
             if (authorization.status === 'denied') throw new Error(authorization.reason);
             const executed = authorization.status === 'completed'
               ? { result: authorization.result, toolCallId: null }
-              : await executeTaskToolAction({ task, action, arguments_: input, authorizationId: authorization.authorizationId, trace: authorization.trace, signal });
+              : await executeTaskToolAction({ task, action, arguments_: input, authorizationId: authorization.authorizationId, trace: authorization.trace, signal, leaseOwnerId });
             await taskEvent(task.workspace_id, task.id, 'action.completed', `${actionName(action)} completed`, { authorizationId: authorization.authorizationId, toolCallId: executed.toolCallId, adapter: action.adapter, toolId: action.tool.id }, authorization.trace);
             results.push({ role: 'tool', tool_call_id: use.id, content: JSON.stringify(executed.result).slice(0, 50_000) });
           } catch (error) {
             const serialized = serializeRuntimeError(error);
+            if (lease.signal.aborted || isLeaseFailure(signal.reason) || isLeaseFailure(error)) {
+              throw signal.reason ?? error;
+            }
             if (signal.aborted || serialized.category === 'cancelled') throw cancellationError(error);
             await taskEvent(task.workspace_id, task.id, 'action.failed', `${actionName(action)} failed`, {
               adapter: action.adapter,
@@ -717,6 +756,7 @@ export async function executeAgentTask(
     return output;
   } catch (error) {
     const serialized = serializeRuntimeError(error);
+    if (lease.signal.aborted || isLeaseFailure(signal.reason) || isLeaseFailure(error)) return null;
     if (signal.aborted || serialized.category === 'cancelled') {
       const cancellationFailure = serialized.category === 'cancelled' ? error : cancellationError(error);
       const cancellationSerialized = serializeRuntimeError(cancellationFailure);
@@ -737,7 +777,17 @@ export async function executeAgentTask(
     throw error;
     }
   } finally {
-    cancellation.stop();
+    cancellation?.stop();
+    try {
+      await lease.stop();
+    } catch (error) {
+      reportLeaseCleanupFailure(leaseSubject, error);
+    }
+    try {
+      await releaseLease(leaseSubject, leaseOwnerId);
+    } catch (error) {
+      reportLeaseCleanupFailure(leaseSubject, error);
+    }
   }
 }
 
@@ -792,13 +842,13 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     parent_span_id: string | null;
     created_at: string;
     runtime_trust_migration_applied_at: string | null;
-    status: 'queued' | 'cancel_requested';
+    status: 'queued' | 'running' | 'cancel_requested';
   }>(
     `SELECT workspace_id,workflow_version_id,definition_snapshot,run_mode,execution_manifest,
             trace_id,span_id,parent_span_id,created_at,status,
             (SELECT applied_at FROM schema_migrations WHERE name='031_runtime_trust.sql')
               runtime_trust_migration_applied_at
-       FROM workflow_runs WHERE id=$1 AND status IN ('queued','cancel_requested')`,
+       FROM workflow_runs WHERE id=$1 AND status IN ('queued','running','cancel_requested')`,
     [job.data.workflowRunId],
   )).rows[0];
   if (!run) return null;
@@ -807,12 +857,16 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     job.data.traceId,
     run.runtime_trust_migration_applied_at,
   );
-  const cancellation = await createCancellationContext({
-    kind: 'workflow_run',
-    id: job.data.workflowRunId,
-  });
+  const leaseSubject: LeaseSubject = { kind: 'workflow_run', id: job.data.workflowRunId };
+  const leaseOwnerId = executionOwnerId();
+  if (!await acquireLease(leaseSubject, leaseOwnerId)) return null;
+  const lease = startLeaseHeartbeat(leaseSubject, leaseOwnerId);
+  let cancellation: Awaited<ReturnType<typeof createCancellationContext>> | null = null;
+  let signal: AbortSignal = lease.signal;
   try {
-    if (cancellation.signal.aborted || run.status === 'cancel_requested') {
+    cancellation = await createCancellationContext(leaseSubject);
+    signal = combineAbortSignals([cancellation.signal, lease.signal]);
+    if (signal.aborted || run.status === 'cancel_requested') {
       await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
       return null;
     }
@@ -820,6 +874,7 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
       try {
         await assertWorkflowRunManifestDependencies(run);
       } catch (error) {
+        if (lease.signal.aborted || isLeaseFailure(signal.reason) || isLeaseFailure(error)) return null;
         const serialized = serializeRuntimeError(error);
         const failedRun = await query(
           `UPDATE workflow_runs
@@ -842,9 +897,11 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     const result = await executeWorkflowStep(
       job.data.workflowRunId,
       executeAgentTask,
-      cancellation.signal,
+      signal,
+      leaseOwnerId,
     );
-    if (cancellation.signal.aborted) {
+    if (lease.signal.aborted || isLeaseFailure(signal.reason)) return null;
+    if (signal.aborted) {
       await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
       return null;
     }
@@ -855,7 +912,8 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     return result;
   } catch (error) {
     const serialized = serializeRuntimeError(error);
-    if (cancellation.signal.aborted || serialized.category === 'cancelled') {
+    if (lease.signal.aborted || isLeaseFailure(signal.reason) || isLeaseFailure(error)) return null;
+    if (signal.aborted || serialized.category === 'cancelled') {
       await finalizeCancellation({ kind: 'workflow_run', id: job.data.workflowRunId });
       return null;
     }
@@ -865,7 +923,17 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
     })) return null;
     throw error;
   } finally {
-    cancellation.stop();
+    cancellation?.stop();
+    try {
+      await lease.stop();
+    } catch (error) {
+      reportLeaseCleanupFailure(leaseSubject, error);
+    }
+    try {
+      await releaseLease(leaseSubject, leaseOwnerId);
+    } catch (error) {
+      reportLeaseCleanupFailure(leaseSubject, error);
+    }
   }
 }, { connection, concurrency: 2 });
 

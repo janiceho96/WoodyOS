@@ -20,11 +20,13 @@ import { limitedActionResult } from '../../lib/action-safety.js';
 
 export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  execution.signal.throwIfAborted();
   await assertWorkflowRunManifestDependencies(run);
   const toolId = node.config.toolId;
   if (typeof toolId !== 'string') throw new Error(`Action node ${node.id} has no toolId`);
   const tool = (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE id=$1 AND workspace_id=$2 AND enabled=true', [toolId, run.workspace_id])).rows[0];
   if (!tool) throw new Error(`Action node ${node.id} references an unavailable tool`);
+  execution.signal.throwIfAborted();
   const requiresApproval = toolRequiresApproval(tool);
   let precedingApproval: { nodeId: string; iterationKey: string } | undefined;
   if (requiresApproval) {
@@ -58,7 +60,9 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
     targetSummary: tool.name,
     trace: actionTrace,
     precedingApproval,
+    leaseOwnerId: execution.leaseOwnerId,
   });
+  execution.signal.throwIfAborted();
   if (authorization.status === 'awaiting_confirmation') {
     throw Object.assign(new Error(`Write-capable action ${node.id} could not consume its preceding approval safely`), { retryable: false });
   }
@@ -69,7 +73,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
     setNodeOutput(authorization.result);
     return { output: authorization.result, result: authorization.result };
   }
-  if (!(await beginWorkflowAction(authorization.authorizationId))) {
+  if (!(await beginWorkflowAction(authorization.authorizationId, execution.leaseOwnerId))) {
     throw Object.assign(new Error('Legacy action execution could not be claimed safely'), { retryable: false });
   }
   await emitEvent('tool.called', `Calling ${tool.name}`, {

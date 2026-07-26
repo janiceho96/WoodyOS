@@ -5,6 +5,7 @@ import type { TraceContext } from '../../runtime/trace.js';
 type BaseExecutionContext = {
   trace: TraceContext;
   signal: AbortSignal;
+  leaseOwnerId?: string;
 };
 
 export type ExecutionContext = BaseExecutionContext & (

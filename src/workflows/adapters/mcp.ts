@@ -7,12 +7,14 @@ import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/err
 
 export async function executeMcpActionNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
+  execution.signal.throwIfAborted();
   await assertWorkflowRunManifestDependencies(run);
   const agentId = node.config.agentId;
   const mcpToolId = node.config.mcpToolId;
   if (typeof agentId !== 'string' || typeof mcpToolId !== 'string') throw new Error(`App action ${node.id} needs an agent and MCP tool`);
   const tool = await authorizedMcpTool(run.workspace_id, agentId, mcpToolId);
   if (!tool) throw Object.assign(new Error(`App action ${node.id} is unavailable or not allowed for the selected agent`), { retryable: false });
+  execution.signal.throwIfAborted();
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : {};
   const arguments_ = resolve(configuredInput) as Record<string, unknown>;
   const actionName = tool.title ?? tool.remote_name;
@@ -31,7 +33,9 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
     requestedBy: run.created_by,
     targetSummary: `${actionName} via ${tool.connection_name}`,
     trace: actionTrace,
+    leaseOwnerId: execution.leaseOwnerId,
   });
+  execution.signal.throwIfAborted();
   if (authorization.status === 'awaiting_confirmation') {
     await emitEvent('action.confirmation_requested', `Confirmation is required before ${actionName}`, { authorizationId: authorization.authorizationId, toolId: tool.id, riskLevel: tool.risk_level }, actionTrace);
     return { waiting: true, waitingMessage: `Confirm ${actionName} before Woody continues`, output: null };
@@ -41,7 +45,7 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
     setNodeOutput(authorization.result);
     return { output: authorization.result, result: authorization.result };
   }
-  if (!(await beginWorkflowAction(authorization.authorizationId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
+  if (!(await beginWorkflowAction(authorization.authorizationId, execution.leaseOwnerId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
   await emitEvent('mcp.tool.called', `Calling ${actionName}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
   try {
     const executed = await executeAuthorizedMcpTool({

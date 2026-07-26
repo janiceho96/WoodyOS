@@ -9,6 +9,7 @@ function json(value: unknown) {
 
 export async function executeAgentNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, executeAgentTask, setNodeOutput } = context;
+  execution.signal.throwIfAborted();
   const agentId = node.config.agentId;
   if (typeof agentId !== 'string') throw new Error(`Agent node ${node.id} has no agentId`);
   let task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
@@ -17,6 +18,7 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
     [run.id, node.id, iterationKey, cursor.attempt],
   )).rows[0];
   if (!task) {
+    execution.signal.throwIfAborted();
     const agentTrace = childTraceContext(execution.trace);
     const inputMapping = node.config.inputMapping && typeof node.config.inputMapping === 'object' && !Array.isArray(node.config.inputMapping)
       ? node.config.inputMapping as Record<string, unknown>
@@ -33,6 +35,7 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
         retryable: false,
       });
     }
+    execution.signal.throwIfAborted();
     task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
       `INSERT INTO tasks(
          workspace_id,agent_id,agent_version_id,workflow_run_id,workflow_node_id,workflow_iteration_key,

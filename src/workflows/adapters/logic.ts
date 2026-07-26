@@ -103,9 +103,14 @@ export async function executeLogicNode(context: WorkflowAdapterContext) {
          SELECT 1 FROM workflow_runs
          WHERE id=$2 AND workspace_id=$1
            AND status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
+           AND ($6::text IS NULL OR EXISTS(
+             SELECT 1 FROM execution_leases
+             WHERE subject_type='workflow_run' AND subject_id=$2
+               AND owner_id=$6 AND expires_at > now()
+           ))
        )
        RETURNING id`,
-      [run.workspace_id, run.id, node.id, iterationKey, cursor.attempt],
+      [run.workspace_id, run.id, node.id, iterationKey, cursor.attempt, execution.leaseOwnerId ?? null],
     );
     if (!inserted.rowCount) throw cancellationError();
     return { waiting: true, waitingMessage: 'Human approval is required', output: null };

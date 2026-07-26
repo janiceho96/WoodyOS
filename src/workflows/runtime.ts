@@ -20,6 +20,7 @@ import {
 } from '../runtime/trace.js';
 import { assertManifestCompatible } from '../runtime/manifest.js';
 import { cancellationError } from '../runtime/cancellation.js';
+import { isLeaseFailure } from '../runtime/leases.js';
 
 export type { AgentTaskExecutor } from './adapters/types.js';
 export { loopResult } from './adapters/logic.js';
@@ -200,10 +201,12 @@ export async function executeWorkflowStep(
   workflowRunId: string,
   executeAgentTask: AgentTaskExecutor,
   signal: AbortSignal = new AbortController().signal,
+  leaseOwnerId?: string,
 ) {
+  signal.throwIfAborted();
   const run = (await query<WorkflowRunRecord>(
     `UPDATE workflow_runs r SET status='running',started_at=COALESCE(started_at,now()),updated_at=now()
-      FROM workflows w WHERE r.id=$1 AND r.workflow_id=w.id AND r.status='queued'
+      FROM workflows w WHERE r.id=$1 AND r.workflow_id=w.id AND r.status IN ('queued','running')
       RETURNING r.*,w.name,w.created_by`,
     [workflowRunId],
   )).rows[0];
@@ -245,13 +248,16 @@ export async function executeWorkflowStep(
   const runTrace = authoritativeTraceContext(run);
   const nodeTrace = childTraceContext(runTrace);
   try {
+    signal.throwIfAborted();
     if (run.step_count === 0) await workflowEvent(run, null, 'workflow.started', `${run.name} started`);
+    signal.throwIfAborted();
     await startNode(run, node, cursor, nodeTrace);
     const key = iterationKey(cursor);
     const execution = await executeRegisteredWorkflowNode({
       execution: {
         trace: nodeTrace,
         signal,
+        leaseOwnerId,
         ...(run.run_mode === 'production'
           ? { mode: 'production' as const, manifest: assertManifestCompatible(run.execution_manifest) }
           : { mode: 'test' as const, manifest: null }),
@@ -272,6 +278,7 @@ export async function executeWorkflowStep(
         run.state.nodes = nodeState;
       },
     });
+    signal.throwIfAborted();
     if (execution.waiting) {
       await waitNode(run, node, cursor, execution.waitingMessage ?? 'Human confirmation is required', nodeTrace);
       return { waiting: true };
@@ -345,6 +352,7 @@ export async function executeWorkflowStep(
     return { queued: true, nextNodeId: edge.target };
   } catch (error) {
     const serialized = serializeRuntimeError(error);
+    if (isLeaseFailure(signal.reason) || isLeaseFailure(error)) throw signal.reason ?? error;
     if (signal.aborted || serialized.category === 'cancelled') {
       throw serialized.category === 'cancelled' ? error : cancellationError(error);
     }
