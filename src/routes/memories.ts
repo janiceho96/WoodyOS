@@ -1,31 +1,101 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { query } from '../db/client.js';
 import { asyncRoute, parse } from '../lib/http.js';
+import {
+  confirmMemory,
+  createMemory,
+  deleteMemory,
+  disputeMemory,
+  expireMemory,
+  listEligibleMemories,
+  serializeMemory,
+  supersedeMemory,
+  updateMemory,
+} from '../memories/service.js';
 
-const memoryInput = z.object({ agentId: z.string().uuid().nullable().optional(), kind: z.enum(['conversation', 'knowledge', 'user']), content: z.string().min(1).max(50000), importance: z.number().min(0).max(1).default(0.5), metadata: z.record(z.unknown()).default({}) });
+const memoryTypes = ['preference', 'fact', 'decision', 'project_context', 'workflow_result', 'error_resolution', 'summary', 'hypothesis'] as const;
+const scopes = ['workspace', 'agent', 'user'] as const;
+const verificationStatuses = ['user_confirmed', 'agent_inferred', 'system_generated', 'unverified', 'disputed', 'superseded'] as const;
+const legacyKinds = ['conversation', 'knowledge', 'user'] as const;
+
+const sourceInput = z.object({ type: z.string().min(1).max(100), id: z.string().max(200).nullable().optional() });
+const memoryFields = z.object({
+  agentId: z.string().uuid().nullable().optional(),
+  kind: z.enum(legacyKinds).optional(),
+  type: z.enum(memoryTypes).optional(),
+  scope: z.enum(scopes).optional(),
+  content: z.string().min(1).max(50000),
+  importance: z.number().min(0).max(1).default(0.5),
+  metadata: z.record(z.unknown()).default({}),
+  source: sourceInput.optional(),
+  confidence: z.number().min(0).max(1).default(0.5),
+  verificationStatus: z.enum(verificationStatuses).optional(),
+  expiresAt: z.coerce.date().nullable().optional(),
+});
+const createInput = memoryFields.refine((value) => Boolean(value.kind || value.type), { message: 'kind or type is required' });
+
+const idParams = z.object({ id: z.string().uuid() });
+const listQuery = z.object({
+  agentId: z.string().uuid().optional(),
+  type: z.enum(memoryTypes).optional(),
+  scope: z.enum(scopes).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
+const supersedeInput = z.object({
+  replacementMemoryId: z.string().uuid().optional(),
+  replacement: createInput.optional(),
+}).refine((value) => Boolean(value.replacementMemoryId || value.replacement), { message: 'replacementMemoryId or replacement is required' });
+
 export async function memoryRoutes(app: FastifyInstance) {
-  app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => ({ data: (await query('SELECT id,agent_id,kind,content,importance,metadata,created_at,updated_at FROM memories WHERE workspace_id=$1 ORDER BY importance DESC,created_at DESC LIMIT 100', [request.user.workspaceId])).rows })));
+  app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
+    const filters = parse(listQuery, request.query, reply); if (!filters) return;
+    const memories = await listEligibleMemories({ workspaceId: request.user.workspaceId, ...filters });
+    return { data: memories.map(serializeMemory) };
+  }));
+
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
-    const input = parse(memoryInput, request.body, reply); if (!input) return;
-    if (input.agentId) { const agent = await query('SELECT 1 FROM agents WHERE id=$1 AND workspace_id=$2', [input.agentId, request.user.workspaceId]); if (!agent.rowCount) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' }); }
-    const result = await query('INSERT INTO memories(workspace_id,agent_id,user_id,kind,content,importance,metadata) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,agent_id,kind,content,importance,metadata,created_at', [request.user.workspaceId, input.agentId ?? null, request.user.sub, input.kind, input.content, input.importance, JSON.stringify(input.metadata)]);
-    return reply.code(201).send(result.rows[0]);
+    const input = parse(createInput, request.body, reply); if (!input) return;
+    const memory = await createMemory({ ...input, workspaceId: request.user.workspaceId, userId: request.user.sub, actor: { type: 'user', id: request.user.sub } });
+    return reply.code(201).send(serializeMemory(memory));
   }));
+
+  app.post('/:id/confirm', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const params = parse(idParams, request.params, reply); if (!params) return;
+    return serializeMemory(await confirmMemory({ workspaceId: request.user.workspaceId, memoryId: params.id, actorId: request.user.sub }));
+  }));
+
+  app.post('/:id/dispute', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const params = parse(idParams, request.params, reply); if (!params) return;
+    return serializeMemory(await disputeMemory({ workspaceId: request.user.workspaceId, memoryId: params.id, actorId: request.user.sub }));
+  }));
+
+  app.post('/:id/expire', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const params = parse(idParams, request.params, reply); if (!params) return;
+    return serializeMemory(await expireMemory({ workspaceId: request.user.workspaceId, memoryId: params.id }));
+  }));
+
+  app.post('/:id/supersede', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const params = parse(idParams, request.params, reply); if (!params) return;
+    const input = parse(supersedeInput, request.body, reply); if (!input) return;
+    const result = await supersedeMemory({
+      workspaceId: request.user.workspaceId,
+      memoryId: params.id,
+      replacementMemoryId: input.replacementMemoryId,
+      replacement: input.replacement && { ...input.replacement, userId: request.user.sub, actor: { type: 'user', id: request.user.sub } },
+    });
+    return { memory: serializeMemory(result.memory), replacement: serializeMemory(result.replacement) };
+  }));
+
   app.patch('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
-    const input = parse(memoryInput.pick({ content: true, importance: true, metadata: true }).partial(), request.body, reply); if (!input) return;
-    const entries: Array<[string, unknown]> = [];
-    if (input.content !== undefined) entries.push(['content', input.content]);
-    if (input.importance !== undefined) entries.push(['importance', input.importance]);
-    if (input.metadata !== undefined) entries.push(['metadata', JSON.stringify(input.metadata)]);
-    if (!entries.length) return reply.code(400).send({ error: 'NO_UPDATES' });
-    const values = entries.map(([, value]) => value);
-    const set = entries.map(([field], index) => `${field}=$${index + 1}`).join(', ');
-    const result = await query(`UPDATE memories SET ${set},updated_at=now() WHERE id=$${values.length + 1} AND workspace_id=$${values.length + 2} RETURNING id,agent_id,kind,content,importance,metadata,updated_at`, [...values, (request.params as { id: string }).id, request.user.workspaceId]);
-    return result.rowCount ? result.rows[0] : reply.code(404).send({ error: 'MEMORY_NOT_FOUND' });
+    const params = parse(idParams, request.params, reply); if (!params) return;
+    const input = parse(memoryFields.pick({ content: true, importance: true, metadata: true }).partial(), request.body, reply); if (!input) return;
+    return serializeMemory(await updateMemory({ workspaceId: request.user.workspaceId, memoryId: params.id, ...input }));
   }));
+
   app.delete('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
-    const result = await query('DELETE FROM memories WHERE id=$1 AND workspace_id=$2 RETURNING id', [(request.params as { id: string }).id, request.user.workspaceId]);
-    return result.rowCount ? reply.code(204).send() : reply.code(404).send({ error: 'MEMORY_NOT_FOUND' });
+    const params = parse(idParams, request.params, reply); if (!params) return;
+    await deleteMemory({ workspaceId: request.user.workspaceId, memoryId: params.id });
+    return reply.code(204).send();
   }));
 }
