@@ -27,6 +27,11 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   if (typeof toolId !== 'string') throw new Error(`Action node ${node.id} has no toolId`);
   const tool = (await query<ToolRecord>('SELECT id,name,kind,config,permissions FROM tools WHERE id=$1 AND workspace_id=$2 AND enabled=true', [toolId, run.workspace_id])).rows[0];
   if (!tool) throw new Error(`Action node ${node.id} references an unavailable tool`);
+  context.registerActionIdentity({
+    adapter: 'api',
+    resourceId: tool.id,
+    riskLevel: toolRiskLevel(tool),
+  });
   execution.signal.throwIfAborted();
   const requiresApproval = toolRequiresApproval(tool);
   let precedingApproval: { nodeId: string; iterationKey: string } | undefined;

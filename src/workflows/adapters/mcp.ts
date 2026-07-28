@@ -15,6 +15,11 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
   if (typeof agentId !== 'string' || typeof mcpToolId !== 'string') throw new Error(`App action ${node.id} needs an agent and MCP tool`);
   const tool = await authorizedMcpTool(run.workspace_id, agentId, mcpToolId);
   if (!tool) throw Object.assign(new Error(`App action ${node.id} is unavailable or not allowed for the selected agent`), { retryable: false });
+  context.registerActionIdentity({
+    adapter: 'mcp',
+    resourceId: tool.id,
+    riskLevel: tool.risk_level,
+  });
   execution.signal.throwIfAborted();
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : {};
   const arguments_ = resolve(configuredInput) as Record<string, unknown>;

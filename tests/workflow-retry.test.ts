@@ -3,6 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({
   statements: [] as Array<{ sql: string; values: unknown[] }>,
   enqueued: [] as Array<{ runId: string; phaseId: string; delay: number; traceId: string }>,
+  actionNode: null as null | {
+    id: string;
+    type: 'action';
+    config: Record<string, unknown>;
+  },
+  actionIdentity: null as null | {
+    adapter: 'api';
+    resourceId: string;
+    riskLevel: 'read' | 'write' | 'unknown';
+  },
 }));
 
 const run = {
@@ -46,7 +56,13 @@ vi.mock('../src/db/client.js', () => ({
   query: vi.fn(async (sql: string, values: unknown[] = []) => {
     state.statements.push({ sql, values });
     if (sql.includes('UPDATE workflow_runs r SET')) {
-      return { rowCount: 1, rows: [structuredClone(run)] };
+      const claimed = structuredClone(run);
+      if (state.actionNode) {
+        claimed.definition_snapshot.nodes[0] = structuredClone(state.actionNode);
+        claimed.definition_snapshot.edges[0].source = state.actionNode.id;
+        claimed.cursor.nodeId = state.actionNode.id;
+      }
+      return { rowCount: 1, rows: [claimed] };
     }
     return { rowCount: 1, rows: [] };
   }),
@@ -54,7 +70,8 @@ vi.mock('../src/db/client.js', () => ({
 vi.mock('../src/workflows/adapters/index.js', async () => {
   const { runtimeError } = await import('../src/runtime/errors.js');
   return {
-    executeRegisteredWorkflowNode: vi.fn(async () => {
+    executeRegisteredWorkflowNode: vi.fn(async (context) => {
+      if (state.actionIdentity) context.registerActionIdentity(state.actionIdentity);
       throw runtimeError('UPSTREAM_TIMEOUT', {
         category: 'timeout',
         retryable: true,
@@ -83,6 +100,8 @@ describe('workflow retry scheduling', () => {
   beforeEach(() => {
     state.statements = [];
     state.enqueued = [];
+    state.actionNode = null;
+    state.actionIdentity = null;
   });
 
   it('persists one decision and schedules exactly one logical next attempt', async () => {
@@ -112,5 +131,88 @@ describe('workflow retry scheduling', () => {
     expect(state.statements.filter((entry) => (
       entry.sql.includes("UPDATE workflow_runs SET status='queued',cursor=")
     ))).toHaveLength(1);
+  });
+
+  it.each([
+    ['write', 'write'],
+    ['unknown', 'unknown'],
+  ] as const)('vetoes retryable adapter failures for authoritative %s actions', async (_name, riskLevel) => {
+    const toolId = '00000000-0000-4000-8000-000000000010';
+    state.actionNode = {
+      id: 'action',
+      type: 'action',
+      config: {
+        toolId,
+        retry: {
+          maxAttempts: 3,
+          initialDelayMs: 250,
+          multiplier: 2,
+          maxDelayMs: 1_000,
+        },
+      },
+    };
+    state.actionIdentity = { adapter: 'api', resourceId: toolId, riskLevel };
+
+    await executeWorkflowStep(run.id, async () => null);
+
+    expect(state.enqueued).toEqual([]);
+    const failedNode = state.statements.find((entry) => (
+      entry.sql.includes("workflow_run_node_states SET status='failed'")
+    ));
+    expect(JSON.parse(String(failedNode?.values[0]))).toMatchObject({
+      retryDecision: { retry: false, reason: 'action_not_retryable' },
+    });
+  });
+
+  it('preserves one legacy read retry without a second resource query or duplicate schedule', async () => {
+    const toolId = '00000000-0000-4000-8000-000000000010';
+    state.actionNode = {
+      id: 'action',
+      type: 'action',
+      config: {
+        toolId,
+        retry: {
+          maxAttempts: 3,
+          initialDelayMs: 250,
+          multiplier: 2,
+          maxDelayMs: 1_000,
+        },
+      },
+    };
+    state.actionIdentity = { adapter: 'api', resourceId: toolId, riskLevel: 'read' };
+
+    await executeWorkflowStep(run.id, async () => null);
+
+    expect(state.enqueued).toHaveLength(1);
+    expect(state.statements.filter((entry) => entry.sql.includes('FROM tools'))).toHaveLength(0);
+    expect(state.statements.filter((entry) => (
+      entry.sql.includes("UPDATE workflow_runs SET status='queued',cursor=")
+    ))).toHaveLength(1);
+  });
+
+  it('treats an action without an authoritative resource identity as unknown and non-retryable', async () => {
+    state.actionNode = {
+      id: 'action',
+      type: 'action',
+      config: {
+        toolId: '00000000-0000-4000-8000-000000000010',
+        retry: {
+          maxAttempts: 3,
+          initialDelayMs: 250,
+          multiplier: 2,
+          maxDelayMs: 1_000,
+        },
+      },
+    };
+
+    await executeWorkflowStep(run.id, async () => null);
+
+    expect(state.enqueued).toEqual([]);
+    const failedNode = state.statements.find((entry) => (
+      entry.sql.includes("workflow_run_node_states SET status='failed'")
+    ));
+    expect(JSON.parse(String(failedNode?.values[0]))).toMatchObject({
+      retryDecision: { retry: false, reason: 'action_not_retryable' },
+    });
   });
 });

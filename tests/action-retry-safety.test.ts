@@ -81,6 +81,7 @@ describe('action retry safety', () => {
         resolve: (value: unknown) => value,
         emitEvent: async () => undefined,
         setNodeOutput: () => undefined,
+        registerActionIdentity: () => undefined,
       } as never);
     } catch (error) {
       failure = error;
@@ -128,6 +129,7 @@ describe('action retry safety', () => {
         resolve: (value: unknown) => value,
         emitEvent: async () => undefined,
         setNodeOutput: () => undefined,
+        registerActionIdentity: () => undefined,
       } as never);
     } catch (error) {
       failure = error;
@@ -181,6 +183,7 @@ describe('action retry safety', () => {
       resolve: (value: unknown) => value,
       emitEvent: async () => undefined,
       setNodeOutput: () => undefined,
+      registerActionIdentity: () => undefined,
     } as never).catch(() => undefined);
 
     expect(gateway.invokeTool.mock.calls[0]?.[3]).toBe(controller.signal);

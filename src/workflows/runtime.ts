@@ -5,8 +5,13 @@ import { requestWorkflowArtifacts } from '../artifacts/service.js';
 import { retryPolicy, type WorkflowDefinition, type WorkflowEdge, type WorkflowNode } from './definition.js';
 import { executeRegisteredWorkflowNode } from './adapters/index.js';
 import { resolveWorkflowTemplates } from './adapters/templates.js';
-import type { AgentTaskExecutor, WorkflowCursor, WorkflowRunRecord } from './adapters/types.js';
-import { workflowNodeDefinition } from './registry.js';
+import type {
+  AgentTaskExecutor,
+  WorkflowActionIdentity,
+  WorkflowCursor,
+  WorkflowRunRecord,
+} from './adapters/types.js';
+import { workflowNodeDefinition, type WorkflowNodeRisk } from './registry.js';
 import {
   redactRuntimeMessage,
   redactRuntimeValue,
@@ -228,13 +233,41 @@ function artifactFormats(node: WorkflowNode): ArtifactFormat[] {
   return [...new Set(raw.map((item) => artifactFormatSchema.safeParse(item)).filter((item) => item.success).map((item) => item.data))];
 }
 
-async function failOrRetry(run: WorkflowRunRecord, node: WorkflowNode, cursor: WorkflowCursor, error: unknown, trace: TraceContext, lease?: ExecutionLeaseContext) {
+function authoritativeActionRisk(
+  node: WorkflowNode,
+  identity: WorkflowActionIdentity | null,
+): WorkflowNodeRisk | undefined {
+  const expected = node.type === 'mcp_action'
+    ? { adapter: 'mcp' as const, resourceId: node.config.mcpToolId }
+    : node.type === 'action' || node.type === 'api_action'
+      ? { adapter: 'api' as const, resourceId: node.config.toolId }
+      : null;
+  if (!expected) return undefined;
+  if (
+    !identity
+    || typeof expected.resourceId !== 'string'
+    || identity.adapter !== expected.adapter
+    || identity.resourceId !== expected.resourceId
+  ) return 'unknown';
+  return identity.riskLevel;
+}
+
+async function failOrRetry(
+  run: WorkflowRunRecord,
+  node: WorkflowNode,
+  cursor: WorkflowCursor,
+  error: unknown,
+  trace: TraceContext,
+  actionRisk: WorkflowNodeRisk | undefined,
+  lease?: ExecutionLeaseContext,
+) {
   const serialized = serializeRuntimeError(error);
   const policy = retryPolicy(node);
   const decision = retryDecision(serialized, {
     attempt: cursor.attempt,
     nodeRetryable: Boolean(workflowNodeDefinition(node.type)?.retryable),
     policy,
+    actionRisk,
   });
   const persistedError = { ...serialized, retryDecision: decision };
   const message = serialized.message;
@@ -362,19 +395,23 @@ export async function executeWorkflowStep(
   }
   const runTrace = authoritativeTraceContext(run);
   const nodeTrace = childTraceContext(runTrace);
+  let actionIdentity: WorkflowActionIdentity | null = null;
   try {
     signal.throwIfAborted();
     if (run.step_count === 0) await emitWorkflowEvent(null, 'workflow.started', `${run.name} started`);
     signal.throwIfAborted();
     await startNode(run, node, cursor, nodeTrace, lease);
     const key = iterationKey(cursor);
+    const executionManifest = run.run_mode === 'production'
+      ? assertManifestCompatible(run.execution_manifest)
+      : null;
     const execution = await executeRegisteredWorkflowNode({
       execution: {
         trace: nodeTrace,
         signal,
         leaseOwnerId,
         ...(run.run_mode === 'production'
-          ? { mode: 'production' as const, manifest: assertManifestCompatible(run.execution_manifest) }
+          ? { mode: 'production' as const, manifest: executionManifest! }
           : { mode: 'test' as const, manifest: null }),
       },
       run,
@@ -391,6 +428,17 @@ export async function executeWorkflowStep(
           : {};
         nodeState[node.id] = value;
         run.state.nodes = nodeState;
+      },
+      registerActionIdentity: (identity) => {
+        const expectedRisk = authoritativeActionRisk(node, identity);
+        const pinned = identity.adapter === 'api'
+          ? executionManifest?.apiTools[identity.resourceId]
+          : executionManifest?.mcpActions[identity.resourceId];
+        if (
+          expectedRisk !== identity.riskLevel
+          || (executionManifest && (!pinned || pinned.toolId !== identity.resourceId))
+        ) return;
+        actionIdentity = identity;
       },
     });
     signal.throwIfAborted();
@@ -480,7 +528,15 @@ export async function executeWorkflowStep(
     if (signal.aborted || serialized.category === 'cancelled') {
       throw serialized.category === 'cancelled' ? error : cancellationError(error);
     }
-    await failOrRetry(run, node, cursor, error, nodeTrace, lease);
+    await failOrRetry(
+      run,
+      node,
+      cursor,
+      error,
+      nodeTrace,
+      authoritativeActionRisk(node, actionIdentity),
+      lease,
+    );
     return { failed: true };
   }
 }

@@ -19,6 +19,11 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     [toolId, run.workspace_id],
   )).rows[0];
   if (!tool) throw Object.assign(new Error(`API action ${node.id} references an unavailable tool`), { retryable: false });
+  context.registerActionIdentity({
+    adapter: 'api',
+    resourceId: tool.id,
+    riskLevel: toolRiskLevel(tool),
+  });
   execution.signal.throwIfAborted();
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : run.state;
   const arguments_ = resolve(configuredInput) as Record<string, unknown>;

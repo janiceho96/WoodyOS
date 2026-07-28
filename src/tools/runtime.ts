@@ -84,9 +84,17 @@ function toolHttpError(response: Response) {
 }
 
 function toolTransportError(error: unknown, callerSignal: AbortSignal | undefined, timeoutSignal: AbortSignal) {
+  if (callerSignal?.aborted) return cancellationError(error);
+  if (timeoutSignal.aborted) {
+    return runtimeError('TOOL_TIMEOUT', {
+      category: 'timeout',
+      retryable: true,
+      message: 'Tool request timed out',
+      cause: error,
+    });
+  }
   if (error instanceof WorkflowRuntimeError) return error;
-  if (callerSignal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) return cancellationError(error);
-  if (timeoutSignal.aborted || (error instanceof DOMException && error.name === 'TimeoutError')) {
+  if (error instanceof DOMException && error.name === 'TimeoutError') {
     return runtimeError('TOOL_TIMEOUT', {
       category: 'timeout',
       retryable: true,
@@ -102,12 +110,28 @@ function toolTransportError(error: unknown, callerSignal: AbortSignal | undefine
   });
 }
 
+function toolRequestError(error: unknown) {
+  if (error instanceof WorkflowRuntimeError) return error;
+  return runtimeError('TOOL_REQUEST_INVALID', {
+    category: 'validation',
+    retryable: false,
+    message: 'Tool request could not be constructed from the supplied input',
+    cause: error,
+  });
+}
+
 function toolEndpointError(error: unknown, callerSignal: AbortSignal | undefined, timeoutSignal: AbortSignal) {
+  if (callerSignal?.aborted || timeoutSignal.aborted) {
+    return toolTransportError(error, callerSignal, timeoutSignal);
+  }
   const message = error instanceof Error ? error.message : '';
   if (
     message === 'Tool endpoints must use HTTPS'
     || message === 'Non-public tool endpoints are not allowed'
-    || (error instanceof TypeError && !('code' in error))
+    || (
+      error instanceof TypeError
+      && (!('code' in error) || error.code === 'ERR_INVALID_URL')
+    )
   ) {
     return runtimeError('TOOL_ENDPOINT_INVALID', {
       category: 'validation',
@@ -147,12 +171,23 @@ export async function invokeTool(
   }
   const headers = headersFrom(config.headers);
   const timeout = combineAbortSignals([callerSignal, timeoutSignal]);
-  let response: Response;
+  let request: { endpoint: URL; init: RequestInit };
   try {
+    let init: RequestInit;
     if (healthCheck) {
-      response = await fetch(endpoint, { method: 'GET', signal: timeout, headers });
+      init = { method: 'GET', signal: timeout, headers };
     } else if (tool.kind === 'mcp') {
-      response = await fetch(endpoint, { method: 'POST', signal: timeout, headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method: 'tools/call', params: { name: String(config.mcpToolName ?? tool.name), arguments: input } }) });
+      init = {
+        method: 'POST',
+        signal: timeout,
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: crypto.randomUUID(),
+          method: 'tools/call',
+          params: { name: String(config.mcpToolName ?? tool.name), arguments: input },
+        }),
+      };
     } else {
       const method = String(config.method ?? 'POST').toUpperCase();
       if (!['GET', 'POST'].includes(method)) throw runtimeError('TOOL_METHOD_INVALID', {
@@ -160,9 +195,29 @@ export async function invokeTool(
         retryable: false,
         message: 'Tool method configuration is invalid',
       });
-      if (method === 'GET') Object.entries(input).forEach(([key, value]) => endpoint.searchParams.set(key, typeof value === 'string' ? value : JSON.stringify(value)));
-      response = await fetch(endpoint, { method, signal: timeout, headers: method === 'POST' ? { 'content-type': 'application/json', ...headers } : headers, body: method === 'POST' ? JSON.stringify(input) : undefined });
+      if (method === 'GET') {
+        Object.entries(input).forEach(([key, value]) => endpoint.searchParams.set(
+          key,
+          typeof value === 'string' ? value : JSON.stringify(value),
+        ));
+      }
+      init = {
+        method,
+        signal: timeout,
+        headers: method === 'POST' ? { 'content-type': 'application/json', ...headers } : headers,
+        body: method === 'POST' ? JSON.stringify(input) : undefined,
+      };
     }
+    // Construct once before dispatch so invalid headers/body/options cannot be
+    // mistaken for a transport failure thrown by the actual fetch.
+    void new Request(endpoint, init);
+    request = { endpoint, init };
+  } catch (error) {
+    throw toolRequestError(error);
+  }
+  let response: Response;
+  try {
+    response = await fetch(request.endpoint, request.init);
   } catch (error) {
     throw toolTransportError(error, callerSignal, timeoutSignal);
   }

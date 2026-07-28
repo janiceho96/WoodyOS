@@ -186,6 +186,7 @@ function context() {
     emitEvent: async () => undefined,
     resolve: (value: unknown) => value,
     setNodeOutput: () => undefined,
+    registerActionIdentity: () => undefined,
   } as never;
 }
 

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { lookup } from 'node:dns/promises';
 import { encryptJson } from '../src/lib/crypto.js';
 import { toolConfigurationError } from '../src/routes/tools.js';
 import { demoApiCatalog, publicDemoApi } from '../src/tools/demo-catalog.js';
 import { invokeTool } from '../src/tools/runtime.js';
+import { retryDecision } from '../src/runtime/errors.js';
 
 vi.mock('node:dns/promises', () => ({
   lookup: vi.fn(async () => [{ address: '93.184.216.34', family: 4 }]),
@@ -89,7 +91,94 @@ describe('tool configuration validation', () => {
 
 describe('tool runtime error classification', () => {
   it.each([
-    ['DNS lookup failure', Object.assign(new Error('getaddrinfo ENOTFOUND api.example.test token=do-not-leak'), { code: 'ENOTFOUND' })],
+    ['a BigInt POST body', { method: 'POST', input: { count: 1n } }],
+    ['a circular GET query value', { method: 'GET', input: (() => {
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      return { circular };
+    })() }],
+  ])('rejects %s before dispatch as non-retryable validation', async (_name, request) => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ ok: true }));
+    const tool = readTool();
+    tool.config = encryptJson({
+      endpoint: 'https://api.example.test/lookup',
+      method: request.method,
+      readOnly: true,
+    });
+
+    let error: unknown;
+    try {
+      await invokeTool(tool, request.input);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      code: 'TOOL_REQUEST_INVALID',
+      category: 'validation',
+      retryable: false,
+    });
+    expect(retryDecision(error, {
+      attempt: 1,
+      nodeRetryable: true,
+      policy: { maxAttempts: 3, initialDelayMs: 250, multiplier: 2, maxDelayMs: 1_000 },
+      actionRisk: 'read',
+    })).toMatchObject({ retry: false });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('classifies DNS resolution failure from safeEndpoint without dispatching fetch', async () => {
+    vi.mocked(lookup).mockRejectedValueOnce(
+      Object.assign(new Error('getaddrinfo ENOTFOUND api.example.test token=do-not-leak'), { code: 'ENOTFOUND' }),
+    );
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ ok: true }));
+
+    let error: unknown;
+    try {
+      await invokeTool(readTool(), {});
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      code: 'TOOL_TRANSPORT_FAILURE',
+      category: 'transient',
+      retryable: true,
+      message: 'Tool endpoint could not be reached',
+    });
+    expect(JSON.stringify(error)).not.toContain('do-not-leak');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an invalid URL', 'not-a-url'],
+    ['a non-HTTPS URL', 'http://api.example.test/lookup'],
+  ])('keeps %s non-retryable at the endpoint boundary', async (_name, endpoint) => {
+    const tool = readTool();
+    tool.config = encryptJson({ endpoint, method: 'GET', readOnly: true });
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ ok: true }));
+
+    await expect(invokeTool(tool, {})).rejects.toMatchObject({
+      code: 'TOOL_ENDPOINT_INVALID',
+      category: 'validation',
+      retryable: false,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps a DNS-resolved private endpoint non-retryable without dispatching fetch', async () => {
+    vi.mocked(lookup).mockResolvedValueOnce([{ address: '127.0.0.1', family: 4 }]);
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ ok: true }));
+
+    await expect(invokeTool(readTool(), {})).rejects.toMatchObject({
+      code: 'TOOL_ENDPOINT_INVALID',
+      category: 'validation',
+      retryable: false,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['connection reset', Object.assign(new Error('read ECONNRESET authorization=Bearer do-not-leak'), { code: 'ECONNRESET' })],
     ['connection refused', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })],
     ['fetch transport failure', new TypeError('fetch failed')],
@@ -112,7 +201,12 @@ describe('tool runtime error classification', () => {
   });
 
   it('classifies bounded transport timeouts as retryable without confusing caller cancellation', async () => {
-    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new DOMException('provider timeout', 'TimeoutError'));
+    const timeout = new AbortController();
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(timeout.signal);
+    vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async () => {
+      timeout.abort(new DOMException('provider timeout', 'TimeoutError'));
+      throw new DOMException('aborted', 'AbortError');
+    });
     await expect(invokeTool(readTool(), {})).rejects.toMatchObject({
       code: 'TOOL_TIMEOUT',
       category: 'timeout',
@@ -181,6 +275,20 @@ describe('tool runtime error classification', () => {
     await expect(invokeTool(readTool(), {})).rejects.toMatchObject({
       code: 'TOOL_RATE_LIMITED',
       details: undefined,
+    });
+  });
+
+  it('honors a bounded Retry-After HTTP date', async () => {
+    const now = Date.parse('2026-07-28T12:00:00.000Z');
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('', {
+      status: 429,
+      headers: { 'retry-after': new Date(now + 5_000).toUTCString() },
+    }));
+
+    await expect(invokeTool(readTool(), {})).rejects.toMatchObject({
+      code: 'TOOL_RATE_LIMITED',
+      details: { retryAfterMs: 5_000 },
     });
   });
 });

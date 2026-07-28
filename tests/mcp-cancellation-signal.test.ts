@@ -79,6 +79,7 @@ describe('MCP workflow cancellation propagation', () => {
       resolve: (value: unknown) => value,
       emitEvent: async () => undefined,
       setNodeOutput: () => undefined,
+      registerActionIdentity: () => undefined,
     } as never);
 
     expect(state.executionInput?.signal).toBe(controller.signal);

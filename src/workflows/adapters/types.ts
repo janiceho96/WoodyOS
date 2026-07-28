@@ -1,6 +1,7 @@
 import type { WorkflowDefinition, WorkflowNode } from '../definition.js';
 import type { ExecutionManifest } from '../../runtime/manifest.js';
 import type { TraceContext } from '../../runtime/trace.js';
+import type { WorkflowNodeRisk } from '../registry.js';
 
 type BaseExecutionContext = {
   trace: TraceContext;
@@ -59,6 +60,12 @@ export type WorkflowAdapterExecution = {
   finished?: boolean;
 };
 
+export type WorkflowActionIdentity = {
+  adapter: 'api' | 'mcp';
+  resourceId: string;
+  riskLevel: WorkflowNodeRisk;
+};
+
 export type WorkflowAdapterContext = {
   execution: ExecutionContext;
   run: WorkflowRunRecord;
@@ -69,6 +76,7 @@ export type WorkflowAdapterContext = {
   emitEvent: (type: string, message: string, payload?: Record<string, unknown>, trace?: TraceContext) => Promise<void>;
   resolve: (value: unknown) => unknown;
   setNodeOutput: (value: unknown) => void;
+  registerActionIdentity: (identity: WorkflowActionIdentity) => void;
 };
 
 export type WorkflowNodeExecutor = (context: WorkflowAdapterContext) => Promise<WorkflowAdapterExecution>;
