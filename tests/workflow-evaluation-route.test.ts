@@ -17,6 +17,8 @@ vi.mock('../src/db/client.js', () => ({
   db: { connect: vi.fn(async () => client) },
   query: vi.fn(async (sql: string) => {
     state.statements.push(sql);
+    if (sql.includes('INSERT INTO workflow_regression_cases') || sql.includes('UPDATE workflow_regression_cases')) return { rowCount: 1, rows: [{ id: ids.case }] };
+    if (sql.includes('SELECT id,name,input,fixtures,assertions FROM workflow_regression_cases')) return { rowCount: 1, rows: [{ id: ids.case, name: 'Existing', input: {}, fixtures: {}, assertions: [] }] };
     return { rowCount: 0, rows: [] };
   }),
 }));
@@ -104,5 +106,28 @@ describe('workflow evaluation route', () => {
     await instance.close();
     expect(response.statusCode).toBe(400);
     expect(response.json().error).toBe('EVALUATION_ASSERTION_INVALID');
+  });
+
+  it('accepts exact approval decision fixtures on create and update', async () => {
+    // Break caught: public case validation rejecting the fixture required to replay a human approval.
+    const fixtureKey = 'approval:approve:decision';
+    const instance = await app();
+    const created = await instance.inject({ method: 'POST', url: `/${ids.workflow}/regression-cases`, payload: { name: 'Approval', input: {}, fixtures: { [fixtureKey]: { decision: 'approved' } }, assertions: [] } });
+    const updated = await instance.inject({ method: 'PATCH', url: `/${ids.workflow}/regression-cases/${ids.case}`, payload: { fixtures: { [fixtureKey]: { decision: false } } } });
+    await instance.close();
+    expect(created.statusCode).toBe(201);
+    expect(updated.statusCode).toBe(200);
+  });
+
+  it('rejects malformed approval fixture keys and decisions', async () => {
+    // Break caught: arbitrary approval-shaped payloads becoming a bypass around fixture validation.
+    const instance = await app();
+    const malformedKey = await instance.inject({ method: 'POST', url: `/${ids.workflow}/regression-cases`, payload: { name: 'Bad approval key', input: {}, fixtures: { 'approval:approve:decision:extra': { decision: 'approved' } }, assertions: [] } });
+    const malformedDecision = await instance.inject({ method: 'PATCH', url: `/${ids.workflow}/regression-cases/${ids.case}`, payload: { fixtures: { 'approval:approve:decision': { decision: 'pending' } } } });
+    await instance.close();
+    expect(malformedKey.statusCode).toBe(400);
+    expect(malformedKey.json().error).toBe('EVALUATION_FIXTURE_KEY_INVALID');
+    expect(malformedDecision.statusCode).toBe(400);
+    expect(malformedDecision.json().error).toBe('EVALUATION_APPROVAL_FIXTURE_INVALID');
   });
 });

@@ -26,7 +26,7 @@ import {
 } from '../runtime/errors.js';
 import { requestCancellation } from '../runtime/cancellation.js';
 import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
-import { runFixtureEvaluation, validateRegressionAssertions } from '../workflows/evaluation.js';
+import { runFixtureEvaluation, validateEvaluationFixtures, validateRegressionAssertions } from '../workflows/evaluation.js';
 import { decryptJson } from '../lib/crypto.js';
 import { canonicalJsonHash } from '../runtime/manifest.js';
 import type { StoredConfig } from '../tools/runtime.js';
@@ -63,9 +63,15 @@ function regressionCasePayload(input: RegressionCasePayload) {
     throw Object.assign(new Error(code), { statusCode: 400 });
   }
   for (const key of Object.keys(input.fixtures)) {
-    if (!/^(api|mcp|browser|file):.+:.+$/.test(key)) {
+    if (!/^(api|mcp|browser|file):.+:.+$/.test(key) && !/^approval:[A-Za-z][A-Za-z0-9_-]*:decision$/.test(key)) {
       throw Object.assign(new Error('EVALUATION_FIXTURE_KEY_INVALID'), { statusCode: 400 });
     }
+  }
+  try {
+    validateEvaluationFixtures(input.fixtures);
+  } catch (error) {
+    const code = typeof (error as { code?: unknown })?.code === 'string' ? String((error as { code: string }).code) : 'EVALUATION_FIXTURE_KEY_INVALID';
+    throw Object.assign(new Error(code), { statusCode: 400 });
   }
   return input;
 }
