@@ -1531,10 +1531,53 @@ describe.runIf(enabled)('database-backed API flow', () => {
   }, 30_000);
 
   it('keeps direct quality-history mutations immutable while allowing workflow-run cascade cleanup', async () => {
+    const { query } = await import('../src/db/client.js');
+    const migration = await readFile(
+      new URL('../src/db/migrations/034_quality_history_cascade_immutability.sql', import.meta.url),
+      'utf8',
+    );
+    await query(migration);
+    await query(migration);
+    if (!token || !agentId) {
+      const registration = await app.inject({
+        method: 'POST',
+        url: '/v1/auth/register',
+        payload: {
+          email: `quality-history-${suffix}@example.test`,
+          password,
+          displayName: 'Quality History Integration User',
+          workspaceName: `Quality History Workspace ${suffix}`,
+        },
+      });
+      expect(registration.statusCode, registration.body).toBe(201);
+      token = registration.json().accessToken;
+      const agent = await app.inject({
+        method: 'POST',
+        url: '/v1/agents',
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          name: 'Quality History Agent',
+          role: 'Evaluator',
+          goal: 'Evaluate quality history fixtures',
+          instructions: 'Record immutable quality results.',
+          status: 'active',
+          modelConfig: { temperature: 0.4, maxTokens: 8192, topP: 0.9 },
+          capabilities: { webBrowser: false, codeInterpreter: false, knowledgeBase: false },
+          avatar: { type: 'icon', value: 'check', backgroundColor: '#312e81', accentColor: '#a5b4fc' },
+        },
+      });
+      expect(agent.statusCode, agent.body).toBe(201);
+      agentId = agent.json().id;
+      const published = await app.inject({
+        method: 'POST',
+        url: `/v1/agents/${agentId}/publish`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(published.statusCode, published.body).toBe(201);
+    }
     const headers = { authorization: `Bearer ${token}` };
     const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers });
     expect(me.statusCode, me.body).toBe(200);
-    const { query } = await import('../src/db/client.js');
     const workspaceId = me.json().workspace_id as string;
     const actorId = me.json().id as string;
     const workflow = (await query<{ id: string }>(
