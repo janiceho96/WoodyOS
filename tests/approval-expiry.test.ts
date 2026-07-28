@@ -330,8 +330,8 @@ describe('approval expiration processing', () => {
 
     expect([...first.expiredIds, ...second.expiredIds]).toEqual([ids.authorization]);
     expect(state.statements.some((sql) => (
-      /FOR UPDATE(?: OF authorization)? SKIP LOCKED/.test(sql)
-      && /ORDER BY\s+authorization\.expires_at,\s*authorization\.id/.test(sql)
+      /FOR UPDATE(?: OF auth)? SKIP LOCKED/.test(sql)
+      && /ORDER BY\s+auth\.expires_at,\s*auth\.id/.test(sql)
     ))).toBe(true);
   });
 

@@ -126,11 +126,11 @@ async function expireAuthorization(
     `/* approval-expiry:task */
      UPDATE tasks task
         SET status=$2,error=$3,completed_at=now(),updated_at=now()
-       FROM action_authorizations authorization
-      WHERE authorization.id=$1
-        AND authorization.workspace_id=task.workspace_id
-        AND authorization.subject_type='task'
-        AND task.id=authorization.task_id
+       FROM action_authorizations auth
+      WHERE auth.id=$1
+        AND auth.workspace_id=task.workspace_id
+        AND auth.subject_type='task'
+        AND task.id=auth.task_id
         AND task.status='awaiting_approval'`,
     [authorization.id, subjectStatus, errorJson],
   );
@@ -138,11 +138,11 @@ async function expireAuthorization(
     `/* approval-expiry:workflow */
      UPDATE workflow_runs run
         SET status=$2,error=$3,output=$4,completed_at=now(),updated_at=now()
-       FROM action_authorizations authorization
-       LEFT JOIN tasks task ON task.id=authorization.task_id
-      WHERE authorization.id=$1
-        AND run.workspace_id=authorization.workspace_id
-        AND run.id=COALESCE(authorization.workflow_run_id,task.workflow_run_id)
+       FROM action_authorizations auth
+       LEFT JOIN tasks task ON task.id=auth.task_id
+      WHERE auth.id=$1
+        AND run.workspace_id=auth.workspace_id
+        AND run.id=COALESCE(auth.workflow_run_id,task.workflow_run_id)
         AND run.status='awaiting_approval'`,
     [authorization.id, subjectStatus, errorJson, JSON.stringify({ error })],
   );
@@ -150,14 +150,14 @@ async function expireAuthorization(
     `/* approval-expiry:node */
      UPDATE workflow_run_node_states state
         SET status=$2,error=$3,completed_at=now(),updated_at=now()
-       FROM action_authorizations authorization
-      WHERE authorization.id=$1
-        AND authorization.subject_type='workflow_run'
-        AND state.workspace_id=authorization.workspace_id
-        AND state.workflow_run_id=authorization.workflow_run_id
-        AND state.node_id=authorization.node_id
-        AND state.iteration_key=authorization.iteration_key
-        AND state.attempt=authorization.attempt
+       FROM action_authorizations auth
+      WHERE auth.id=$1
+        AND auth.subject_type='workflow_run'
+        AND state.workspace_id=auth.workspace_id
+        AND state.workflow_run_id=auth.workflow_run_id
+        AND state.node_id=auth.node_id
+        AND state.iteration_key=auth.iteration_key
+        AND state.attempt=auth.attempt
         AND state.status='waiting'`,
     [authorization.id, policy === 'auto_reject' ? 'skipped' : 'failed', errorJson],
   );
@@ -165,13 +165,13 @@ async function expireAuthorization(
     `/* approval-expiry:artifacts */
      UPDATE artifacts artifact
         SET status=$2,error_message=$3,updated_at=now()
-       FROM action_authorizations authorization
-       LEFT JOIN tasks task ON task.id=authorization.task_id
-      WHERE authorization.id=$1
+       FROM action_authorizations auth
+       LEFT JOIN tasks task ON task.id=auth.task_id
+      WHERE auth.id=$1
         AND artifact.status='pending'
         AND (
-          artifact.task_id=authorization.task_id
-          OR artifact.workflow_run_id=COALESCE(authorization.workflow_run_id,task.workflow_run_id)
+          artifact.task_id=auth.task_id
+          OR artifact.workflow_run_id=COALESCE(auth.workflow_run_id,task.workflow_run_id)
         )`,
     [authorization.id, artifactStatus, artifactError],
   );
@@ -211,16 +211,16 @@ async function escalateAuthorization(
        INSERT INTO task_events(
          workspace_id,task_id,event_type,message,payload,trace_id,span_id,parent_span_id
        )
-       SELECT authorization.workspace_id,authorization.task_id,$2,
+       SELECT auth.workspace_id,auth.task_id,$2,
               'Action confirmation expired and requires owner or admin attention',$3,
-              COALESCE(authorization.trace_id,task.trace_id),gen_random_uuid(),
-              COALESCE(authorization.span_id,task.span_id)
-         FROM action_authorizations authorization
-         JOIN tasks task ON task.id=authorization.task_id
-        WHERE authorization.id=$1
-          AND authorization.workspace_id=$4
-          AND authorization.status='awaiting_confirmation'
-          AND authorization.escalation_level=1
+              COALESCE(auth.trace_id,task.trace_id),gen_random_uuid(),
+              COALESCE(auth.span_id,task.span_id)
+         FROM action_authorizations auth
+         JOIN tasks task ON task.id=auth.task_id
+        WHERE auth.id=$1
+          AND auth.workspace_id=$4
+          AND auth.status='awaiting_confirmation'
+          AND auth.escalation_level=1
        RETURNING id`,
       [authorization.id, 'action.authorization.escalated', payload, authorization.workspace_id],
     );
@@ -230,16 +230,16 @@ async function escalateAuthorization(
        INSERT INTO workflow_run_events(
          workspace_id,workflow_run_id,node_id,event_type,message,payload,trace_id,span_id,parent_span_id
        )
-       SELECT authorization.workspace_id,authorization.workflow_run_id,authorization.node_id,$2,
+       SELECT auth.workspace_id,auth.workflow_run_id,auth.node_id,$2,
               'Action confirmation expired and requires owner or admin attention',$3,
-              COALESCE(authorization.trace_id,run.trace_id),gen_random_uuid(),
-              COALESCE(authorization.span_id,run.span_id)
-         FROM action_authorizations authorization
-         JOIN workflow_runs run ON run.id=authorization.workflow_run_id
-        WHERE authorization.id=$1
-          AND authorization.workspace_id=$4
-          AND authorization.status='awaiting_confirmation'
-          AND authorization.escalation_level=1
+              COALESCE(auth.trace_id,run.trace_id),gen_random_uuid(),
+              COALESCE(auth.span_id,run.span_id)
+         FROM action_authorizations auth
+         JOIN workflow_runs run ON run.id=auth.workflow_run_id
+        WHERE auth.id=$1
+          AND auth.workspace_id=$4
+          AND auth.status='awaiting_confirmation'
+          AND auth.escalation_level=1
        RETURNING id`,
       [authorization.id, 'action.authorization.escalated', payload, authorization.workspace_id],
     );
@@ -260,18 +260,18 @@ export async function expireDueAuthorizations(
     await client.query('BEGIN');
     const due = await client.query<DueAuthorization>(
       `/* approval-expiry:claim */
-       SELECT authorization.id,authorization.workspace_id,authorization.subject_type,
-              authorization.task_id,authorization.workflow_run_id,authorization.node_id,
-              authorization.iteration_key,authorization.attempt,
-              authorization.on_expiration,authorization.escalation_level,
-              authorization.expires_at,authorization.trace_id,
-              authorization.span_id,authorization.parent_span_id
-         FROM action_authorizations authorization
-        WHERE authorization.status='awaiting_confirmation'
-          AND authorization.expires_at<=now()
-        ORDER BY authorization.expires_at,authorization.id
+       SELECT auth.id,auth.workspace_id,auth.subject_type,
+              auth.task_id,auth.workflow_run_id,auth.node_id,
+              auth.iteration_key,auth.attempt,
+              auth.on_expiration,auth.escalation_level,
+              auth.expires_at,auth.trace_id,
+              auth.span_id,auth.parent_span_id
+         FROM action_authorizations auth
+        WHERE auth.status='awaiting_confirmation'
+          AND auth.expires_at<=now()
+        ORDER BY auth.expires_at,auth.id
         LIMIT $1
-        FOR UPDATE OF authorization SKIP LOCKED`,
+        FOR UPDATE OF auth SKIP LOCKED`,
       [limit],
     );
     for (const authorization of due.rows) {
