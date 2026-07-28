@@ -12,6 +12,7 @@ import {
   claimAgentMemoriesForPrompt,
   retrieveAgentMemories,
   supersedeMemory,
+  updateMemory,
 } from '../src/memories/service.js';
 import { rankMemoryCandidate } from '../src/memories/ranking.js';
 import type { MemoryRecord } from '../src/memories/types.js';
@@ -22,27 +23,17 @@ const agentId = '33333333-3333-4333-8333-333333333333';
 
 const state = vi.hoisted(() => ({
   connect: vi.fn(),
-  query: vi.fn(async (sql?: string, values?: unknown[]) => {
-    if (String(sql).includes('FROM agents')) return { rowCount: 1, rows: [{ id: agentId }] };
-    if (String(sql).includes('INSERT INTO memories')) {
-      return {
-        rowCount: 1,
-        rows: [{
-          id: '44444444-4444-4444-8444-444444444444', workspace_id: values?.[0], agent_id: values?.[1], user_id: values?.[2],
-          kind: values?.[3], content: values?.[4], importance: values?.[5], metadata: values?.[6], memory_type: values?.[7],
-          scope: values?.[8], source_type: values?.[9], source_id: values?.[10], confidence: values?.[11],
-          verification_status: values?.[12], expires_at: values?.[13] ?? null, superseded_by: null, last_accessed_at: null,
-          access_count: 0, created_at: new Date('2026-07-26T00:00:00.000Z'), updated_at: new Date('2026-07-26T00:00:00.000Z'),
-        }],
-      };
-    }
-    return { rowCount: 1, rows: [] };
-  }),
+  embeddingFor: vi.fn(),
+  query: vi.fn(),
 }));
 
 vi.mock('../src/db/client.js', () => ({
   db: { connect: state.connect },
   query: state.query,
+}));
+
+vi.mock('../src/lib/embeddings.js', () => ({
+  embeddingFor: state.embeddingFor,
 }));
 
 function memoryRow(overrides: Record<string, unknown> = {}) {
@@ -81,8 +72,26 @@ async function routeApp() {
 
 describe('governed memories', () => {
   beforeEach(() => {
-    state.query.mockClear();
+    state.query.mockReset();
+    state.query.mockImplementation(async (sql?: string, values?: unknown[]) => {
+      if (String(sql).includes('FROM agents')) return { rowCount: 1, rows: [{ semantic_search: false }] };
+      if (String(sql).includes('INSERT INTO memories')) {
+        return {
+          rowCount: 1,
+          rows: [{
+            id: '44444444-4444-4444-8444-444444444444', workspace_id: values?.[0], agent_id: values?.[1], user_id: values?.[2],
+            kind: values?.[3], content: values?.[4], importance: values?.[5], metadata: values?.[6], memory_type: values?.[7],
+            scope: values?.[8], source_type: values?.[9], source_id: values?.[10], confidence: values?.[11],
+            verification_status: values?.[12], expires_at: values?.[13] ?? null, superseded_by: null, last_accessed_at: null,
+            access_count: 0, created_at: new Date('2026-07-26T00:00:00.000Z'), updated_at: new Date('2026-07-26T00:00:00.000Z'),
+          }],
+        };
+      }
+      return { rowCount: 1, rows: [] };
+    });
     state.connect.mockReset();
+    state.embeddingFor.mockReset();
+    state.embeddingFor.mockResolvedValue(null);
   });
 
   it('accepts an agent-inferred governed payload without requiring legacy kind', async () => {
@@ -166,6 +175,37 @@ describe('governed memories', () => {
       verificationStatus,
       actor: { type: 'user', id: userId },
     })).rejects.toMatchObject({ message: 'TERMINAL_VERIFICATION_STATUS', statusCode: 400 });
+  });
+
+  it('uses authoritative policy-off creation without calling the embedding facility', async () => {
+    await createMemory({
+      workspaceId,
+      agentId,
+      type: 'fact',
+      content: 'Policy-controlled fact',
+      semanticSearch: true,
+      actor: { type: 'user', id: userId },
+    });
+
+    expect(state.embeddingFor).not.toHaveBeenCalled();
+    expect(state.query.mock.calls.some(([sql]) => String(sql).includes('memory_config'))).toBe(true);
+  });
+
+  it('keeps actorless creation unverified and preserves caller provenance metadata', async () => {
+    const memory = await createMemory({
+      workspaceId,
+      type: 'fact',
+      content: 'Imported legacy fact',
+      source: { type: 'import', id: 'legacy-42' },
+      verificationStatus: 'user_confirmed',
+    });
+
+    expect(memory).toMatchObject({
+      sourceType: 'legacy',
+      sourceId: null,
+      verificationStatus: 'unverified',
+      metadata: { provenance: { type: 'import', id: 'legacy-42' } },
+    });
   });
 
   it('guards confirmation and disputes by workspace and authenticated actor', async () => {
@@ -319,6 +359,115 @@ describe('governed memories', () => {
     expect(statements.some((statement) => statement.includes('INSERT INTO memories'))).toBe(false);
   });
 
+  it('embeds an inline supersession replacement when authoritative agent policy enables semantic search', async () => {
+    const replacementId = '66666666-6666-4666-8666-666666666666';
+    const replacementContent = 'Use monthly reports instead';
+    state.embeddingFor.mockResolvedValueOnce([0.25, 0.75]);
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
+        if (sql.startsWith('SELECT') && sql.includes("verification_status <> 'superseded'")) {
+          return { rowCount: 1, rows: [memoryRow()] };
+        }
+        if (sql.includes('FROM agents')) return { rowCount: 1, rows: [{ semantic_search: true }] };
+        if (sql.includes('INSERT INTO memories')) {
+          return {
+            rowCount: 1,
+            rows: [memoryRow({
+              id: replacementId,
+              content: values?.[4],
+              verification_status: values?.[12],
+            })],
+          };
+        }
+        return {
+          rowCount: 1,
+          rows: [memoryRow({ verification_status: 'superseded', superseded_by: replacementId })],
+        };
+      }),
+      release: vi.fn(),
+    };
+    state.connect.mockResolvedValueOnce(client);
+
+    const result = await supersedeMemory({
+      workspaceId,
+      memoryId: memoryRow().id,
+      replacement: {
+        agentId,
+        type: 'fact',
+        content: replacementContent,
+        actor: { type: 'user', id: userId },
+      },
+    });
+
+    expect(result.replacement.id).toBe(replacementId);
+    expect(state.embeddingFor).toHaveBeenCalledWith(replacementContent);
+    const insertCall = client.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO memories'));
+    expect(insertCall?.[1]?.[14]).toBe('[0.25,0.75]');
+  });
+
+  it('refreshes the embedding atomically with edited content when authoritative policy is on', async () => {
+    const editedContent = 'The customer now prefers monthly reports';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{ agent_id: agentId, semantic_search: true }],
+    });
+    state.embeddingFor.mockResolvedValueOnce([0.4, 0.6]);
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ content: editedContent })],
+    });
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, content: editedContent });
+
+    expect(state.embeddingFor).toHaveBeenCalledWith(editedContent);
+    const [sql, values] = state.query.mock.calls[1];
+    expect(sql).toMatch(/content=.*embedding=/);
+    expect(values).toContain('[0.4,0.6]');
+  });
+
+  it('clears an edited memory embedding without calling the facility when authoritative policy is off', async () => {
+    const editedContent = 'Policy-off content edit';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{ agent_id: agentId, semantic_search: false }],
+    });
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ content: editedContent })],
+    });
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, content: editedContent });
+
+    expect(state.embeddingFor).not.toHaveBeenCalled();
+    const [sql, values] = state.query.mock.calls[1];
+    expect(sql).toMatch(/content=.*embedding=/);
+    expect(values).toContain(null);
+  });
+
+  it('clears an edited memory embedding when embedding generation fails', async () => {
+    const editedContent = 'Content whose embedding request fails';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{ agent_id: agentId, semantic_search: true }],
+    });
+    state.embeddingFor.mockRejectedValueOnce(new Error('embedding unavailable'));
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ content: editedContent })],
+    });
+
+    await expect(updateMemory({
+      workspaceId,
+      memoryId: memoryRow().id,
+      content: editedContent,
+    })).resolves.toMatchObject({ content: editedContent });
+
+    const [sql, values] = state.query.mock.calls[1];
+    expect(sql).toMatch(/content=.*embedding=/);
+    expect(values).toContain(null);
+  });
+
   it('uses the documented normalized weights and clamps out-of-range ranking signals', () => {
     const candidate = rankableMemory({
       sourceType: 'user', confidence: 2, importance: -2, createdAt: new Date('2026-07-26T00:00:00.000Z'),
@@ -468,6 +617,49 @@ describe('governed memories', () => {
     expect(sql).toContain('embedding <=>');
     expect(sql).not.toMatch(/,embedding(?:,|\s+FROM)/i);
     expect(values).toContain('[0.1,0.2]');
+  });
+
+  it('blends bounded semantic and lexical pools so an unembedded lexical winner survives 1000 embedded candidates', async () => {
+    const semanticCandidates = Array.from({ length: 1_000 }, (_, index) => memoryRow({
+      id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+      scope: 'workspace',
+      source_type: 'agent',
+      verification_status: 'agent_inferred',
+      content: 'unrelated embedded memory',
+      confidence: 0,
+      importance: 0,
+      semantic_relevance: 0.1,
+    }));
+    const lexicalWinner = memoryRow({
+      id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+      scope: 'workspace',
+      source_type: 'user',
+      verification_status: 'user_confirmed',
+      content: 'weekly reports',
+      confidence: 1,
+      importance: 1,
+      semantic_relevance: null,
+    });
+    state.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('semantic_relevance DESC NULLS LAST')) {
+        return { rowCount: semanticCandidates.length, rows: semanticCandidates };
+      }
+      if (sql.includes('ts_rank')) return { rowCount: 1, rows: [lexicalWinner] };
+      throw new Error(`Unexpected retrieval query: ${sql}`);
+    });
+
+    const results = await retrieveAgentMemories({
+      workspaceId,
+      agentId,
+      userId,
+      query: 'weekly reports',
+      queryEmbedding: [0.1, 0.2],
+      limit: 1,
+    });
+
+    expect(results.map((memory) => memory.id)).toEqual([lexicalWinner.id]);
+    expect(state.query).toHaveBeenCalledTimes(2);
+    for (const [, values] of state.query.mock.calls) expect(values).toContain(1_000);
   });
 
   it('does not let an agent actor forge user source authority', async () => {

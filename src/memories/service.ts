@@ -106,7 +106,11 @@ function resolvedCreate(input: CreateMemoryInput) {
   };
 }
 
-async function insertMemory(input: CreateMemoryInput, executor: Queryable): Promise<MemoryRecord> {
+async function insertMemory(
+  input: CreateMemoryInput,
+  executor: Queryable,
+  embedding: number[] | null,
+): Promise<MemoryRecord> {
   const resolved = resolvedCreate(input);
   const result = await executor.query<MemoryRow>(
     `INSERT INTO memories(
@@ -121,22 +125,42 @@ async function insertMemory(input: CreateMemoryInput, executor: Queryable): Prom
         ...(input.source ? { provenance: { type: input.source.type, id: input.source.id ?? null } } : {}),
       }), resolved.type, resolved.scope,
       resolved.sourceType, resolved.sourceId, input.confidence ?? 0.5, resolved.verificationStatus,
-      input.expiresAt ?? null, input.embedding?.length ? `[${input.embedding.join(',')}]` : null,
+      input.expiresAt ?? null, embedding?.length ? `[${embedding.join(',')}]` : null,
     ],
   );
   return mapMemory(result.rows[0]);
 }
 
-async function ensureAgentInWorkspace(input: CreateMemoryInput, executor: Queryable) {
-  if (!input.agentId) return;
-  const agent = await executor.query('SELECT 1 FROM agents WHERE id=$1 AND workspace_id=$2', [input.agentId, input.workspaceId]);
+async function authoritativeSemanticSearch(
+  workspaceId: string,
+  agentId: string | null | undefined,
+  executor: Queryable,
+): Promise<boolean> {
+  if (!agentId) return false;
+  const agent = await executor.query<{ semantic_search: boolean }>(
+    `SELECT COALESCE((memory_config->>'semanticSearch')::boolean,false) semantic_search
+       FROM agents WHERE id=$1 AND workspace_id=$2`,
+    [agentId, workspaceId],
+  );
   if (!agent.rowCount) throw new MemoryServiceError('AGENT_NOT_FOUND', 404);
+  return agent.rows[0]?.semantic_search === true;
+}
+
+async function policyEmbedding(
+  input: Pick<CreateMemoryInput, 'workspaceId' | 'agentId' | 'content'>,
+  executor: Queryable,
+): Promise<number[] | null> {
+  const enabled = await authoritativeSemanticSearch(input.workspaceId, input.agentId, executor);
+  return enabled ? await embeddingFor(input.content).catch(() => null) : null;
+}
+
+async function createMemoryWithExecutor(input: CreateMemoryInput, executor: Queryable): Promise<MemoryRecord> {
+  const embedding = await policyEmbedding(input, executor);
+  return insertMemory(input, executor, embedding);
 }
 
 export async function createMemory(input: CreateMemoryInput): Promise<MemoryRecord> {
-  await ensureAgentInWorkspace(input, { query });
-  const embedding = input.semanticSearch ? await embeddingFor(input.content).catch(() => null) : null;
-  return insertMemory({ ...input, embedding }, { query });
+  return createMemoryWithExecutor(input, { query });
 }
 
 async function updateLifecycle(
@@ -193,13 +217,28 @@ export async function updateMemory(input: {
   metadata?: Record<string, unknown>;
 }): Promise<MemoryRecord> {
   const entries: Array<[string, unknown]> = [];
-  if (input.content !== undefined) entries.push(['content', input.content]);
+  if (input.content !== undefined) {
+    const target = await query<{ semantic_search: boolean }>(
+      `SELECT COALESCE((a.memory_config->>'semanticSearch')::boolean,false) semantic_search
+         FROM memories m
+         LEFT JOIN agents a ON a.id=m.agent_id AND a.workspace_id=m.workspace_id
+        WHERE m.id=$1 AND m.workspace_id=$2`,
+      [input.memoryId, input.workspaceId],
+    );
+    if (!target.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
+    const embedding = target.rows[0]?.semantic_search === true
+      ? await embeddingFor(input.content).catch(() => null)
+      : null;
+    entries.push(['content', input.content], ['embedding', embedding?.length ? `[${embedding.join(',')}]` : null]);
+  }
   if (input.importance !== undefined) entries.push(['importance', input.importance]);
   if (input.metadata !== undefined) entries.push(['metadata', JSON.stringify(input.metadata)]);
   if (!entries.length) throw new MemoryServiceError('NO_UPDATES', 400);
   const values = entries.map(([, value]) => value);
   const set = entries.map(([field], index) => field === 'metadata'
     ? `metadata=(metadata || ($${index + 1}::jsonb - 'provenance'))`
+    : field === 'embedding'
+      ? `embedding=$${index + 1}::vector`
     : `${field}=$${index + 1}`).join(', ');
   const result = await query<MemoryRow>(
     `UPDATE memories SET ${set},updated_at=now()
@@ -264,8 +303,10 @@ export async function supersedeMemory(input: {
       );
       const previous = previousResult.rows[0];
       if (!previous) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
-      await ensureAgentInWorkspace({ ...input.replacement!, workspaceId: input.workspaceId }, client);
-      replacement = await insertMemory({ ...input.replacement!, workspaceId: input.workspaceId }, client);
+      replacement = await createMemoryWithExecutor(
+        { ...input.replacement!, workspaceId: input.workspaceId },
+        client,
+      );
     }
     const superseded = await client.query<MemoryRow>(
       `UPDATE memories SET verification_status='superseded',superseded_by=$1,updated_at=now()
@@ -344,25 +385,40 @@ export async function retrieveAgentMemories(input: RetrieveAgentMemoriesInput): 
   ];
   if (input.confirmedOnly) conditions.push("verification_status <> 'agent_inferred'");
   const vector = input.queryEmbedding?.length ? `[${input.queryEmbedding.join(',')}]` : null;
-  if (vector) values.push(vector);
-  const similarityColumn = vector
-    ? `,CASE WHEN embedding IS NULL THEN NULL ELSE 1-(embedding <=> $${values.length}::vector) END semantic_relevance`
-    : ',NULL::real semantic_relevance';
-  const lexicalParam = vector ? null : input.query;
-  if (lexicalParam !== null) values.push(lexicalParam);
   const candidateLimit = 1_000;
-  values.push(candidateLimit);
-  const relevanceOrder = vector
-    ? `semantic_relevance DESC NULLS LAST`
-    : `ts_rank(to_tsvector('simple',content),websearch_to_tsquery('simple',$${values.length - 1})) DESC`;
-  const result = await query<MemoryRow & { semantic_relevance: number | null }>(
+  const vectorIndex = values.length + 1;
+  const similarityColumn = vector
+    ? `,CASE WHEN embedding IS NULL THEN NULL ELSE 1-(embedding <=> $${vectorIndex}::vector) END semantic_relevance`
+    : ',NULL::real semantic_relevance';
+  const lexicalValues = vector
+    ? [...values, vector, input.query, candidateLimit]
+    : [...values, input.query, candidateLimit];
+  const lexicalQueryIndex = lexicalValues.length - 1;
+  const lexicalCandidates = query<MemoryRow & { semantic_relevance: number | null }>(
     `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}
-      ORDER BY ${relevanceOrder},
+      ORDER BY ts_rank(to_tsvector('simple',content),websearch_to_tsquery('simple',$${lexicalQueryIndex})) DESC,
         CASE source_type WHEN 'user' THEN 1 WHEN 'system' THEN .8 WHEN 'agent' THEN .6 ELSE .4 END DESC,
-        confidence DESC,importance DESC,created_at DESC,id ASC LIMIT $${values.length}`,
-    values,
+        confidence DESC,importance DESC,created_at DESC,id ASC LIMIT $${lexicalValues.length}`,
+    lexicalValues,
   );
-  const rows = result.rows;
+  const semanticCandidates = vector
+    ? query<MemoryRow & { semantic_relevance: number | null }>(
+      `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}
+        ORDER BY semantic_relevance DESC NULLS LAST,
+          CASE source_type WHEN 'user' THEN 1 WHEN 'system' THEN .8 WHEN 'agent' THEN .6 ELSE .4 END DESC,
+          confidence DESC,importance DESC,created_at DESC,id ASC LIMIT $${values.length + 2}`,
+      [...values, vector, candidateLimit],
+    )
+    : null;
+  const [lexicalResult, semanticResult] = await Promise.all([
+    lexicalCandidates,
+    semanticCandidates ?? Promise.resolve(null),
+  ]);
+  const rowsById = new Map<string, MemoryRow & { semantic_relevance: number | null }>();
+  for (const row of [...(semanticResult?.rows ?? []), ...lexicalResult.rows]) {
+    if (!rowsById.has(row.id)) rowsById.set(row.id, row);
+  }
+  const rows = [...rowsById.values()];
   const rankingContext = { ...input, now };
   const selected = rows
     .map((row) => ({ memory: mapMemory(row), semanticRelevance: row.semantic_relevance }))

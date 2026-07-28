@@ -1,7 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { asyncRoute, parse } from '../lib/http.js';
-import { query } from '../db/client.js';
 import {
   confirmMemory,
   createMemory,
@@ -49,14 +48,6 @@ const supersedeInput = z.object({
 }).refine((value) => Boolean(value.replacementMemoryId || value.replacement), { message: 'replacementMemoryId or replacement is required' });
 
 export async function memoryRoutes(app: FastifyInstance) {
-  const semanticSearchForAgent = async (workspaceId: string, agentId?: string | null) => {
-    if (!agentId) return false;
-    const result = await query<{ semantic_search: boolean }>(
-      "SELECT COALESCE((memory_config->>'semanticSearch')::boolean,false) semantic_search FROM agents WHERE id=$1 AND workspace_id=$2",
-      [agentId, workspaceId],
-    );
-    return result.rows[0]?.semantic_search === true;
-  };
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const filters = parse(listQuery, request.query, reply); if (!filters) return;
     const memories = await listEligibleMemories({ workspaceId: request.user.workspaceId, ...filters });
@@ -65,7 +56,7 @@ export async function memoryRoutes(app: FastifyInstance) {
 
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(createInput, request.body, reply); if (!input) return;
-    const memory = await createMemory({ ...input, workspaceId: request.user.workspaceId, userId: request.user.sub, semanticSearch: await semanticSearchForAgent(request.user.workspaceId, input.agentId), actor: { type: 'user', id: request.user.sub } });
+    const memory = await createMemory({ ...input, workspaceId: request.user.workspaceId, userId: request.user.sub, actor: { type: 'user', id: request.user.sub } });
     return reply.code(201).send(serializeMemory(memory));
   }));
 
@@ -91,7 +82,7 @@ export async function memoryRoutes(app: FastifyInstance) {
       workspaceId: request.user.workspaceId,
       memoryId: params.id,
       replacementMemoryId: input.replacementMemoryId,
-      replacement: input.replacement && { ...input.replacement, userId: request.user.sub, semanticSearch: await semanticSearchForAgent(request.user.workspaceId, input.replacement.agentId), actor: { type: 'user', id: request.user.sub } },
+      replacement: input.replacement && { ...input.replacement, userId: request.user.sub, actor: { type: 'user', id: request.user.sub } },
     });
     return { memory: serializeMemory(result.memory), replacement: serializeMemory(result.replacement) };
   }));
