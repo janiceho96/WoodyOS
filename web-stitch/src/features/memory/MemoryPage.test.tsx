@@ -44,12 +44,13 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-it('labels filters and clearly marks a disputed memory as unavailable for retrieval', async () => {
+it('labels filters, scopes active-memory retrieval claims, and clearly marks disputed memory unavailable', async () => {
   renderPage();
 
   expect(screen.getByRole('heading', { name: 'Memory management' })).toBeTruthy();
   expect(screen.getByRole('combobox', { name: 'Lifecycle status' })).toBeTruthy();
   expect(screen.getByRole('combobox', { name: 'Expiry' })).toBeTruthy();
+  expect(screen.getByText(/Active memories are considered only when scope and the requesting agent's confirmed-memory setting allow it/i)).toBeTruthy();
   expect(await screen.findByText('A disputed preference')).toBeTruthy();
   expect(screen.getByText('Not eligible for retrieval')).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Delete memory' })).toBeTruthy();

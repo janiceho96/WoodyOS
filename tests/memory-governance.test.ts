@@ -616,7 +616,7 @@ describe('governed memories', () => {
     const editedContent = 'The customer now prefers monthly reports';
     state.query.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ agent_id: agentId, semantic_search: true }],
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: true })],
     });
     state.embeddingFor.mockResolvedValueOnce([0.4, 0.6]);
     state.query.mockResolvedValueOnce({
@@ -626,7 +626,7 @@ describe('governed memories', () => {
 
     await updateMemory({ workspaceId, memoryId: memoryRow().id, content: editedContent });
 
-    expect(state.embeddingFor).toHaveBeenCalledWith(editedContent);
+    expect(state.embeddingFor).toHaveBeenCalledWith(editedContent, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     const [sql, values] = state.query.mock.calls[1];
     expect(sql).toMatch(/content=.*embedding=/);
     expect(values).toContain('[0.4,0.6]');
@@ -636,7 +636,7 @@ describe('governed memories', () => {
     const editedContent = 'Policy-off content edit';
     state.query.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ agent_id: agentId, semantic_search: false }],
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: false })],
     });
     state.query.mockResolvedValueOnce({
       rowCount: 1,
@@ -655,7 +655,7 @@ describe('governed memories', () => {
     const editedContent = 'Content whose embedding request fails';
     state.query.mockResolvedValueOnce({
       rowCount: 1,
-      rows: [{ agent_id: agentId, semantic_search: true }],
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: true })],
     });
     state.embeddingFor.mockRejectedValueOnce(new Error('embedding unavailable'));
     state.query.mockResolvedValueOnce({
@@ -672,6 +672,117 @@ describe('governed memories', () => {
     const [sql, values] = state.query.mock.calls[1];
     expect(sql).toMatch(/content=.*embedding=/);
     expect(values).toContain(null);
+  });
+
+  it.each([
+    ['workspace', null, null],
+    ['user', null, userId],
+  ] as const)('clears an embedding when moving an agent memory to %s scope without changing content', async (scope, nextAgentId, nextUserId) => {
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, user_id: null, semantic_search: true })],
+    });
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope, agent_id: nextAgentId, user_id: nextUserId })],
+    });
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, scope, agentId: nextAgentId, actorId: userId });
+
+    const [sql, values] = state.query.mock.calls.at(-1)!;
+    expect(sql).toMatch(/embedding=/);
+    expect(values).toContain(null);
+  });
+
+  it('clears an embedding when the target agent policy disables semantic memory without changing content', async () => {
+    const disabledAgentId = '99999999-9999-4999-8999-999999999999';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: true })],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ semantic_search: false }] });
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: disabledAgentId })],
+    });
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, scope: 'agent', agentId: disabledAgentId });
+
+    const [sql, values] = state.query.mock.calls.at(-1)!;
+    expect(sql).toMatch(/embedding=/);
+    expect(values).toContain(null);
+  });
+
+  it('retains a valid embedding when moving an unchanged memory from a disabled agent to an enabled agent', async () => {
+    const enabledAgentId = '88888888-8888-4888-8888-888888888888';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: false })],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ semantic_search: true }] });
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: enabledAgentId })],
+    });
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, scope: 'agent', agentId: enabledAgentId });
+
+    const [sql, values] = state.query.mock.calls.at(-1)!;
+    expect(sql).not.toMatch(/embedding=/);
+    expect(values).toContain(true);
+  });
+
+  it('regenerates an embedding when moving changed content from a disabled agent to an enabled agent', async () => {
+    const enabledAgentId = '88888888-8888-4888-8888-888888888888';
+    const changedContent = 'A changed fact for the enabled target agent';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: false })],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ semantic_search: true }] });
+    state.embeddingFor.mockResolvedValueOnce([0.2, 0.8]);
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: enabledAgentId, content: changedContent })],
+    });
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, scope: 'agent', agentId: enabledAgentId, content: changedContent });
+
+    expect(state.embeddingFor).toHaveBeenCalledWith(changedContent, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    const [sql, values] = state.query.mock.calls.at(-1)!;
+    expect(sql).toMatch(/content=.*embedding=/);
+    expect(values).toContain('[0.2,0.8]');
+  });
+
+  it('prefetches changed content with an abortable request before its optimistic CAS update', async () => {
+    const changedContent = 'Content updated under the current semantic policy';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: true })],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [memoryRow({ content: changedContent })] });
+    state.embeddingFor.mockResolvedValueOnce([0.4, 0.6]);
+
+    await updateMemory({ workspaceId, memoryId: memoryRow().id, content: changedContent });
+
+    expect(state.embeddingFor).toHaveBeenCalledWith(changedContent, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(state.connect).not.toHaveBeenCalled();
+    expect(state.query.mock.calls[1][0]).toContain('updated_at::text=$');
+  });
+
+  it('rejects a policy change after embedding preflight instead of writing stale scope data', async () => {
+    const changedContent = 'Content whose target policy changes concurrently';
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, semantic_search: true, updated_at: new Date('2026-07-26T00:00:00.000Z') })],
+    });
+    state.embeddingFor.mockResolvedValueOnce([0.4, 0.6]);
+    state.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await expect(updateMemory({ workspaceId, memoryId: memoryRow().id, content: changedContent }))
+      .rejects.toMatchObject({ message: 'MEMORY_UPDATE_CONFLICT', statusCode: 409 });
+    expect(state.query.mock.calls[1][0]).toContain('updated_at::text=$');
+    expect(state.query.mock.calls[1][0]).toContain('target_agent.memory_config');
   });
 
   it('uses the documented normalized weights and clamps out-of-range ranking signals', () => {
