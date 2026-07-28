@@ -502,6 +502,18 @@ export type WorkflowRun = {
   artifacts?: Artifact[];
   usage?: { agentTasks: number; inputTokens: number; outputTokens: number; estimatedCostUsd: number };
 };
+export type WorkflowDryRun = {
+  valid: boolean;
+  executionPath: string[];
+  externalActions: Array<{ nodeId: string; adapter: string; resourceId: string; risk: string; requiresConfirmation: boolean }>;
+  requiredApprovals: Array<{ nodeId: string; reason: string; prompt?: string }>;
+  missingResources: Array<{ nodeId: string; resourceId: string; kind: string }>;
+  pinnedAgents: Array<{ nodeId: string; agentId: string; versionId: string; version: number }>;
+  estimatedBudgets: { agentCalls: number; maxLoopIterations: number; externalActions: number };
+  errors: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
+  warnings: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
+  manifest: { definitionHash: string; inputHash: string; previewHash: string };
+};
 export type WorkflowNodeCatalogEntry = {
   type: WorkflowNode['type'];
   category: 'trigger' | 'ai' | 'integration' | 'knowledge' | 'logic' | 'human' | 'output';
@@ -1075,6 +1087,8 @@ export const api = {
     request<WorkflowRun>(`/v1/workflows/${id}/test-runs`, { method: 'POST', body: JSON.stringify({ input }) }),
   testWorkflowNode: (id: string, nodeId: string, input: Record<string, unknown> = {}) =>
     request<WorkflowRun>(`/v1/workflows/${id}/nodes/${encodeURIComponent(nodeId)}/test-runs`, { method: 'POST', body: JSON.stringify({ input }) }),
+  dryRunWorkflow: (id: string, input: Record<string, unknown> = {}) =>
+    request<WorkflowDryRun>(`/v1/workflows/${id}/dry-run`, { method: 'POST', body: JSON.stringify({ input }) }),
   publishWorkflow: (id: string) =>
     request<Workflow>(`/v1/workflows/${id}/publish`, { method: 'POST' }),
   workflowRun: (id: string) => request<WorkflowRun>(`/v1/workflows/runs/${id}`),

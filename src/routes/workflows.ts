@@ -23,6 +23,7 @@ import {
   serializeRuntimeError,
 } from '../runtime/errors.js';
 import { requestCancellation } from '../runtime/cancellation.js';
+import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -38,6 +39,39 @@ type WorkflowRecord = {
   draft_revision: number;
   published_version_id: string | null;
 };
+
+async function dryRunResources(workspaceId: string, definition: WorkflowDefinition): Promise<DryRunResources> {
+  const agentIds = [...new Set(definition.nodes.filter((node) => ['agent', 'mcp_action'].includes(node.type)).map((node) => node.config.agentId).filter((id): id is string => typeof id === 'string'))];
+  const toolIds = [...new Set(definition.nodes.filter((node) => ['action', 'api_action'].includes(node.type)).map((node) => node.config.toolId).filter((id): id is string => typeof id === 'string'))];
+  const mcpIds = [...new Set(definition.nodes.filter((node) => node.type === 'mcp_action').map((node) => node.config.mcpToolId).filter((id): id is string => typeof id === 'string'))];
+  const [agents, tools, mcpTools] = await Promise.all([
+    agentIds.length ? query<{ id: string; version_id: string | null; version: number | null }>(
+      `SELECT a.id,v.id version_id,v.version FROM agents a
+       LEFT JOIN agent_versions v ON v.id=a.published_version_id AND v.workspace_id=a.workspace_id
+       WHERE a.workspace_id=$1 AND a.status='active' AND a.id=ANY($2::uuid[])`, [workspaceId, agentIds]) : Promise.resolve({ rows: [] }),
+    toolIds.length ? query<{ id: string; kind: string; permissions: string[] }>(
+      "SELECT id,kind,permissions FROM tools WHERE workspace_id=$1 AND enabled=true AND kind <> 'mcp' AND id=ANY($2::uuid[])", [workspaceId, toolIds]) : Promise.resolve({ rows: [] }),
+    mcpIds.length ? query<{ id: string; connection_id: string; risk_level: string; agent_id: string }>(
+      `SELECT t.id,t.connection_id,t.risk_level,access.agent_id FROM mcp_connection_tools t
+       JOIN mcp_connections c ON c.id=t.connection_id
+       JOIN mcp_agent_access access ON access.connection_id=c.id AND access.enabled=true
+       JOIN mcp_agent_tool_access tool_access ON tool_access.mcp_tool_id=t.id AND tool_access.agent_id=access.agent_id AND tool_access.enabled=true
+       JOIN agents a ON a.id=access.agent_id AND a.workspace_id=c.workspace_id AND a.status='active'
+       WHERE c.workspace_id=$1 AND c.deleted_at IS NULL AND c.enabled=true AND c.health_status='healthy'
+         AND t.enabled=true AND t.id=ANY($2::uuid[])`, [workspaceId, mcpIds]) : Promise.resolve({ rows: [] }),
+  ]);
+  const mcpById = new Map<string, { id: string; kind: string; risk: string; permissions: string[]; connectionId: string; agentIds: string[] }>();
+  for (const row of mcpTools.rows) {
+    const current = mcpById.get(row.id);
+    if (current) current.agentIds.push(row.agent_id);
+    else mcpById.set(row.id, { id: row.id, kind: 'mcp', risk: row.risk_level, permissions: [], connectionId: row.connection_id, agentIds: [row.agent_id] });
+  }
+  return {
+    agents: new Map(agents.rows.map((row) => [row.id, { id: row.id, versionId: row.version_id, version: row.version }])),
+    tools: new Map(tools.rows.map((row) => [row.id, { id: row.id, kind: row.kind, risk: 'unknown', permissions: row.permissions ?? [] }])),
+    mcpTools: mcpById,
+  };
+}
 
 function publicWorkflowError(value: unknown) {
   return value == null ? null : serializeRuntimeError(value);
@@ -350,6 +384,17 @@ export async function workflowRoutes(app: FastifyInstance) {
     if (!result.rowCount) return reply.code(404).send({ error: 'WORKFLOW_NOT_FOUND' });
     await audit(request.user.workspaceId, request.user.sub, 'workflow.deleted', 'workflow', result.rows[0].id);
     return reply.code(204).send();
+  }));
+  app.post('/:id/dry-run', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const input = parse(runInputSchema, request.body, reply); if (!input) return;
+    const workflow = await query<WorkflowRecord>(
+      "SELECT * FROM workflows WHERE id=$1 AND workspace_id=$2 AND status <> 'archived'",
+      [(request.params as { id: string }).id, request.user.workspaceId],
+    );
+    if (!workflow.rowCount) return reply.code(404).send({ error: 'WORKFLOW_NOT_FOUND' });
+    // This endpoint intentionally only performs tenant-scoped SELECTs. It creates no run,
+    // audit event, artifact, queue item, worker task, or persisted execution manifest.
+    return dryRunWorkflow({ workspaceId: request.user.workspaceId, definition: workflow.rows[0].definition, input: input.input ?? {}, resources: await dryRunResources(request.user.workspaceId, workflow.rows[0].definition) });
   }));
   app.post('/:id/test-runs', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(runInputSchema, request.body, reply); if (!input) return;
