@@ -185,6 +185,19 @@ function externalFixtureInput(node: WorkflowNode, state: Record<string, unknown>
   return resolveWorkflowTemplates(configured ?? fallback, state);
 }
 
+function knowledgeFixtureOutput(fixture: unknown, input: unknown, nodeId: string, fixtureKey: string) {
+  const record = asRecord(fixture);
+  const allowedKeys = new Set(['expectedInput', 'results']);
+  if (!record || !Array.isArray(record.results) || Object.keys(record).some((key) => !allowedKeys.has(key))) {
+    throw evaluationError('EVALUATION_KNOWLEDGE_FIXTURE_INVALID', `Fixture ${fixtureKey} must contain knowledge results`, { nodeId, fixtureKey });
+  }
+  const request = asRecord(input);
+  if (!request || typeof request.query !== 'string' || typeof request.limit !== 'number') {
+    throw evaluationError('EVALUATION_KNOWLEDGE_FIXTURE_INVALID', `Knowledge input for ${nodeId} is invalid`, { nodeId, fixtureKey });
+  }
+  return { query: request.query, count: record.results.length, results: record.results };
+}
+
 function approvalDecision(fixture: unknown, nodeId: string) {
   const key = evaluationFixtureKey('approval', nodeId, 'decision');
   const record = asRecord(fixture);
@@ -272,7 +285,9 @@ export async function runFixtureEvaluation(input: FixtureEvaluationInput): Promi
       if (fixtureRecord && Object.hasOwn(fixtureRecord, 'expectedInput') && !jsonEquals(fixtureRecord.expectedInput, resolvedInput)) {
         throw evaluationError('EVALUATION_FIXTURE_INPUT_MISMATCH', `Fixture ${identity.key} does not match resolved node input`, { nodeId: current.id, fixtureKey: identity.key });
       }
-      nodeOutput = fixtureRecord && Object.hasOwn(fixtureRecord, 'output') ? fixtureRecord.output : fixture;
+      nodeOutput = current.type === 'knowledge_search'
+        ? knowledgeFixtureOutput(fixture, resolvedInput, current.id, identity.key)
+        : fixtureRecord && Object.hasOwn(fixtureRecord, 'output') ? fixtureRecord.output : fixture;
       result = nodeOutput;
     } else if (current.type === 'agent') {
       if (!input.executeModel) throw evaluationError('EVALUATION_MODEL_EXECUTOR_REQUIRED', `Evaluation needs a pinned model executor for agent node ${current.id}`, { nodeId: current.id });
@@ -308,8 +323,10 @@ export async function runFixtureEvaluation(input: FixtureEvaluationInput): Promi
       return { status: assertionResults.every((result) => result.passed) ? 'passed' : 'failed', output, assertionResults, measurements };
     } else throw evaluationError('EVALUATION_NODE_UNSUPPORTED', `Evaluation does not support node type ${current.type}`, { nodeId: current.id, type: current.type });
 
-    state[current.id] = nodeOutput;
-    (state.nodes as Record<string, unknown>)[current.id] = nodeOutput;
+    if (current.type !== 'trigger') {
+      state[current.id] = nodeOutput;
+      (state.nodes as Record<string, unknown>)[current.id] = nodeOutput;
+    }
     const advanced = advanceWorkflowCursor(input.definition, cursor, current, result);
     if (!advanced) throw evaluationError('EVALUATION_PATH_INVALID', `Node ${current.id} did not resolve an outgoing edge`, { nodeId: current.id });
     cursor = advanced.cursor;

@@ -295,7 +295,7 @@ describe('workflow regression evaluation', () => {
           { id: 'root_check', type: 'condition' as const, config: { path: 'approved', operator: 'equals', value: true } },
           { id: 'node_check', type: 'condition' as const, config: { path: 'nodes.root_check', operator: 'equals', value: true } },
           { id: 'call', type: 'api_action' as const, config: { toolId } },
-          { id: 'finish', type: 'output' as const, config: { fromNodeId: 'start' } },
+          { id: 'finish', type: 'output' as const, config: { fromNodeId: 'call' } },
           { id: 'rejected', type: 'output' as const, config: {} },
         ],
         edges: [
@@ -307,10 +307,18 @@ describe('workflow regression evaluation', () => {
       },
       input: runtimeInput,
       manifest: evaluationManifest,
-      fixtures: { [evaluationFixtureKey('api', toolId, 'invoke')]: { expectedInput: { ...runtimeInput, input: runtimeInput, start: runtimeInput, root_check: true, node_check: true, nodes: { start: runtimeInput, root_check: true, node_check: true }, variables: {}, __runtime: { agentExecutionIdentitySchemaVersion: 1 } }, output: { ok: true } } },
+      fixtures: { [evaluationFixtureKey('api', toolId, 'invoke')]: { expectedInput: { ...runtimeInput, input: runtimeInput, root_check: true, node_check: true, nodes: { root_check: true, node_check: true }, variables: {}, __runtime: { agentExecutionIdentitySchemaVersion: 1 } }, output: { ok: true } } },
       assertions: [],
     });
-    expect(result.output).toEqual(runtimeInput);
+    expect(result.output).toEqual({ ok: true });
+  });
+
+  it('does not expose trigger output for downstream output bindings', async () => {
+    // Break caught: evaluation making trigger data addressable even though the production runtime never persists trigger output.
+    await expect(runFixtureEvaluation({
+      definition: { nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'start' } }], edges: [{ source: 'start', target: 'finish' }] },
+      input: { city: 'Kuala Lumpur' }, manifest: evaluationManifest, fixtures: {}, assertions: [],
+    })).rejects.toMatchObject({ code: 'EVALUATION_OUTPUT_UNAVAILABLE' });
   });
 
   it('preserves literal output configuration exactly like the production file adapter', async () => {
@@ -337,10 +345,31 @@ describe('workflow regression evaluation', () => {
         nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'knowledge', type: 'knowledge_search' as const, config: { documentId: 'doc-1', query: 'fixtures' } }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'knowledge' } }],
         edges: [{ source: 'start', target: 'knowledge' }, { source: 'knowledge', target: 'finish' }],
       },
-      input: {}, fixtures: { [evaluationFixtureKey('file', 'doc-1', 'read')]: { matches: [] } }, assertions: [],
+      input: {}, fixtures: { [evaluationFixtureKey('file', 'doc-1', 'read')]: { results: [] } }, assertions: [],
       manifest: evaluationManifest,
     });
-    expect(result.output).toEqual({ matches: [] });
+    expect(result.output).toEqual({ query: 'fixtures', count: 0, results: [] });
+  });
+
+  it('normalizes fixture-backed knowledge results to the production output shape', async () => {
+    // Break caught: downstream paths seeing a fixture-specific payload rather than the knowledge adapter result.
+    const result = await runFixtureEvaluation({
+      definition: {
+        nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'knowledge', type: 'knowledge_search' as const, config: { documentId: 'doc-1', query: '{{ input.topic }}', limit: 3 } }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'knowledge' } }],
+        edges: [{ source: 'start', target: 'knowledge' }, { source: 'knowledge', target: 'finish' }],
+      },
+      input: { topic: 'runtime parity' }, manifest: evaluationManifest,
+      fixtures: { [evaluationFixtureKey('file', 'doc-1', 'read')]: { expectedInput: { query: 'runtime parity', limit: 3 }, results: [{ id: 'one' }, { id: 'two' }] } }, assertions: [{ kind: 'output.json_path', path: 'count', operator: 'equals', expected: 2 }],
+    });
+    expect(result.output).toEqual({ query: 'runtime parity', count: 2, results: [{ id: 'one' }, { id: 'two' }] });
+  });
+
+  it('fails closed for malformed knowledge fixtures', async () => {
+    // Break caught: treating arbitrary fixture objects as results returned by workspace knowledge.
+    await expect(runFixtureEvaluation({
+      definition: { nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'knowledge', type: 'knowledge_search' as const, config: { documentId: 'doc-1', query: 'fixtures' } }, { id: 'finish', type: 'output' as const, config: {} }], edges: [{ source: 'start', target: 'knowledge' }, { source: 'knowledge', target: 'finish' }] },
+      input: {}, manifest: evaluationManifest, fixtures: { [evaluationFixtureKey('file', 'doc-1', 'read')]: { results: 'not-an-array' } }, assertions: [],
+    })).rejects.toMatchObject({ code: 'EVALUATION_KNOWLEDGE_FIXTURE_INVALID' });
   });
 
   it('executes bounded fixture-backed loop bodies without reaching a live adapter', async () => {
