@@ -85,8 +85,9 @@ function resolvedCreate(input: CreateMemoryInput) {
   const kind = input.kind ?? legacyKindForType[input.type ?? 'hypothesis'];
   const defaults = kindDefaults[kind];
   const type = input.type ?? defaults.type;
-  const verificationStatus = input.verificationStatus
-    ?? (input.actor?.type === 'user' && kind === 'user' ? 'user_confirmed' : defaults.verificationStatus);
+  const verificationStatus = input.actor
+    ? input.verificationStatus ?? (input.actor.type === 'user' && kind === 'user' ? 'user_confirmed' : defaults.verificationStatus)
+    : 'unverified';
   if (verificationStatus === 'disputed' || verificationStatus === 'superseded') {
     throw new MemoryServiceError('TERMINAL_VERIFICATION_STATUS', 400);
   }
@@ -100,7 +101,7 @@ function resolvedCreate(input: CreateMemoryInput) {
     verificationStatus,
     // The actor is authenticated at the route/worker boundary; caller-supplied
     // source labels are provenance detail, not an authority claim.
-    sourceType: input.actor?.type ?? 'system',
+    sourceType: input.actor?.type ?? 'legacy',
     sourceId: input.actor?.id ?? null,
   };
 }
@@ -197,7 +198,9 @@ export async function updateMemory(input: {
   if (input.metadata !== undefined) entries.push(['metadata', JSON.stringify(input.metadata)]);
   if (!entries.length) throw new MemoryServiceError('NO_UPDATES', 400);
   const values = entries.map(([, value]) => value);
-  const set = entries.map(([field], index) => `${field}=$${index + 1}`).join(', ');
+  const set = entries.map(([field], index) => field === 'metadata'
+    ? `metadata=(metadata || ($${index + 1}::jsonb - 'provenance'))`
+    : `${field}=$${index + 1}`).join(', ');
   const result = await query<MemoryRow>(
     `UPDATE memories SET ${set},updated_at=now()
       WHERE id=$${values.length + 1} AND workspace_id=$${values.length + 2}
@@ -345,22 +348,21 @@ export async function retrieveAgentMemories(input: RetrieveAgentMemoriesInput): 
   const similarityColumn = vector
     ? `,CASE WHEN embedding IS NULL THEN NULL ELSE 1-(embedding <=> $${values.length}::vector) END semantic_relevance`
     : ',NULL::real semantic_relevance';
-  const rows: Array<MemoryRow & { semantic_relevance: number | null }> = [];
-  const pageSize = 100;
-  const maxCandidates = 1_000;
-  let lastId: string | null = null;
-  while (rows.length < maxCandidates) {
-    const pageValues: unknown[] = lastId ? [...values, lastId, pageSize] : [...values, pageSize];
-    const keyset: string = lastId ? ` AND id > $${pageValues.length - 1}` : '';
-    const result: QueryResult<MemoryRow & { semantic_relevance: number | null }> = await query<MemoryRow & { semantic_relevance: number | null }>(
-      `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}${keyset}
-        ORDER BY id ASC LIMIT $${pageValues.length}`,
-      pageValues,
-    );
-    rows.push(...result.rows);
-    if (result.rows.length < pageSize) break;
-    lastId = result.rows[result.rows.length - 1].id;
-  }
+  const lexicalParam = vector ? null : input.query;
+  if (lexicalParam !== null) values.push(lexicalParam);
+  const candidateLimit = 1_000;
+  values.push(candidateLimit);
+  const relevanceOrder = vector
+    ? `semantic_relevance DESC NULLS LAST`
+    : `ts_rank(to_tsvector('simple',content),websearch_to_tsquery('simple',$${values.length - 1})) DESC`;
+  const result = await query<MemoryRow & { semantic_relevance: number | null }>(
+    `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}
+      ORDER BY ${relevanceOrder},
+        CASE source_type WHEN 'user' THEN 1 WHEN 'system' THEN .8 WHEN 'agent' THEN .6 ELSE .4 END DESC,
+        confidence DESC,importance DESC,created_at DESC,id ASC LIMIT $${values.length}`,
+    values,
+  );
+  const rows = result.rows;
   const rankingContext = { ...input, now };
   const selected = rows
     .map((row) => ({ memory: mapMemory(row), semanticRelevance: row.semantic_relevance }))

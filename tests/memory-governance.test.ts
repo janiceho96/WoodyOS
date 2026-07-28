@@ -451,14 +451,13 @@ describe('governed memories', () => {
       verification_status: 'user_confirmed', content: 'weekly reports', importance: 1, confidence: 1,
       created_at: new Date('2026-04-26T00:00:00.000Z'),
     });
-    state.query.mockResolvedValueOnce({ rowCount: 100, rows: firstPage });
-    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [olderWinner] });
+    state.query.mockResolvedValueOnce({ rowCount: 101, rows: [...firstPage, olderWinner] });
 
     const results = await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'weekly reports', limit: 1 });
 
     expect(results.map((item) => item.id)).toEqual([olderWinner.id]);
-    expect(state.query).toHaveBeenCalledTimes(2);
-    expect(state.query.mock.calls[1][0]).toContain('id >');
+    expect(state.query).toHaveBeenCalledTimes(1);
+    expect(state.query.mock.calls[0][0]).toContain('ts_rank');
   });
 
   it('uses a database scalar similarity when a query embedding is supplied without selecting vectors', async () => {
