@@ -520,6 +520,9 @@ kbd { padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; bac
 .run-card-result>small { color:var(--subtle); }
 .run-card-result>b { display:inline-flex;align-items:center;gap:5px;color:var(--primary);font-size:var(--text-label);font-weight:var(--weight-semibold);white-space:nowrap; }
 
+/* Governed memory management remains a secondary Knowledge surface. */
+.memory-page{display:grid;gap:14px}.memory-filter-panel{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;padding:14px}.memory-filter-panel label,.memory-page .form-grid>label{display:grid;gap:6px;color:var(--muted);font-size:var(--text-caption)}.memory-list{display:grid;gap:10px}.memory-card{display:grid;gap:12px;padding:16px}.memory-card-head{display:flex;justify-content:space-between;gap:14px}.memory-card-head p{margin:5px 0 0;white-space:pre-wrap}.memory-statuses{display:flex;align-items:flex-start;justify-content:flex-end;gap:5px;flex-wrap:wrap}.memory-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0}.memory-facts div{min-width:0;padding-top:8px;border-top:1px solid var(--border)}.memory-facts dt{color:var(--subtle);font-size:var(--text-caption)}.memory-facts dd{margin:3px 0 0;overflow-wrap:anywhere;color:var(--text);font-size:var(--text-caption)}.memory-actions{display:flex;gap:6px;flex-wrap:wrap}.memory-eligibility{display:flex;align-items:center;gap:6px;margin:0;color:var(--amber);font-size:var(--text-caption)}.memory-loading{display:flex;align-items:center;justify-content:center;gap:8px;min-height:120px;color:var(--muted)}.memory-pagination{display:flex;align-items:center;justify-content:space-between;gap:10px;color:var(--muted);font-size:var(--text-caption)}.memory-pagination>div{display:flex;gap:6px}
+
 .knowledge-overview { grid-template-columns:minmax(170px,.55fr) minmax(170px,.55fr) minmax(300px,1.1fr); }
 .knowledge-overview article { min-height:88px;padding:14px 16px; }
 .knowledge-overview small { font-weight:var(--weight-medium); }
@@ -563,4 +566,5 @@ kbd { padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; bac
   .knowledge-overview .knowledge-scope a { grid-column:1;grid-row:auto;margin-top:5px; }
   .analytics-quota-meter.no-limit { grid-template-columns:1fr; }
   .analytics-quota-meter.no-limit>em { grid-column:1;text-align:left; }
+  .memory-filter-panel,.memory-facts{grid-template-columns:1fr}.memory-card-head{flex-direction:column}.memory-statuses{justify-content:flex-start}
 }

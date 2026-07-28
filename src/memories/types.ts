@@ -76,3 +76,20 @@ export type MemoryListFilters = {
   limit?: number;
   now?: Date;
 };
+
+export type MemoryManagementFilters = {
+  workspaceId: string;
+  agentId?: string;
+  type?: MemoryType;
+  scope?: MemoryScope;
+  verificationStatus?: VerificationStatus;
+  expiry?: 'active' | 'expired' | 'any';
+  limit?: number;
+  offset?: number;
+  now?: Date;
+};
+
+export type ManagedMemoryList = {
+  memories: MemoryRecord[];
+  pagination: { limit: number; offset: number; nextOffset: number | null };
+};

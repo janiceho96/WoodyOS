@@ -21,6 +21,7 @@ const SettingsPage = lazy(() => import('./features/settings/SettingsPage').then(
 const WorkflowsPage = lazy(() => import('./features/workflows/WorkflowsPage').then((module) => ({ default: module.WorkflowsPage })));
 const StarterSolutionsPage = lazy(() => import('./features/solutions/StarterSolutionsPage').then((module) => ({ default: module.StarterSolutionsPage })));
 const MascotLabPage = lazy(() => import('./features/mascot/MascotLabPage').then((module) => ({ default: module.MascotLabPage })));
+const MemoryPage = lazy(() => import('./features/memory/MemoryPage').then((module) => ({ default: module.MemoryPage })));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 5_000, retry: 1 } } });
 
@@ -47,6 +48,7 @@ function RoutedApp() {
     <Route path="/workflows" element={<WorkflowsPage/>}/>
     <Route path="/solutions" element={<StarterSolutionsPage/>}/>
     <Route path="/knowledge" element={<KnowledgeRoute/>}/>
+    <Route path="/knowledge/memory" element={<MemoryPage/>}/>
     <Route path="/api-tools" element={<ApiToolsRoute/>}/>
     <Route path="/tools" element={<LegacyToolsRedirect/>}/>
     <Route path="/mcp" element={<McpMarketplacePage/>}/>

@@ -4,9 +4,11 @@ import type {
   CreateMemoryInput,
   LegacyMemoryKind,
   MemoryListFilters,
+  MemoryManagementFilters,
   MemoryRecord,
   MemoryScope,
   MemoryType,
+  ManagedMemoryList,
   VerificationStatus,
 } from './types.js';
 import { isEligibleMemoryCandidate, rankMemoryCandidate } from './ranking.js';
@@ -227,24 +229,64 @@ export async function updateMemory(input: {
   content?: string;
   importance?: number;
   metadata?: Record<string, unknown>;
+  scope?: MemoryScope;
+  agentId?: string | null;
+  expiresAt?: Date | null;
+  actorId?: string;
 }): Promise<MemoryRecord> {
-  const entries: Array<[string, unknown]> = [];
-  if (input.content !== undefined) {
-    const target = await query<{ semantic_search: boolean }>(
-      `SELECT COALESCE((a.memory_config->>'semanticSearch')::boolean,false) semantic_search
+  const changesOwnership = input.scope !== undefined || input.agentId !== undefined;
+  const target = input.content !== undefined || changesOwnership
+    ? await query<{ agent_id: string | null; scope: MemoryScope; semantic_search: boolean }>(
+      `SELECT m.agent_id,m.scope,COALESCE((a.memory_config->>'semanticSearch')::boolean,false) semantic_search
          FROM memories m
          LEFT JOIN agents a ON a.id=m.agent_id AND a.workspace_id=m.workspace_id
-        WHERE m.id=$1 AND m.workspace_id=$2`,
+        WHERE m.id=$1 AND m.workspace_id=$2 AND m.verification_status <> 'superseded'`,
       [input.memoryId, input.workspaceId],
-    );
-    if (!target.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
-    const embedding = target.rows[0]?.semantic_search === true
+    )
+    : null;
+  if (target && !target.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
+  const current = target?.rows[0];
+  const entries: Array<[string, unknown]> = [];
+  let targetAgentId = current?.agent_id ?? null;
+  if (changesOwnership) {
+    const targetScope = input.scope ?? current?.scope;
+    if (!targetScope) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
+    targetAgentId = input.agentId === undefined ? targetAgentId : input.agentId;
+    if (targetScope === 'workspace') {
+      entries.push(['scope', 'workspace'], ['agent_id', null], ['user_id', null]);
+      targetAgentId = null;
+    } else if (targetScope === 'agent') {
+      if (!targetAgentId) throw new MemoryServiceError('AGENT_REQUIRED_FOR_SCOPE', 400);
+      await authoritativeSemanticSearch(input.workspaceId, targetAgentId, { query });
+      entries.push(['scope', 'agent'], ['agent_id', targetAgentId], ['user_id', null]);
+    } else {
+      if (!input.actorId) throw new MemoryServiceError('USER_SCOPE_ACTOR_REQUIRED', 403);
+      if (targetAgentId) await authoritativeSemanticSearch(input.workspaceId, targetAgentId, { query });
+      entries.push(['scope', 'user'], ['agent_id', targetAgentId], ['user_id', input.actorId]);
+    }
+  }
+  if (input.content !== undefined) {
+    const semanticEnabled = targetAgentId && targetAgentId !== current?.agent_id
+      ? await authoritativeSemanticSearch(input.workspaceId, targetAgentId, { query })
+      : current?.semantic_search === true;
+    const embedding = semanticEnabled
       ? await embeddingFor(input.content).catch(() => null)
       : null;
     entries.push(['content', input.content], ['embedding', embedding?.length ? `[${embedding.join(',')}]` : null]);
   }
-  if (input.importance !== undefined) entries.push(['importance', input.importance]);
+  if (input.importance !== undefined) {
+    if (!Number.isFinite(input.importance) || input.importance < 0 || input.importance > 1) {
+      throw new MemoryServiceError('IMPORTANCE_INVALID', 400);
+    }
+    entries.push(['importance', input.importance]);
+  }
   if (input.metadata !== undefined) entries.push(['metadata', JSON.stringify(input.metadata)]);
+  if (input.expiresAt !== undefined) {
+    if (input.expiresAt !== null && (!Number.isFinite(input.expiresAt.getTime()) || input.expiresAt <= new Date())) {
+      throw new MemoryServiceError('EXPIRY_INVALID', 400);
+    }
+    entries.push(['expires_at', input.expiresAt]);
+  }
   if (!entries.length) throw new MemoryServiceError('NO_UPDATES', 400);
   const values = entries.map(([, value]) => value);
   const set = entries.map(([field], index) => field === 'metadata'
@@ -255,6 +297,7 @@ export async function updateMemory(input: {
   const result = await query<MemoryRow>(
     `UPDATE memories SET ${set},updated_at=now()
       WHERE id=$${values.length + 1} AND workspace_id=$${values.length + 2}
+        AND verification_status <> 'superseded'
       RETURNING ${memoryColumns}`,
     [...values, input.memoryId, input.workspaceId],
   );
@@ -382,6 +425,42 @@ export async function listEligibleMemories(filters: MemoryListFilters): Promise<
     values,
   );
   return result.rows.map(mapMemory);
+}
+
+export async function listManagedMemories(filters: MemoryManagementFilters): Promise<ManagedMemoryList> {
+  const limit = Math.min(Math.max(filters.limit ?? 50, 1), 100);
+  const offset = Math.min(Math.max(filters.offset ?? 0, 0), 1_000);
+  const values: unknown[] = [filters.workspaceId, filters.now ?? new Date()];
+  const conditions = ['workspace_id=$1'];
+  if (filters.agentId) {
+    values.push(filters.agentId);
+    conditions.push(`agent_id=$${values.length}`);
+  }
+  if (filters.type) {
+    values.push(filters.type);
+    conditions.push(`memory_type=$${values.length}`);
+  }
+  if (filters.scope) {
+    values.push(filters.scope);
+    conditions.push(`scope=$${values.length}`);
+  }
+  if (filters.verificationStatus) {
+    values.push(filters.verificationStatus);
+    conditions.push(`verification_status=$${values.length}`);
+  }
+  if (filters.expiry === 'active') conditions.push('(expires_at IS NULL OR expires_at > $2)');
+  if (filters.expiry === 'expired') conditions.push('expires_at <= $2');
+  values.push(limit + 1, offset);
+  const result = await query<MemoryRow>(
+    `SELECT ${memoryColumns} FROM memories WHERE ${conditions.join(' AND ')}
+      ORDER BY created_at DESC,id DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+    values,
+  );
+  const memories = result.rows.slice(0, limit).map(mapMemory);
+  return {
+    memories,
+    pagination: { limit, offset, nextOffset: result.rows.length > limit && offset + limit <= 1_000 ? offset + limit : null },
+  };
 }
 
 export type RetrieveAgentMemoriesInput = {

@@ -247,6 +247,83 @@ describe('governed memories', () => {
     expect(values).toContain(agentId);
   });
 
+  it('lists terminal and expired memories only through the bounded management route', async () => {
+    const expiredAt = new Date('2026-07-26T00:00:00.000Z');
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({
+        agent_id: agentId,
+        verification_status: 'disputed',
+        expires_at: expiredAt,
+        embedding: '[secret-vector]',
+      })],
+    });
+    const app = await routeApp();
+    const response = await app.inject({
+      method: 'GET',
+      url: `/manage?agentId=${agentId}&verificationStatus=disputed&expiry=expired&limit=20&offset=0`,
+    });
+    await app.close();
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({
+      data: [expect.objectContaining({ verification_status: 'disputed', expires_at: expiredAt.toISOString() })],
+      pagination: { limit: 20, offset: 0, nextOffset: null },
+    });
+    const [sql, values] = state.query.mock.calls[0];
+    expect(sql).toContain('workspace_id=$1');
+    expect(sql).toContain('verification_status=$');
+    expect(sql).toContain('expires_at <=');
+    expect(sql).toContain('ORDER BY created_at DESC,id DESC');
+    expect(sql).not.toMatch(/embedding/i);
+    expect(values).toEqual(expect.arrayContaining([workspaceId, agentId, 'disputed']));
+  });
+
+  it('lets the authenticated user move a memory to user scope while clearing an incompatible agent principal', async () => {
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'agent', agent_id: agentId, user_id: null, semantic_search: false })],
+    });
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'user', agent_id: null, user_id: userId, expires_at: null })],
+    });
+    const app = await routeApp();
+    const response = await app.inject({
+      method: 'PATCH',
+      url: `/${memoryRow().id}`,
+      payload: { scope: 'user', agentId: null, expiresAt: null },
+    });
+    await app.close();
+
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({ scope: 'user', agent_id: null, user_id: userId, expires_at: null });
+    const [sql, values] = state.query.mock.calls[1];
+    expect(sql).toContain('scope=');
+    expect(sql).toContain('agent_id=');
+    expect(sql).toContain('user_id=');
+    expect(sql).toContain("verification_status <> 'superseded'");
+    expect(values).toContain(userId);
+  });
+
+  it('rejects a scoped edit that targets an agent outside the workspace without exposing that agent', async () => {
+    state.query.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [memoryRow({ scope: 'workspace', agent_id: null, user_id: null, semantic_search: false })],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    const app = await routeApp();
+    const response = await app.inject({
+      method: 'PATCH',
+      url: `/${memoryRow().id}`,
+      payload: { scope: 'agent', agentId: '99999999-9999-4999-8999-999999999999' },
+    });
+    await app.close();
+
+    expect(response.statusCode, response.body).toBe(404);
+    expect(response.json()).toMatchObject({ error: 'AGENT_NOT_FOUND' });
+  });
+
   it('supersedes under row locks in a single transaction', async () => {
     const oldId = memoryRow().id;
     const replacementId = '66666666-6666-4666-8666-666666666666';

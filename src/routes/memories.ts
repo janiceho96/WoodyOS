@@ -8,6 +8,7 @@ import {
   disputeMemory,
   expireMemory,
   listEligibleMemories,
+  listManagedMemories,
   serializeMemory,
   supersedeMemory,
   updateMemory,
@@ -16,6 +17,7 @@ import {
 const memoryTypes = ['preference', 'fact', 'decision', 'project_context', 'workflow_result', 'error_resolution', 'summary', 'hypothesis'] as const;
 const scopes = ['workspace', 'agent', 'user'] as const;
 const verificationStatuses = ['user_confirmed', 'agent_inferred', 'system_generated', 'unverified'] as const;
+const managementVerificationStatuses = [...verificationStatuses, 'disputed', 'superseded'] as const;
 const legacyKinds = ['conversation', 'knowledge', 'user'] as const;
 
 const sourceInput = z.object({ type: z.string().min(1).max(100), id: z.string().max(200).nullable().optional() });
@@ -41,6 +43,27 @@ const listQuery = z.object({
   scope: z.enum(scopes).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
 });
+const managementListQuery = z.object({
+  agentId: z.string().uuid().optional(),
+  type: z.enum(memoryTypes).optional(),
+  scope: z.enum(scopes).optional(),
+  verificationStatus: z.enum(managementVerificationStatuses).optional(),
+  expiry: z.enum(['active', 'expired', 'any']).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  offset: z.coerce.number().int().min(0).max(1000).optional(),
+});
+const updateInput = z.object({
+  content: z.string().min(1).max(50000).optional(),
+  importance: z.number().min(0).max(1).optional(),
+  metadata: z.record(z.unknown()).optional(),
+  scope: z.enum(scopes).optional(),
+  agentId: z.string().uuid().nullable().optional(),
+  expiresAt: z.coerce.date().nullable().optional(),
+}).superRefine((value, context) => {
+  if (value.expiresAt && value.expiresAt <= new Date()) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['expiresAt'], message: 'expiresAt must be in the future or null' });
+  }
+});
 
 const supersedeInput = z.object({
   replacementMemoryId: z.string().uuid().optional(),
@@ -52,6 +75,12 @@ export async function memoryRoutes(app: FastifyInstance) {
     const filters = parse(listQuery, request.query, reply); if (!filters) return;
     const memories = await listEligibleMemories({ workspaceId: request.user.workspaceId, ...filters });
     return { data: memories.map(serializeMemory) };
+  }));
+
+  app.get('/manage', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const filters = parse(managementListQuery, request.query, reply); if (!filters) return;
+    const result = await listManagedMemories({ workspaceId: request.user.workspaceId, ...filters });
+    return { data: result.memories.map(serializeMemory), pagination: result.pagination };
   }));
 
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
@@ -89,8 +118,13 @@ export async function memoryRoutes(app: FastifyInstance) {
 
   app.patch('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
-    const input = parse(memoryFields.pick({ content: true, importance: true, metadata: true }).partial(), request.body, reply); if (!input) return;
-    return serializeMemory(await updateMemory({ workspaceId: request.user.workspaceId, memoryId: params.id, ...input }));
+    const input = parse(updateInput, request.body, reply); if (!input) return;
+    return serializeMemory(await updateMemory({
+      workspaceId: request.user.workspaceId,
+      memoryId: params.id,
+      actorId: request.user.sub,
+      ...input,
+    }));
   }));
 
   app.delete('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {

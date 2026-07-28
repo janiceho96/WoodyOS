@@ -691,6 +691,47 @@ export type KnowledgeResult = {
   content: string;
   score: number;
 };
+export type MemoryType = 'preference' | 'fact' | 'decision' | 'project_context' | 'workflow_result' | 'error_resolution' | 'summary' | 'hypothesis';
+export type MemoryScope = 'workspace' | 'agent' | 'user';
+export type MemoryVerificationStatus = 'user_confirmed' | 'agent_inferred' | 'system_generated' | 'unverified' | 'disputed' | 'superseded';
+export type ManagedMemory = {
+  id: string;
+  agent_id: string | null;
+  user_id: string | null;
+  kind: 'conversation' | 'knowledge' | 'user';
+  content: string;
+  importance: number;
+  metadata: Record<string, unknown>;
+  memory_type: MemoryType;
+  scope: MemoryScope;
+  source_type: string;
+  source_id: string | null;
+  confidence: number;
+  verification_status: MemoryVerificationStatus;
+  expires_at: string | null;
+  superseded_by: string | null;
+  last_accessed_at: string | null;
+  access_count: number;
+  created_at: string;
+  updated_at: string;
+};
+export type MemoryManagementFilters = Partial<{
+  agentId: string;
+  type: MemoryType;
+  scope: MemoryScope;
+  verificationStatus: MemoryVerificationStatus;
+  expiry: 'active' | 'expired' | 'any';
+  limit: number;
+  offset: number;
+}>;
+export type UpdateMemoryInput = Partial<{
+  content: string;
+  importance: number;
+  metadata: Record<string, unknown>;
+  scope: MemoryScope;
+  agentId: string | null;
+  expiresAt: string | null;
+}>;
 type ToolFields = {
   id: string;
   name: string;
@@ -1211,6 +1252,20 @@ export const api = {
       body: JSON.stringify({ query }),
     }),
   deleteDocument: (id: string) => request<void>(`/v1/knowledge/documents/${id}`, { method: 'DELETE' }),
+
+  managedMemories: (filters: MemoryManagementFilters = {}) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) if (value !== undefined) query.set(key, String(value));
+    return request<{ data: ManagedMemory[]; pagination: { limit: number; offset: number; nextOffset: number | null } }>(`/v1/memories/manage${query.size ? `?${query}` : ''}`);
+  },
+  updateMemory: (id: string, body: UpdateMemoryInput) =>
+    request<ManagedMemory>(`/v1/memories/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  confirmMemory: (id: string) => request<ManagedMemory>(`/v1/memories/${id}/confirm`, { method: 'POST' }),
+  disputeMemory: (id: string) => request<ManagedMemory>(`/v1/memories/${id}/dispute`, { method: 'POST' }),
+  expireMemory: (id: string) => request<ManagedMemory>(`/v1/memories/${id}/expire`, { method: 'POST' }),
+  supersedeMemory: (id: string, body: { replacementMemoryId?: string; replacement?: Record<string, unknown> }) =>
+    request<{ memory: ManagedMemory; replacement: ManagedMemory }>(`/v1/memories/${id}/supersede`, { method: 'POST', body: JSON.stringify(body) }),
+  deleteMemory: (id: string) => request<void>(`/v1/memories/${id}`, { method: 'DELETE' }),
 
   tools: () => request<{ data: Tool[] }>('/v1/tools'),
   demoApis: () => request<{ data: DemoApi[] }>('/v1/tools/demos'),

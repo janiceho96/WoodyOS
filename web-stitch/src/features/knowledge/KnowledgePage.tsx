@@ -46,7 +46,7 @@ export function KnowledgePage({ openText }: { openText: () => void }) {
   const processing = data.documents.filter((doc) => ['waiting_file', 'queued', 'processing'].includes(doc.status)).length;
 
   return <div className="knowledge-page knowledge-redesign">
-    <PageHeader eyebrow="Resources" title="Knowledge" description="Trusted workspace context your enabled agents can retrieve when it is relevant." actions={<button className="button" onClick={openText}><FileText size={15}/>Add text</button>}/>
+    <PageHeader eyebrow="Resources" title="Knowledge" description="Trusted workspace context your enabled agents can retrieve when it is relevant." actions={<><Link className="button" to="/knowledge/memory">Manage memories</Link><button className="button" onClick={openText}><FileText size={15}/>Add text</button></>}/>
     <section className="knowledge-overview"><article className="panel"><Database size={19}/><span><small>Ready for agents</small><strong>{ready}</strong><em>indexed documents</em></span></article><article className="panel"><LoaderCircle size={19} className={processing ? 'spin' : ''}/><span><small>Processing</small><strong>{processing}</strong><em>upload or indexing jobs</em></span></article><article className="panel knowledge-scope"><Info size={19}/><span><strong>Workspace-wide library</strong><em>Only agents with Knowledge enabled can retrieve these documents.</em><Link to="/agents">Review agent access</Link></span></article></section>
     <section className={`upload-zone ${upload.isPending ? 'busy' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={drop}>
       <input ref={fileRef} type="file" accept={accepted} onChange={(event) => receiveFile(event.target.files?.[0])}/>
