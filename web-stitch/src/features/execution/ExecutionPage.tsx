@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, AlertTriangle, ArrowUpRight, CalendarDays, CheckCircle2, CircleAlert, Download, Eye, FileArchive, FileSpreadsheet, FileText, LoaderCircle, Play, Presentation, RefreshCw, Search, Square, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, artifactFormats, type Artifact, type ArtifactFormat, type FileAsset, type Task, type TaskDetail } from '../../api';
+import { api, artifactFormats, type Artifact, type ArtifactFormat, type FileAsset, type Task, type TaskDetail, type WorkflowReplay } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { OutputViewer } from '../../components/OutputViewer';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
@@ -131,6 +131,11 @@ export function ExecutionDetail({ task, refresh }: { task: TaskDetail; refresh: 
   const pendingActions = task.actionAuthorizations?.filter((authorization) => authorization.status === 'awaiting_confirmation') ?? [];
   const canApproveActions = !session.workspace.role || ['owner', 'admin'].includes(session.workspace.role);
   const cost = taskCost([task], 5);
+  const replay = useQuery({
+    queryKey: ['workflow-replay', task.workflow_run_id],
+    queryFn: () => api.workflowReplay(task.workflow_run_id!),
+    enabled: Boolean(task.workflow_run_id),
+  });
   return <div className="execution-detail">
     <div className="trace-head"><AgentAvatar agent={taskAgent(task)} size="md" status={task.status === 'failed' ? 'error' : task.status === 'running' ? 'busy' : undefined}/><div><span className="eyebrow">run:{task.id.slice(0, 8)}</span><h2>{task.title}</h2><p>{task.agent_name ?? 'AI Agent'} · created {new Date(task.created_at).toLocaleString()}</p></div><div><Status value={task.status}/><button className="icon-button" onClick={refresh} aria-label="Refresh execution"><RefreshCw size={16}/></button>{cancellable && <button className="button danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}><Square size={13}/>Cancel</button>}</div></div>
     <RunStatusGuide task={task} openAgent={() => navigate(`/agents/${task.agent_id}/edit`)}/>
@@ -138,6 +143,7 @@ export function ExecutionDetail({ task, refresh }: { task: TaskDetail; refresh: 
     <div className="execution-stats"><span><small>Duration</small><strong>{task.duration_ms ? duration(task.duration_ms) : '—'}</strong></span><span><small>Input tokens</small><strong>{compact(task.token_input ?? 0)}</strong></span><span><small>Output tokens</small><strong>{compact(task.token_output ?? 0)}</strong></span><span><small>Cost</small><strong>{cost.label}</strong></span></div>
     {task.input && Object.keys(task.input).length > 0 && <section className="run-input-section"><div className="section-title"><div><span className="eyebrow">Request</span><h3>Input provided</h3></div></div><OutputViewer value={task.input}/></section>}
     <div className="trace-timeline"><h3>Event timeline</h3>{task.events.length ? task.events.map((event) => <div key={event.id}><i/><time>{new Date(event.created_at).toLocaleTimeString()}</time><span><strong>{event.event_type.replaceAll('.', ' ')}</strong><p>{event.message}</p>{event.payload && Object.keys(event.payload).length > 0 && <details className="event-data"><summary>Technical event data</summary><code>{JSON.stringify(event.payload)}</code></details>}</span></div>) : <p>No events recorded yet.</p>}</div>
+    {task.workflow_run_id && <WorkflowReplayTimeline replay={replay.data} loading={replay.isLoading} error={replay.isError}/>}
     {(task.output !== null && task.output !== undefined) && (task.status === 'completed'
       ? <EditableOutput task={task} refreshTask={refresh}/>
       : <section className="output-section"><h3>Agent result</h3><OutputViewer value={task.output}/></section>)}
@@ -145,6 +151,19 @@ export function ExecutionDetail({ task, refresh }: { task: TaskDetail; refresh: 
     {(task.error !== null && task.error !== undefined) && <section className="output-section error"><h3>Execution error</h3><OutputViewer value={task.error} error/></section>}
     {task.status === 'completed' && (task.output === null || task.output === undefined) && <section className="output-section"><h3>Agent result</h3><p>This task completed without an output payload.</p></section>}
   </div>;
+}
+
+function replayRecovery(summary: Record<string, unknown>) {
+  const category = typeof summary.category === 'string' ? summary.category.replaceAll('_', ' ') : null;
+  if (!category) return null;
+  return `Recovery: ${category}${summary.retryable === true ? ' · retryable' : ' · review configuration or policy before starting a new run'}`;
+}
+
+export function WorkflowReplayTimeline({ replay, loading = false, error = false }: { replay?: WorkflowReplay; loading?: boolean; error?: boolean }) {
+  if (loading) return <section className="trace-timeline workflow-replay-timeline" aria-live="polite"><h3>Trace replay history</h3><p>Loading stored trace history…</p></section>;
+  if (error) return <section className="trace-timeline workflow-replay-timeline" role="alert"><h3>Trace replay history</h3><p>Stored trace history could not be loaded. Refresh to try again; this never reruns the workflow.</p></section>;
+  if (!replay) return null;
+  return <section className="trace-timeline workflow-replay-timeline" aria-labelledby="trace-replay-heading"><div className="section-title"><div><span className="eyebrow">Trace {replay.run.traceId.slice(0, 8)}</span><h3 id="trace-replay-heading">Trace replay history</h3></div></div><p className="trace-replay-note">Stored history only — this does not rerun the workflow.</p>{replay.run.modelVersions.length > 0 && <div className="trace-replay-models" aria-label="Pinned model and agent versions">{replay.run.modelVersions.map((model) => <span key={`${model.agentId}-${model.versionId}`}>{model.model} · agent v{model.version}</span>)}</div>}{replay.events.length ? <ol className="trace-replay-events">{replay.events.map((event) => { const recovery = replayRecovery(event.summary); const outputVersion = event.kind === 'quality_history' && (typeof event.summary.version === 'string' || typeof event.summary.version === 'number') ? String(event.summary.version) : null; return <li key={`${event.sequence}-${event.kind}-${event.spanId}`}><time dateTime={event.timestamp}>{new Date(event.timestamp).toLocaleTimeString()}</time><span><strong>{event.title}</strong><small>{event.kind.replaceAll('_', ' ')} · {event.status.replaceAll('_', ' ')}{event.durationMs !== null ? ` · ${duration(event.durationMs)}` : ''}{event.costUsd !== null ? ` · $${event.costUsd.toFixed(4)}` : ''}</small>{outputVersion && <small>Quality output version: {outputVersion}</small>}{recovery && <p>{recovery}</p>}</span></li>; })}</ol> : <p>No persisted trace events are available for this workflow run.</p>}</section>;
 }
 
 export function RunStatusGuide({ task, openAgent }: { task: TaskDetail; openAgent: () => void }) {

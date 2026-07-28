@@ -502,6 +502,30 @@ export type WorkflowRun = {
   artifacts?: Artifact[];
   usage?: { agentTasks: number; inputTokens: number; outputTokens: number; estimatedCostUsd: number };
 };
+export type WorkflowReplayEvent = {
+  sequence: number;
+  timestamp: string;
+  traceId: string;
+  spanId: string;
+  parentSpanId: string | null;
+  kind: string;
+  title: string;
+  durationMs: number | null;
+  costUsd: number | null;
+  status: string;
+  summary: Record<string, unknown>;
+};
+export type WorkflowReplay = {
+  run: {
+    id: string;
+    traceId: string;
+    status: string;
+    createdAt: string;
+    completedAt: string | null;
+    modelVersions: Array<{ agentId: string; versionId: string; version: number; provider: string; model: string }>;
+  };
+  events: WorkflowReplayEvent[];
+};
 export type WorkflowDryRun = {
   valid: boolean;
   executionPath: string[];
@@ -1127,6 +1151,7 @@ export const api = {
   publishWorkflow: (id: string) =>
     request<Workflow>(`/v1/workflows/${id}/publish`, { method: 'POST' }),
   workflowRun: (id: string) => request<WorkflowRun>(`/v1/workflows/runs/${id}`),
+  workflowReplay: (id: string) => request<WorkflowReplay>(`/v1/workflows/runs/${id}/replay`),
   decideWorkflowApproval: (runId: string, approvalId: string, decision: 'approved' | 'rejected', comment = '') =>
     request(`/v1/workflows/runs/${runId}/approvals/${approvalId}`, {
       method: 'POST',

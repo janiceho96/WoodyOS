@@ -27,6 +27,7 @@ import {
 import { requestCancellation } from '../runtime/cancellation.js';
 import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
 import { runFixtureEvaluation, validateEvaluationFixtures, validateRegressionAssertions } from '../workflows/evaluation.js';
+import { getWorkflowReplay } from '../runtime/replay.js';
 import { decryptJson } from '../lib/crypto.js';
 import { canonicalJsonHash } from '../runtime/manifest.js';
 import type { StoredConfig } from '../tools/runtime.js';
@@ -727,6 +728,22 @@ export async function workflowRoutes(app: FastifyInstance) {
       workflowVersionId: workflow.rows[0].published_version_id,
     });
     return reply.code(202).send(created.run);
+  }));
+  app.get('/runs/:runId/replay', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const runId = (request.params as { runId: string }).runId;
+    const membership = await query<{ role: 'owner' | 'admin' | 'member' | 'viewer' }>(
+      'SELECT role FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2',
+      [request.user.workspaceId, request.user.sub],
+    );
+    const role = membership.rows[0]?.role;
+    if (!role || role === 'viewer') return reply.code(403).send({ error: 'FORBIDDEN' });
+    const replay = await getWorkflowReplay({
+      workspaceId: request.user.workspaceId,
+      runId,
+      role,
+    });
+    if (!replay) return reply.code(404).send({ error: 'WORKFLOW_RUN_NOT_FOUND' });
+    return replay;
   }));
   app.get('/runs/:runId', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const runId = (request.params as { runId: string }).runId;

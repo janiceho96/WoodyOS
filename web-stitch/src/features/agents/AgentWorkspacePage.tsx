@@ -12,7 +12,7 @@ import { EditableOutput } from '../../components/outputs/EditableOutput';
 import { EmptyState, Status } from '../../components/ui';
 import { compact, duration, humanize, relative, taskCost } from '../../lib/format';
 import { thinkingOrbStateForContext } from '../../lib/thinkingOrb';
-import { ArtifactPanel, TaskDialogBody } from '../execution/ExecutionPage';
+import { ArtifactPanel, TaskDialogBody, WorkflowReplayTimeline } from '../execution/ExecutionPage';
 import { AgentActivityPanel } from './AgentActivityPanel';
 import { AgentExecutionProvider, useAgentExecution } from './agentExecution';
 import { mcpAvailabilityLabel, mcpToolAvailabilityLabel } from '../mcp/agentMcpAccess';
@@ -86,6 +86,11 @@ function AgentTaskWorkspace() {
   const { report, reportError } = useWorkspace();
   const [composing, setComposing] = useState(!execution.task);
   const [previewAttachment, setPreviewAttachment] = useState<NonNullable<typeof execution.task>['attachments'][number] | null>(null);
+  const workflowReplay = useQuery({
+    queryKey: ['workflow-replay', execution.workflowRun?.id],
+    queryFn: () => api.workflowReplay(execution.workflowRun!.id),
+    enabled: Boolean(execution.workflowRun),
+  });
   const retrievedSources = ([...(execution.task?.events ?? [])].reverse().find((event) => event.event_type === 'attachments.retrieved')?.payload?.citations ?? []) as Array<{ fileId: string; filename: string; locator: string }>;
   const rerun = useMutation({
     mutationFn: () => api.createTask({ agentId: execution.agent.id, title: `${execution.task!.title} — retry`, input: execution.task?.input ?? {} }),
@@ -107,6 +112,7 @@ function AgentTaskWorkspace() {
         : <section className="panel output-section primary-result"><div className="section-title"><div><span className="eyebrow">Saved automatically</span><h2>Agent result</h2></div><FileOutput size={20}/></div><OutputViewer value={execution.task.output}/></section>)}
       {retrievedSources.length > 0 && <section className="panel run-input-section"><div className="section-title"><div><span className="eyebrow">Grounding</span><h2>Attachment sources used</h2></div></div><div className="capability-tags">{retrievedSources.map((source, index) => <span key={`${source.fileId}-${source.locator}-${index}`}>{source.filename} · {source.locator}</span>)}</div></section>}
       {execution.task.error !== undefined && execution.task.error !== null && <section className="panel output-section error"><h2>Execution error</h2><OutputViewer value={execution.task.error} error/></section>}
+      {execution.workflowRun && <WorkflowReplayTimeline replay={workflowReplay.data} loading={workflowReplay.isLoading} error={workflowReplay.isError}/>}
       {(execution.task.status === 'completed' || execution.task.artifacts?.length > 0) && <section className="panel"><ArtifactPanel task={execution.task} refresh={() => void execution.refresh()}/></section>}
       {previewAttachment && <FilePreviewDialog file={previewAttachment} close={() => setPreviewAttachment(null)}/>}
     </>}
