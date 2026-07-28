@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentRuntimeSourceFromSnapshot, normalizeModelConfig, resolveAgentRuntimePolicy } from '../src/lib/agent-runtime.js';
+import { agentRuntimeSourceFromSnapshot, formatAgentMemoryContext, normalizeModelConfig, resolveAgentRuntimePolicy } from '../src/lib/agent-runtime.js';
 import type { ToolRecord } from '../src/tools/runtime.js';
 
 function tool(id: string, name: string, permissions: string[]): ToolRecord {
@@ -69,5 +69,22 @@ describe('agent runtime policy', () => {
       tool_ids: [],
     }, []);
     expect(policy.knowledgeEnabled).toBe(false);
+  });
+
+  it('formats selected memory as prompt context without metadata or embeddings', () => {
+    const context = formatAgentMemoryContext([
+      {
+        id: 'memory-1',
+        content: 'The customer prefers weekly reports.',
+        memoryType: 'preference',
+        scope: 'user',
+        verificationStatus: 'user_confirmed',
+        score: 0.9,
+        metadata: { embedding: '[secret-vector]' },
+      },
+    ]);
+
+    expect(context).toBe('[Memory 1: preference, user_confirmed]\nThe customer prefers weekly reports.');
+    expect(context).not.toMatch(/embedding|secret-vector|metadata/i);
   });
 });

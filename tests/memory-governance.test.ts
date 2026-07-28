@@ -9,8 +9,11 @@ import {
   disputeMemory,
   expireMemory,
   listEligibleMemories,
+  retrieveAgentMemories,
   supersedeMemory,
 } from '../src/memories/service.js';
+import { rankMemoryCandidate } from '../src/memories/ranking.js';
+import type { MemoryRecord } from '../src/memories/types.js';
 
 const workspaceId = '22222222-2222-4222-8222-222222222222';
 const userId = '11111111-1111-4111-8111-111111111111';
@@ -48,6 +51,18 @@ function memoryRow(overrides: Record<string, unknown> = {}) {
     scope: 'agent', source_type: 'agent', source_id: agentId, confidence: 0.5, verification_status: 'agent_inferred',
     expires_at: null, superseded_by: null, last_accessed_at: null, access_count: 0,
     created_at: new Date('2026-07-26T00:00:00.000Z'), updated_at: new Date('2026-07-26T00:00:00.000Z'),
+    ...overrides,
+  };
+}
+
+function rankableMemory(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
+  return {
+    id: '44444444-4444-4444-8444-444444444444', workspaceId, agentId, userId,
+    kind: 'knowledge', content: 'The customer prefers weekly reports', importance: 0.5, metadata: {},
+    memoryType: 'hypothesis', scope: 'agent', sourceType: 'agent', sourceId: agentId,
+    confidence: 0.5, verificationStatus: 'agent_inferred', expiresAt: null, supersededBy: null,
+    lastAccessedAt: null, accessCount: 0,
+    createdAt: new Date('2026-07-26T00:00:00.000Z'), updatedAt: new Date('2026-07-26T00:00:00.000Z'),
     ...overrides,
   };
 }
@@ -301,5 +316,106 @@ describe('governed memories', () => {
     })).rejects.toMatchObject({ message: 'AGENT_NOT_FOUND', statusCode: 404 });
     expect(statements).toContain('ROLLBACK');
     expect(statements.some((statement) => statement.includes('INSERT INTO memories'))).toBe(false);
+  });
+
+  it('uses the documented normalized weights and clamps out-of-range ranking signals', () => {
+    const candidate = rankableMemory({
+      sourceType: 'user', confidence: 2, importance: -2, createdAt: new Date('2026-07-26T00:00:00.000Z'),
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    });
+
+    expect(rankMemoryCandidate(candidate, {
+      workspaceId,
+      agentId,
+      userId,
+      query: 'weekly reports',
+      semanticRelevance: 0.5,
+      now: new Date('2026-07-26T00:00:00.000Z'),
+    })).toBeCloseTo(0.7, 8);
+  });
+
+  it('assigns zero rank to disputed or confirmed-only agent-inferred candidates', () => {
+    const context = {
+      workspaceId,
+      agentId,
+      userId,
+      query: 'weekly reports',
+      semanticRelevance: 1,
+      now: new Date('2026-07-26T00:00:00.000Z'),
+    };
+    const confirmed = rankableMemory({ verificationStatus: 'user_confirmed', sourceType: 'user' });
+
+    expect(rankMemoryCandidate(confirmed, context)).toBeGreaterThan(rankMemoryCandidate(
+      rankableMemory({ verificationStatus: 'disputed' }), context,
+    ));
+    expect(rankMemoryCandidate(rankableMemory({ verificationStatus: 'agent_inferred' }), {
+      ...context,
+      confirmedOnly: true,
+    })).toBe(0);
+  });
+
+  it('filters candidates to the tenant and exact agent or user scope before ranking', async () => {
+    state.query.mockResolvedValueOnce({
+      rowCount: 4,
+      rows: [
+        memoryRow({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', scope: 'workspace', verification_status: 'user_confirmed' }),
+        memoryRow({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', scope: 'agent', agent_id: '99999999-9999-4999-8999-999999999999', verification_status: 'user_confirmed' }),
+        memoryRow({ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', scope: 'user', user_id: '88888888-8888-4888-8888-888888888888', verification_status: 'user_confirmed' }),
+        memoryRow({ id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', workspace_id: '77777777-7777-4777-8777-777777777777', scope: 'workspace', verification_status: 'user_confirmed' }),
+      ],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    const results = await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'weekly reports', limit: 8 });
+
+    expect(results.map((item) => item.id)).toEqual(['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']);
+    const [sql, values] = state.query.mock.calls[0];
+    expect(sql).toContain("scope='workspace'");
+    expect(sql).toContain("scope='agent'");
+    expect(sql).toContain("scope='user'");
+    expect(values).toEqual(expect.arrayContaining([workspaceId, agentId, userId]));
+  });
+
+  it('excludes agent-inferred memory in confirmed-only mode before selection', async () => {
+    state.query.mockResolvedValueOnce({
+      rowCount: 2,
+      rows: [
+        memoryRow({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', scope: 'workspace', verification_status: 'agent_inferred' }),
+        memoryRow({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', scope: 'workspace', verification_status: 'user_confirmed' }),
+      ],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    const results = await retrieveAgentMemories({
+      workspaceId, agentId, userId, query: 'weekly reports', limit: 8, confirmedOnly: true,
+    });
+
+    expect(results.map((item) => item.id)).toEqual(['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']);
+    expect(state.query.mock.calls[0][0]).toContain("verification_status <> 'agent_inferred'");
+  });
+
+  it('uses deterministic score and ID ordering and accounts only for final limited prompt memories', async () => {
+    state.query.mockResolvedValueOnce({
+      rowCount: 3,
+      rows: [
+        memoryRow({ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', scope: 'workspace', verification_status: 'user_confirmed' }),
+        memoryRow({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', scope: 'workspace', verification_status: 'user_confirmed' }),
+        memoryRow({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', scope: 'workspace', verification_status: 'user_confirmed' }),
+      ],
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 2, rows: [] });
+
+    const results = await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'unrelated', limit: 2 });
+
+    expect(results.map((item) => item.id)).toEqual([
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    ]);
+    expect(state.query).toHaveBeenCalledTimes(2);
+    expect(state.query.mock.calls[1][0]).toMatch(/access_count=access_count\+1/);
+    expect(state.query.mock.calls[1][1]).toEqual([
+      ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'],
+      workspaceId,
+    ]);
   });
 });

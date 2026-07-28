@@ -9,6 +9,7 @@ import type {
   MemoryType,
   VerificationStatus,
 } from './types.js';
+import { isEligibleMemoryCandidate, rankMemoryCandidate } from './ranking.js';
 
 type Queryable = {
   query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
@@ -299,6 +300,67 @@ export async function listEligibleMemories(filters: MemoryListFilters): Promise<
     values,
   );
   return result.rows.map(mapMemory);
+}
+
+export type RetrieveAgentMemoriesInput = {
+  workspaceId: string;
+  agentId: string;
+  userId: string;
+  query: string;
+  limit?: number;
+  confirmedOnly?: boolean;
+  now?: Date;
+};
+
+export type AgentPromptMemory = {
+  id: string;
+  content: string;
+  memoryType: MemoryType;
+  scope: MemoryScope;
+  verificationStatus: VerificationStatus;
+  score: number;
+};
+
+export async function retrieveAgentMemories(input: RetrieveAgentMemoriesInput): Promise<AgentPromptMemory[]> {
+  const now = input.now ?? new Date();
+  const limit = Math.min(Math.max(input.limit ?? 4, 1), 8);
+  const values: unknown[] = [input.workspaceId, input.agentId, input.userId, now];
+  const conditions = [
+    'workspace_id=$1',
+    "(scope='workspace' OR (scope='agent' AND agent_id=$2) OR (scope='user' AND user_id=$3))",
+    "verification_status NOT IN ('disputed','superseded')",
+    '(expires_at IS NULL OR expires_at > $4)',
+  ];
+  if (input.confirmedOnly) conditions.push("verification_status <> 'agent_inferred'");
+  values.push(100);
+  const result = await query<MemoryRow>(
+    `SELECT ${memoryColumns} FROM memories WHERE ${conditions.join(' AND ')}
+      ORDER BY created_at DESC, id ASC LIMIT $${values.length}`,
+    values,
+  );
+  const rankingContext = { ...input, now };
+  const selected = result.rows
+    .map(mapMemory)
+    .filter((memory) => isEligibleMemoryCandidate(memory, rankingContext))
+    .map((memory) => ({ memory, score: rankMemoryCandidate(memory, rankingContext) }))
+    .sort((left, right) => right.score - left.score || left.memory.id.localeCompare(right.memory.id))
+    .slice(0, limit);
+
+  if (selected.length) {
+    await query(
+      'UPDATE memories SET last_accessed_at=now(),access_count=access_count+1 WHERE id=ANY($1::uuid[]) AND workspace_id=$2',
+      [selected.map(({ memory }) => memory.id), input.workspaceId],
+    );
+  }
+
+  return selected.map(({ memory, score }) => ({
+    id: memory.id,
+    content: memory.content,
+    memoryType: memory.memoryType,
+    scope: memory.scope,
+    verificationStatus: memory.verificationStatus,
+    score,
+  }));
 }
 
 export function serializeMemory(memory: MemoryRecord) {

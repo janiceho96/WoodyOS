@@ -1,6 +1,7 @@
 import { query } from '../db/client.js';
 import type { ToolRecord } from '../tools/runtime.js';
 import { searchWorkspaceKnowledge } from '../knowledge/retrieval.js';
+import { retrieveAgentMemories, type AgentPromptMemory } from '../memories/service.js';
 import type { TraceContext } from '../runtime/trace.js';
 
 export type AgentModelConfig = {
@@ -159,4 +160,29 @@ export async function retrieveAgentKnowledge(
   return results
     .map((row, index) => `[Knowledge ${index + 1}: ${row.documentName}]\n${row.content}`)
     .join('\n\n');
+}
+
+export function formatAgentMemoryContext(memories: readonly AgentPromptMemory[]) {
+  return memories
+    .map((memory, index) => `[Memory ${index + 1}: ${memory.memoryType}, ${memory.verificationStatus}]\n${memory.content}`)
+    .join('\n\n');
+}
+
+export async function retrieveAgentMemoryContext(input: {
+  workspaceId: string;
+  agentId: string;
+  userId: string;
+  requestText: string;
+  limit?: number;
+  confirmedOnly?: boolean;
+}) {
+  const memories = await retrieveAgentMemories({
+    workspaceId: input.workspaceId,
+    agentId: input.agentId,
+    userId: input.userId,
+    query: input.requestText,
+    limit: input.limit,
+    confirmedOnly: input.confirmedOnly,
+  });
+  return formatAgentMemoryContext(memories);
 }
