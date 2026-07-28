@@ -83,12 +83,8 @@ function requiresDurableQualityHistory(context: WorkflowAdapterContext) {
     && run.execution_manifest?.compatibility === 'exact';
 }
 
-function hasStoredAgentExecutionIdentities(state: Record<string, unknown>) {
-  return Boolean(
-    state.agentExecutionIdentities
-    && typeof state.agentExecutionIdentities === 'object'
-    && !Array.isArray(state.agentExecutionIdentities),
-  );
+function hasCurrentIdentitySchema(state: Record<string, unknown>) {
+  return state.agentExecutionIdentitySchemaVersion === 1;
 }
 
 async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
@@ -103,7 +99,7 @@ async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
     !quality
     || loop.iteration <= 0
     || !requiresDurableQualityHistory(context)
-    || !hasStoredAgentExecutionIdentities(run.state)
+    || !hasCurrentIdentitySchema(run.state)
   ) return;
   const nodes = run.state.nodes && typeof run.state.nodes === 'object' && !Array.isArray(run.state.nodes)
     ? run.state.nodes as Record<string, unknown>

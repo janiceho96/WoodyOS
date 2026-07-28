@@ -73,6 +73,7 @@ function context(input: {
   graderIdentityOutput?: Record<string, unknown>;
   graderStateVerdict?: Record<string, unknown>;
   storedIdentities?: boolean;
+  identitySchemaVersion?: boolean;
   compatibility?: 'exact' | 'legacy_partial';
   mode?: 'production' | 'test';
   leaseOwnerId?: string;
@@ -91,6 +92,7 @@ function context(input: {
         worker: { text: 'Candidate' },
         grader: { data: graderStateVerdict },
       },
+      ...(input.identitySchemaVersion === false ? {} : { agentExecutionIdentitySchemaVersion: 1 }),
       ...(input.storedIdentities === false ? {} : {
         agentExecutionIdentities: {
           ...(input.candidateIdentity === false ? {} : {
@@ -238,10 +240,20 @@ describe('quality-loop durable history', () => {
   });
 
   it('keeps in-flight exact production quality loops running when no identities were ever stored', async () => {
-    const adapterContext = context({ candidateIdentity: false, graderIdentity: false, storedIdentities: false });
+    const adapterContext = context({ candidateIdentity: false, graderIdentity: false, storedIdentities: false, identitySchemaVersion: false });
 
     await expect(executeLogicNode(adapterContext)).resolves.toMatchObject({ result: 'done' });
     expect(state.order).toEqual(['state']);
+  });
+
+  it('keeps a mixed pre-deployment candidate and post-deployment grader loop running without durable history', async () => {
+    const adapterContext = context({ candidateIdentity: false, identitySchemaVersion: false });
+
+    await expect(executeLogicNode(adapterContext)).resolves.toMatchObject({ result: 'done' });
+    expect(state.order).toEqual(['state']);
+    expect(adapterContext.run.state.qualityHistory).toMatchObject({
+      quality_loop: [{ iteration: 1, verdict: { score: 91 } }],
+    });
   });
 
   it('rejects a mutable grader state verdict that differs from the grader task output', async () => {

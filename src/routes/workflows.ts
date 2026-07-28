@@ -160,7 +160,13 @@ async function createQueuedRun(input: {
   await assertWorkspaceAiBudgetAvailable(input.workspaceId);
   const trigger = input.definition.nodes.find((node) => node.type === 'trigger');
   if (!trigger) return { error: 'WORKFLOW_TRIGGER_MISSING' as const };
-  const initialState = { ...input.runInput, input: input.runInput, nodes: {}, variables: {} };
+  const initialState = {
+    ...input.runInput,
+    input: input.runInput,
+    nodes: {},
+    variables: {},
+    agentExecutionIdentitySchemaVersion: 1,
+  };
   const cursor = { nodeId: trigger.id, loops: {}, attempt: 1 };
   const trace = createTraceContext();
   const client = await db.connect();
