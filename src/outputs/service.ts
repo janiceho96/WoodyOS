@@ -64,6 +64,16 @@ export async function getTaskOutputDocument(workspaceId: string, taskId: string)
   return document ? detailForDocument(document) : null;
 }
 
+export async function getOutputDocumentVersion(workspaceId: string, versionId: string) {
+  return (await query<OutputVersionRecord>(
+    `SELECT id,workspace_id,document_id,version_number,content,content_hash,
+            created_by,created_at
+       FROM output_document_versions
+      WHERE id=$1 AND workspace_id=$2`,
+    [versionId, workspaceId],
+  )).rows[0] ?? null;
+}
+
 export async function initializeTaskOutputDocument(input: {
   workspaceId: string;
   taskId: string;

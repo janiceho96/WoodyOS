@@ -4,8 +4,9 @@ import type { WorkflowAdapterContext, WorkflowCursor } from './types.js';
 import { cancellationError } from '../../runtime/cancellation.js';
 import { assertFencedMutation } from '../../runtime/leases.js';
 import { appendQualityHistoryEntry } from '../../quality/history.js';
-import { getTaskOutputDocument, initializeTaskOutputDocument } from '../../outputs/service.js';
+import { getOutputDocumentVersion } from '../../outputs/service.js';
 import { runtimeError } from '../../runtime/errors.js';
+import { canonicalJson } from '../../runtime/manifest.js';
 import type { AgentNodeExecutionIdentity } from './types.js';
 
 type QualitySummary = {
@@ -66,6 +67,30 @@ function identityFor(
     : null;
 }
 
+function graderResultFor(identity: AgentNodeExecutionIdentity) {
+  const output = identity.output;
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return null;
+  const result = (output as Record<string, unknown>).data;
+  return result && typeof result === 'object' && !Array.isArray(result)
+    ? result as Record<string, unknown>
+    : null;
+}
+
+function requiresDurableQualityHistory(context: WorkflowAdapterContext) {
+  const { execution, run } = context;
+  return execution.mode === 'production'
+    && run.run_mode === 'production'
+    && run.execution_manifest?.compatibility === 'exact';
+}
+
+function hasStoredAgentExecutionIdentities(state: Record<string, unknown>) {
+  return Boolean(
+    state.agentExecutionIdentities
+    && typeof state.agentExecutionIdentities === 'object'
+    && !Array.isArray(state.agentExecutionIdentities),
+  );
+}
+
 async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor } = context;
   const quality = node.config.quality
@@ -74,7 +99,12 @@ async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
     ? node.config.quality as Record<string, unknown>
     : null;
   const loop = cursor.loops[node.id] ?? { iteration: 0 };
-  if (!quality || loop.iteration <= 0) return;
+  if (
+    !quality
+    || loop.iteration <= 0
+    || !requiresDurableQualityHistory(context)
+    || !hasStoredAgentExecutionIdentities(run.state)
+  ) return;
   const nodes = run.state.nodes && typeof run.state.nodes === 'object' && !Array.isArray(run.state.nodes)
     ? run.state.nodes as Record<string, unknown>
     : {};
@@ -107,25 +137,27 @@ async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
       details: { nodeId: graderNodeId, iteration: loop.iteration },
     });
   }
-  let candidateDocument = await getTaskOutputDocument(run.workspace_id, candidateIdentity.taskId);
-  if (!candidateDocument) {
-    try {
-      candidateDocument = await initializeTaskOutputDocument({
-        workspaceId: run.workspace_id,
-        taskId: candidateIdentity.taskId,
-        actorId: run.created_by,
-      });
-    } catch (error) {
-      if (!(error instanceof Error && error.message === 'OUTPUT_SOURCE_EMPTY')) throw error;
-      throw runtimeError('QUALITY_CANDIDATE_VERSION_REQUIRED', {
-        category: 'validation',
-        retryable: false,
-        message: 'Quality candidates require a completed versioned text output',
-        details: { nodeId: candidateNodeId, iteration: loop.iteration },
-      });
-    }
+  const graderResult = graderResultFor(graderIdentity);
+  if (!graderResult || canonicalJson(graderResult) !== canonicalJson(verdict)) {
+    throw runtimeError('QUALITY_GRADER_RESULT_MISMATCH', {
+      category: 'validation',
+      retryable: false,
+      message: 'Quality grader state does not match the completed grader task output',
+      details: { nodeId: graderNodeId, iteration: loop.iteration },
+    });
   }
-  const outputVersion = candidateDocument.currentVersion;
+  const outputVersion = await getOutputDocumentVersion(
+    run.workspace_id,
+    candidateIdentity.outputDocumentVersionId,
+  );
+  if (!outputVersion) {
+    throw runtimeError('QUALITY_CANDIDATE_VERSION_REQUIRED', {
+      category: 'validation',
+      retryable: false,
+      message: 'Quality candidate output version is missing',
+      details: { nodeId: candidateNodeId, iteration: loop.iteration },
+    });
+  }
   const passingScore = Number(node.config.passingScore ?? 0);
   const passed = verdict.passed === true
     && typeof verdict.score === 'number'
@@ -151,7 +183,7 @@ async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
     graderTaskId: graderIdentity.taskId,
     graderAgentVersionId: graderIdentity.agentVersionId,
     modelIdentity: graderIdentity.modelIdentity,
-    result: verdict,
+    result: graderResult,
     exitReason,
     traceId: run.trace_id,
     leaseOwnerId: execution.leaseOwnerId,

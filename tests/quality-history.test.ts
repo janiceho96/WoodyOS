@@ -17,6 +17,7 @@ const ids = {
 const hash = 'a'.repeat(64);
 const parametersHash = 'b'.repeat(64);
 const modelIdentity = `openai-compatible:gpt-5:${parametersHash}:${ids.graderVersion}:runtime-4`;
+const graderResult = { passed: true, score: 91, feedback: [], criteria: [] };
 
 type Entry = {
   id: string;
@@ -88,6 +89,7 @@ function identityRow() {
     grader_agent_version_id: ids.graderVersion,
     grader_version_workspace_id: ids.workspace,
     grader_version_agent_id: ids.graderAgent,
+    grader_result: graderResult,
   };
 }
 
@@ -193,7 +195,7 @@ function input(overrides: Record<string, unknown> = {}) {
     graderTaskId: ids.graderTask,
     graderAgentVersionId: ids.graderVersion,
     modelIdentity,
-    result: { passed: true, score: 91 },
+    result: graderResult,
     exitReason: 'quality_passed',
     traceId: ids.trace,
     leaseOwnerId: 'worker-owner',
@@ -271,12 +273,22 @@ describe('immutable quality history', () => {
     await appendQualityHistoryEntry(input());
 
     await expect(appendQualityHistoryEntry(input({
-      result: { passed: false, score: 12 },
+      exitReason: 'limit_exit',
     }))).rejects.toMatchObject({
       code: 'QUALITY_HISTORY_SEQUENCE_CONFLICT',
       retryable: false,
     });
     expect(state.entries).toHaveLength(1);
+  });
+
+  it('rejects a caller verdict that differs from the completed grader task output', async () => {
+    await expect(appendQualityHistoryEntry(input({
+      result: { passed: false, score: 12, feedback: ['Rewrite'], criteria: [] },
+    }))).rejects.toMatchObject({
+      code: 'QUALITY_HISTORY_RESULT_MISMATCH',
+      retryable: false,
+    });
+    expect(state.entries).toEqual([]);
   });
 
   it('does not append when the workflow lease is stale', async () => {

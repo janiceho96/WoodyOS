@@ -68,9 +68,10 @@ type LinkedIdentityRow = {
   grader_agent_version_id: string;
   grader_version_workspace_id: string;
   grader_version_agent_id: string;
+  grader_result: unknown;
 };
 
-function qualityError(code: 'QUALITY_HISTORY_IDENTITY_MISMATCH' | 'QUALITY_HISTORY_SEQUENCE_CONFLICT') {
+function qualityError(code: 'QUALITY_HISTORY_IDENTITY_MISMATCH' | 'QUALITY_HISTORY_RESULT_MISMATCH' | 'QUALITY_HISTORY_SEQUENCE_CONFLICT') {
   return Object.assign(new Error(code), {
     code,
     category: 'validation',
@@ -203,7 +204,8 @@ export async function appendQualityHistoryEntry(
               grader.agent_version_id grader_task_agent_version_id,
               grader_version.id grader_agent_version_id,
               grader_version.workspace_id grader_version_workspace_id,
-              grader_version.agent_id grader_version_agent_id
+              grader_version.agent_id grader_version_agent_id,
+              grader.output->'data' grader_result
          FROM tasks candidate
          JOIN output_documents output_document
            ON output_document.task_id=candidate.id
@@ -251,6 +253,9 @@ export async function appendQualityHistoryEntry(
     if (input.modelIdentity !== derivedModelIdentity) {
       throw qualityError('QUALITY_HISTORY_IDENTITY_MISMATCH');
     }
+    if (canonicalJson(input.result) !== canonicalJson(identity.grader_result)) {
+      throw qualityError('QUALITY_HISTORY_RESULT_MISMATCH');
+    }
 
     const existing = (await client.query<QualityHistoryRow>(
       `/* quality-history:existing */
@@ -288,7 +293,7 @@ export async function appendQualityHistoryEntry(
         input.graderTaskId,
         input.graderAgentVersionId,
         derivedModelIdentity,
-        canonicalJson(input.result),
+        canonicalJson(identity.grader_result),
         input.exitReason,
         input.traceId,
       ],

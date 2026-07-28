@@ -1530,6 +1530,70 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect((await query<{ output: unknown }>('SELECT output FROM tasks WHERE id=$1', [task.id])).rows[0].output).toEqual(original);
   }, 30_000);
 
+  it('keeps direct quality-history mutations immutable while allowing workflow-run cascade cleanup', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers });
+    expect(me.statusCode, me.body).toBe(200);
+    const { query } = await import('../src/db/client.js');
+    const workspaceId = me.json().workspace_id as string;
+    const actorId = me.json().id as string;
+    const workflow = (await query<{ id: string }>(
+      `INSERT INTO workflows(workspace_id,name,definition,created_by)
+       VALUES($1,$2,$3,$4) RETURNING id`,
+      [workspaceId, `Quality history lifecycle ${suffix}`, JSON.stringify({ nodes: [{ id: 'start', type: 'trigger', config: {} }], edges: [] }), actorId],
+    )).rows[0];
+    const run = (await query<{ id: string; trace_id: string }>(
+      `INSERT INTO workflow_runs(workspace_id,workflow_id,input,definition_snapshot,state,cursor,run_mode)
+       VALUES($1,$2,'{}'::jsonb,$3,'{}'::jsonb,$4,'production') RETURNING id,trace_id`,
+      [workspaceId, workflow.id, JSON.stringify({ nodes: [{ id: 'start', type: 'trigger', config: {} }], edges: [] }), JSON.stringify({ nodeId: 'start', loops: {}, attempt: 1 })],
+    )).rows[0];
+    const version = (await query<{ published_version_id: string }>(
+      'SELECT published_version_id FROM agents WHERE id=$1 AND workspace_id=$2',
+      [agentId, workspaceId],
+    )).rows[0];
+    const candidate = (await query<{ id: string }>(
+      `INSERT INTO tasks(workspace_id,agent_id,agent_version_id,workflow_run_id,title,input,output,status,requested_by,completed_at)
+       VALUES($1,$2,$3,$4,'Quality candidate','{}'::jsonb,$5,'completed',$6,now()) RETURNING id`,
+      [workspaceId, agentId, version.published_version_id, run.id, JSON.stringify({ text: 'Candidate' }), actorId],
+    )).rows[0];
+    const graderResult = { passed: true, score: 91, feedback: [], criteria: [] };
+    const grader = (await query<{ id: string }>(
+      `INSERT INTO tasks(workspace_id,agent_id,agent_version_id,workflow_run_id,title,input,output,status,requested_by,completed_at)
+       VALUES($1,$2,$3,$4,'Quality grader','{}'::jsonb,$5,'completed',$6,now()) RETURNING id`,
+      [workspaceId, agentId, version.published_version_id, run.id, JSON.stringify({ text: JSON.stringify(graderResult), data: graderResult }), actorId],
+    )).rows[0];
+    const document = (await query<{ id: string }>(
+      `INSERT INTO output_documents(workspace_id,task_id,current_version_number,created_by)
+       VALUES($1,$2,1,$3) RETURNING id`,
+      [workspaceId, candidate.id, actorId],
+    )).rows[0];
+    const outputVersion = (await query<{ id: string; content_hash: string }>(
+      `INSERT INTO output_document_versions(workspace_id,document_id,version_number,content,content_hash,created_by)
+       VALUES($1,$2,1,'Candidate',$3,$4) RETURNING id,content_hash`,
+      [workspaceId, document.id, 'a'.repeat(64), actorId],
+    )).rows[0];
+    const entry = (await query<{ id: string }>(
+      `INSERT INTO quality_history_entries(
+         workspace_id,workflow_run_id,sequence,candidate_task_id,output_document_version_id,candidate_hash,
+         grader_task_id,grader_agent_version_id,model_identity,result,trace_id
+       ) VALUES($1,$2,1,$3,$4,$5,$6,$7,'integration:grader',$8,$9) RETURNING id`,
+      [workspaceId, run.id, candidate.id, outputVersion.id, outputVersion.content_hash, grader.id, version.published_version_id, JSON.stringify(graderResult), run.trace_id],
+    )).rows[0];
+
+    await expect(query(
+      `UPDATE quality_history_entries SET result='{"passed":false}'::jsonb WHERE id=$1`,
+      [entry.id],
+    )).rejects.toThrow('Quality history entries are immutable');
+    await expect(query(
+      'DELETE FROM quality_history_entries WHERE id=$1',
+      [entry.id],
+    )).rejects.toThrow('Quality history entries are immutable');
+
+    await query('DELETE FROM workflow_runs WHERE id=$1 AND workspace_id=$2', [run.id, workspaceId]);
+    const remaining = await query('SELECT 1 FROM quality_history_entries WHERE id=$1', [entry.id]);
+    expect(remaining.rowCount).toBe(0);
+  });
+
   it('blocks new AI work after an enforced local budget is exhausted', async () => {
     const headers = { authorization: `Bearer ${token}` };
     const budget = await app.inject({

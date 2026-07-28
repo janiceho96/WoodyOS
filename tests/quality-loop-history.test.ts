@@ -16,29 +16,20 @@ const ids = {
 const state = vi.hoisted(() => ({
   order: [] as string[],
   appendInput: null as Record<string, unknown> | null,
-  candidateDocument: null as Record<string, unknown> | null,
+  candidateVersion: null as Record<string, unknown> | null,
+  currentDocumentReads: 0,
 }));
 
-function currentCandidateDocument() {
+function evaluatedCandidateVersion() {
   return {
-    id: '00000000-0000-4000-8000-000000000010',
+    id: ids.outputVersion,
     workspace_id: ids.workspace,
-    task_id: ids.candidateTask,
-    current_version_number: 3,
+    document_id: '00000000-0000-4000-8000-000000000010',
+    version_number: 1,
+    content: 'Candidate evaluated by the grader',
+    content_hash: 'a'.repeat(64),
     created_by: null,
     created_at: '2026-07-27T00:00:00.000Z',
-    updated_at: '2026-07-27T00:00:00.000Z',
-    currentVersion: {
-      id: ids.currentOutputVersion,
-      workspace_id: ids.workspace,
-      document_id: '00000000-0000-4000-8000-000000000010',
-      version_number: 3,
-      content: 'Human-revised candidate',
-      content_hash: 'c'.repeat(64),
-      created_by: null,
-      created_at: '2026-07-27T00:00:00.000Z',
-    },
-    versions: [],
   };
 }
 
@@ -61,16 +52,34 @@ vi.mock('../src/quality/history.js', async () => {
   };
 });
 vi.mock('../src/outputs/service.js', () => ({
-  getTaskOutputDocument: vi.fn(async () => state.candidateDocument),
-  initializeTaskOutputDocument: vi.fn(async () => {
-    state.order.push('initialize');
-    return currentCandidateDocument();
+  getOutputDocumentVersion: vi.fn(async () => state.candidateVersion),
+  getTaskOutputDocument: vi.fn(async () => {
+    state.currentDocumentReads += 1;
+    return {
+      currentVersion: {
+        id: ids.currentOutputVersion,
+        content_hash: 'c'.repeat(64),
+        version_number: 3,
+      },
+    };
   }),
 }));
 
 import { executeLogicNode } from '../src/workflows/adapters/logic.js';
 
-function context(input: { candidateIdentity?: boolean; leaseOwnerId?: string } = {}) {
+function context(input: {
+  candidateIdentity?: boolean;
+  graderIdentity?: boolean;
+  graderIdentityOutput?: Record<string, unknown>;
+  graderStateVerdict?: Record<string, unknown>;
+  storedIdentities?: boolean;
+  compatibility?: 'exact' | 'legacy_partial';
+  mode?: 'production' | 'test';
+  leaseOwnerId?: string;
+} = {}) {
+  const graderStateVerdict = input.graderStateVerdict ?? { passed: true, score: 91, feedback: [], criteria: [] };
+  const graderIdentityOutput = input.graderIdentityOutput ?? { data: graderStateVerdict };
+  const mode = input.mode ?? 'production';
   const run = {
     id: ids.run,
     workspace_id: ids.workspace,
@@ -80,10 +89,11 @@ function context(input: { candidateIdentity?: boolean; leaseOwnerId?: string } =
     state: {
       nodes: {
         worker: { text: 'Candidate' },
-        grader: { data: { passed: true, score: 91, feedback: [], criteria: [] } },
+        grader: { data: graderStateVerdict },
       },
-      agentExecutionIdentities: {
-        ...(input.candidateIdentity === false ? {} : {
+      ...(input.storedIdentities === false ? {} : {
+        agentExecutionIdentities: {
+          ...(input.candidateIdentity === false ? {} : {
           worker: {
             taskId: ids.candidateTask,
             agentVersionId: ids.candidateAgentVersion,
@@ -92,19 +102,22 @@ function context(input: { candidateIdentity?: boolean; leaseOwnerId?: string } =
             output: { text: 'Candidate' },
           },
         }),
-        grader: {
+          ...(input.graderIdentity === false ? {} : { grader: {
           taskId: ids.graderTask,
           agentVersionId: ids.graderAgentVersion,
           outputDocumentVersionId: '00000000-0000-4000-8000-000000000012',
           modelIdentity: `openai-compatible:gpt-5:${'b'.repeat(64)}:${ids.graderAgentVersion}:runtime-4`,
-          output: { data: { passed: true, score: 91, feedback: [], criteria: [] } },
+          output: graderIdentityOutput,
+          } }),
         },
-      },
+      }),
     } as Record<string, unknown>,
     cursor: { nodeId: 'quality_loop', loops: { quality_loop: { iteration: 1 } }, attempt: 1 },
     step_count: 3,
-    run_mode: 'production' as const,
-    execution_manifest: null,
+    run_mode: mode,
+    execution_manifest: mode === 'production'
+      ? { compatibility: input.compatibility ?? 'exact' } as never
+      : null,
     trace_id: ids.trace,
     span_id: '00000000-0000-4000-8000-000000000013',
     parent_span_id: null,
@@ -128,8 +141,9 @@ function context(input: { candidateIdentity?: boolean; leaseOwnerId?: string } =
   };
   return {
     execution: {
-      mode: 'production' as const,
-      manifest: {} as never,
+      ...(mode === 'production'
+        ? { mode: 'production' as const, manifest: {} as never }
+        : { mode: 'test' as const, manifest: null }),
       trace: {
         traceId: ids.trace,
         spanId: run.span_id,
@@ -156,10 +170,11 @@ describe('quality-loop durable history', () => {
   beforeEach(() => {
     state.order = [];
     state.appendInput = null;
-    state.candidateDocument = currentCandidateDocument();
+    state.candidateVersion = evaluatedCandidateVersion();
+    state.currentDocumentReads = 0;
   });
 
-  it('inserts the exact durable grade before materializing and advancing loop state', async () => {
+  it('binds the durable grade to the exact candidate version evaluated before a later editable revision', async () => {
     const adapterContext = context();
     const execution = await executeLogicNode(adapterContext);
 
@@ -170,16 +185,17 @@ describe('quality-loop durable history', () => {
       workflowRunId: ids.run,
       sequence: 1,
       automatedRevision: 0,
-      manualRevision: 2,
+      manualRevision: 0,
       candidateTaskId: ids.candidateTask,
-      outputDocumentVersionId: ids.currentOutputVersion,
-      candidateHash: 'c'.repeat(64),
+      outputDocumentVersionId: ids.outputVersion,
+      candidateHash: 'a'.repeat(64),
       graderTaskId: ids.graderTask,
       graderAgentVersionId: ids.graderAgentVersion,
       exitReason: 'quality_passed',
       traceId: ids.trace,
       leaseOwnerId: 'worker-owner',
     });
+    expect(state.currentDocumentReads).toBe(0);
     expect(adapterContext.run.state.nodes).toEqual({
       worker: { text: 'Candidate' },
       grader: { data: { passed: true, score: 91, feedback: [], criteria: [] } },
@@ -191,7 +207,7 @@ describe('quality-loop durable history', () => {
           entryId: ids.entry,
           iteration: 1,
           automatedRevision: 0,
-          manualRevision: 2,
+          manualRevision: 0,
           candidate: { text: 'Candidate' },
           verdict: { passed: true, score: 91, feedback: [], criteria: [] },
           revisionAgentNodeId: 'worker',
@@ -211,17 +227,33 @@ describe('quality-loop durable history', () => {
     expect(adapterContext.run.state.qualityHistory).toBeUndefined();
   });
 
-  it('initializes a missing candidate document before appending the grade', async () => {
-    state.candidateDocument = null;
-    const adapterContext = context();
+  it('keeps successful test-mode quality loops publishable without durable identities', async () => {
+    const adapterContext = context({ mode: 'test', candidateIdentity: false, graderIdentity: false });
 
-    await executeLogicNode(adapterContext);
-
-    expect(state.order).toEqual(['initialize', 'append', 'state']);
-    expect(state.appendInput).toMatchObject({
-      outputDocumentVersionId: ids.currentOutputVersion,
-      candidateHash: 'c'.repeat(64),
+    await expect(executeLogicNode(adapterContext)).resolves.toMatchObject({ result: 'done' });
+    expect(state.order).toEqual(['state']);
+    expect(adapterContext.run.state.qualityHistory).toMatchObject({
+      quality_loop: [{ iteration: 1, verdict: { score: 91 } }],
     });
+  });
+
+  it('keeps in-flight exact production quality loops running when no identities were ever stored', async () => {
+    const adapterContext = context({ candidateIdentity: false, graderIdentity: false, storedIdentities: false });
+
+    await expect(executeLogicNode(adapterContext)).resolves.toMatchObject({ result: 'done' });
+    expect(state.order).toEqual(['state']);
+  });
+
+  it('rejects a mutable grader state verdict that differs from the grader task output', async () => {
+    const adapterContext = context({
+      graderIdentityOutput: { data: { passed: false, score: 12, feedback: ['Rewrite'], criteria: [] } },
+    });
+
+    await expect(executeLogicNode(adapterContext)).rejects.toMatchObject({
+      code: 'QUALITY_GRADER_RESULT_MISMATCH',
+      retryable: false,
+    });
+    expect(state.order).toEqual([]);
   });
 
   it('reconfirms durable history when a retry carries a materialized current entry', async () => {
@@ -233,7 +265,7 @@ describe('quality-loop durable history', () => {
           entryId: ids.entry,
           iteration: 1,
           automatedRevision: 0,
-          manualRevision: 2,
+          manualRevision: 0,
           candidate: { text: 'Candidate' },
           verdict: { passed: true, score: 91, feedback: [], criteria: [] },
           revisionAgentNodeId: 'worker',
