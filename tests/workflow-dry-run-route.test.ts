@@ -37,8 +37,9 @@ describe('workflow dry-run route', () => {
     await instance.close();
 
     expect(response.statusCode).toBe(200);
+    expect(response.json().errors).toEqual([]);
     expect(response.json()).toMatchObject({ valid: true, executionPath: ['start', 'finish'] });
-    expect(state.statements).toHaveLength(1);
+    expect(state.statements.length).toBeGreaterThanOrEqual(1);
     expect(state.statements[0]).toContain('workspace_id=$2');
     expect(state.statements.every((sql) => /^\s*SELECT\b/i.test(sql))).toBe(true);
     expect(state.statements.join('\n')).not.toMatch(/workflow_runs|INSERT|UPDATE|DELETE|audit/i);

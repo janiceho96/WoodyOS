@@ -12,6 +12,7 @@ import { retryPolicy } from '../workflows/definition.js';
 import { toolRequiresApproval, toolRiskLevel, type ToolRecord } from '../tools/runtime.js';
 import { workflowLayoutErrors, workflowLayoutInputSchema } from '../workflows/layout.js';
 import {
+  buildWorkflowDependencySnapshot,
   buildWorkflowManifest,
   validateManifestCompatibility,
   type ExecutionManifest,
@@ -47,7 +48,7 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
   const agentIds = [...new Set(definition.nodes.filter((node) => ['agent', 'mcp_action'].includes(node.type)).map((node) => node.config.agentId).filter((id): id is string => typeof id === 'string'))];
   const toolIds = [...new Set(definition.nodes.filter((node) => ['action', 'api_action'].includes(node.type)).map((node) => node.config.toolId).filter((id): id is string => typeof id === 'string'))];
   const mcpIds = [...new Set(definition.nodes.filter((node) => node.type === 'mcp_action').map((node) => node.config.mcpToolId).filter((id): id is string => typeof id === 'string'))];
-  const [agents, tools, mcpTools] = await Promise.all([
+  const [agents, tools, mcpTools, dependencyResult] = await Promise.all([
     agentIds.length ? query<{ id: string; version_id: string | null; version: number | null; snapshot: unknown }>(
       `SELECT a.id,v.id version_id,v.version,v.snapshot FROM agents a
        LEFT JOIN agent_versions v ON v.id=a.published_version_id AND v.workspace_id=a.workspace_id
@@ -62,6 +63,21 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
        JOIN agents a ON a.id=access.agent_id AND a.workspace_id=c.workspace_id AND a.status='active'
        WHERE c.workspace_id=$1 AND c.deleted_at IS NULL AND c.enabled=true AND c.health_status='healthy'
          AND t.enabled=true AND t.id=ANY($2::uuid[])`, [workspaceId, mcpIds]) : Promise.resolve({ rows: [] }),
+    buildWorkflowDependencySnapshot({ workspaceId, definition }, { query })
+      .then((dependencies) => ({ dependencies, issues: [] }))
+      .catch((error: unknown) => {
+        const code = typeof (error as { code?: unknown })?.code === 'string'
+          ? String((error as { code: string }).code)
+          : 'DEPENDENCY_PREVIEW_UNAVAILABLE';
+        return {
+          dependencies: undefined,
+          issues: [{
+            code,
+            message: `Execution dependency preview is incomplete: ${error instanceof Error ? error.message : code}`,
+            guidance: 'Publish required agents and choose available workspace resources, then run the preview again.',
+          }],
+        };
+      }),
   ]);
   const mcpById = new Map<string, { id: string; kind: string; risk: string; permissions: string[]; connectionId: string; agentIds: string[]; schema: unknown; schemaHash: string; permissionHash: string }>();
   for (const row of mcpTools.rows) {
@@ -74,6 +90,8 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
     agents: new Map(agents.rows.map((row) => [row.id, { id: row.id, versionId: row.version_id, version: row.version, snapshotHash: canonicalJsonHash(row.snapshot) }])),
     tools: new Map(tools.rows.map((row) => { const config = decryptJson(row.config) as Record<string, unknown>; const schema = config.inputSchema ?? { type: 'object', properties: {} }; const record = { id: row.id, name: '', kind: row.kind as 'api' | 'mcp' | 'plugin' | 'internal', config: row.config, permissions: row.permissions ?? [] }; const risk = toolRiskLevel(record); return [row.id, { id: row.id, kind: row.kind, risk, permissions: [...(row.permissions ?? [])].sort(), requiresApproval: toolRequiresApproval(record), schema, schemaHash: canonicalJsonHash({ schema, endpoint: config.endpoint ?? null, method: config.method ?? null, readOnly: config.readOnly === true }), permissionHash: canonicalJsonHash({ kind: row.kind, permissions: row.permissions ?? [], risk }) }]; })),
     mcpTools: mcpById,
+    dependencies: dependencyResult.dependencies,
+    dependencyIssues: dependencyResult.issues,
   };
 }
 

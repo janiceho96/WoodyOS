@@ -6,7 +6,7 @@ import { api, type Artifact, type Workflow, type WorkflowDefinition, type Workfl
 import { useWorkspace } from '../../app/workspace';
 import { OutputViewer } from '../../components/OutputViewer';
 import { groupInspectorFields, inspectorSectionLabels, type InspectorSection } from './NodeInspector';
-import { replaceWorkflowEdge } from './WorkflowEdge';
+import { deriveWorkflowEdgeCondition, replaceWorkflowEdge } from './WorkflowEdge';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
 import { compact, duration, money, relative } from '../../lib/format';
 import { failureGuidance } from '../../lib/recovery';
@@ -222,10 +222,9 @@ export function WorkflowsPage() {
     if (sourcePort && targetPort && sourcePort.dataType !== 'any' && targetPort.dataType !== 'any' && sourcePort.dataType !== targetPort.dataType) {
       return reportError(`${sourcePort.label} produces ${sourcePort.dataType}, but ${targetPort.label} expects ${targetPort.dataType}.`);
     }
-    let condition = connection.sourceHandle && connection.sourceHandle !== 'output' ? connection.sourceHandle : undefined;
-    if (target.type === 'loop' && !['condition', 'loop'].includes(source.type) && !condition) condition = 'continue';
-    if (source.type === 'condition' && !['true', 'false'].includes(condition ?? '')) return reportError('Use the True or False handle from a Condition.');
-    if (source.type === 'loop' && !['body', 'done'].includes(condition ?? '')) return reportError('Use the Body or Done handle from a Loop.');
+    const derived = deriveWorkflowEdgeCondition(source.type, target.type, connection.sourceHandle);
+    if (derived.error) return reportError(derived.error);
+    const condition = derived.condition;
     if (edges.some((edge) => edge.source === source.id && edge.target === target.id && edge.condition === condition)) return reportError('That connection already exists.');
     const schemaFor = (dataType: string) => dataType === 'text' ? { type: 'string' } : dataType === 'collection' ? { type: 'array' } : dataType === 'any' ? {} : { type: dataType };
     const nextEdge = { source: source.id, target: target.id, sourcePort: sourcePort?.id ?? connection.sourceHandle ?? 'output', targetPort: targetPort?.id ?? connection.targetHandle ?? 'input', sourceSchema: schemaFor(sourcePort?.dataType ?? 'any'), targetSchema: schemaFor(targetPort?.dataType ?? 'any'), required: Boolean(targetPort?.required), nullable: false, ...(condition ? { condition } : {}) };
@@ -242,7 +241,9 @@ export function WorkflowsPage() {
     const sourcePort = catalog.find((entry) => entry.type === source.type)?.outputPorts.find((port) => port.id === (connection.sourceHandle ?? 'output'));
     const targetPort = catalog.find((entry) => entry.type === target.type)?.inputPorts.find((port) => port.id === (connection.targetHandle ?? 'input'));
     const schemaFor = (dataType: string) => dataType === 'text' ? { type: 'string' } : dataType === 'collection' ? { type: 'array' } : dataType === 'any' ? {} : { type: dataType };
-    const condition = source.type === 'condition' || source.type === 'loop' ? (connection.sourceHandle ?? edge.condition) : edge.condition;
+    const derived = deriveWorkflowEdgeCondition(source.type, target.type, connection.sourceHandle);
+    if (derived.error) return reportError(derived.error);
+    const condition = derived.condition;
     commit({ nodes, edges: replaceWorkflowEdge(edges, edge, { source: source.id, target: target.id, condition, sourcePort: sourcePort?.id ?? connection.sourceHandle ?? edge.sourcePort, targetPort: targetPort?.id ?? connection.targetHandle ?? edge.targetPort, sourceSchema: sourcePort ? schemaFor(sourcePort.dataType) : edge.sourceSchema, targetSchema: targetPort ? schemaFor(targetPort.dataType) : edge.targetSchema, required: targetPort ? Boolean(targetPort.required) : edge.required }), positions });
   };
   const deleteEdges = (removed: WorkflowDefinition['edges']) => {

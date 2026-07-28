@@ -113,6 +113,32 @@ describe('workflow dry run', () => {
     expect(changed.manifest.previewHash).not.toBe(first.manifest.previewHash);
   });
 
+  it('hashes the authoritative production dependency snapshot into the preview', async () => {
+    // Break caught: preview hashing ad-hoc resource rows while production freezes more identities.
+    const dependencies = {
+      agents: {},
+      prompts: { '00000000-0000-4000-8000-000000000020': { versionId: '00000000-0000-4000-8000-000000000020', contentHash: 'a'.repeat(64) } },
+      models: {},
+      apiTools: {},
+      mcpActions: {},
+      policy: { version: '1' },
+      adapters: { start: 'logic:1', finish: 'file:1' },
+      outputContracts: { finish: 'b'.repeat(64) },
+      artifactTemplates: {},
+      runtime: { version: '0.1.0', stateSchemaVersion: 1 as const },
+    };
+    const simple = { nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'finish', type: 'output' as const, config: {} }], edges: [{ source: 'start', target: 'finish' }] };
+    const first = await dryRunWorkflow({ workspaceId, definition: simple, input: {}, resources: { ...resources, dependencies } });
+    const changed = await dryRunWorkflow({ workspaceId, definition: simple, input: {}, resources: {
+      ...resources,
+      dependencies: { ...dependencies, prompts: { ...dependencies.prompts, '00000000-0000-4000-8000-000000000020': { versionId: '00000000-0000-4000-8000-000000000020', contentHash: 'c'.repeat(64) } } },
+    } });
+
+    expect(first.manifest.dependenciesHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(changed.manifest.dependenciesHash).not.toBe(first.manifest.dependenciesHash);
+    expect(changed.manifest.previewHash).not.toBe(first.manifest.previewHash);
+  });
+
   it('validates deep contracts, nullable required ports, registered transforms, and fixture-resolved paths', async () => {
     const result = await dryRunWorkflow({ workspaceId, resources, input: { take: true }, definition: {
       nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'check', type: 'condition' as const, config: { path: 'input.take', operator: 'equals', value: true } }, { id: 'yes', type: 'output' as const, config: {} }, { id: 'no', type: 'output' as const, config: {} }],
@@ -124,5 +150,61 @@ describe('workflow dry run', () => {
     } });
     expect(result.executionPath).toEqual(['start', 'check', 'yes']);
     expect(result.errors).toContainEqual(expect.objectContaining({ code: 'NODE_SCHEMA_INCOMPATIBLE', nodeId: 'yes' }));
+  });
+
+  it('derives nested nullability only from the nested schemas', async () => {
+    // Break caught: leaking the edge's top-level nullable flag into recursive child checks.
+    const result = await dryRunWorkflow({ workspaceId, resources, input: {}, definition: {
+      nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'finish', type: 'output' as const, config: {} }],
+      edges: [{
+        source: 'start',
+        target: 'finish',
+        nullable: true,
+        sourceSchema: { type: 'object', nullable: true, properties: { value: { type: 'string' } }, required: ['value'] },
+        targetSchema: { type: 'object', nullable: true, properties: { value: { type: 'string' } }, required: ['value'] },
+      }],
+    } });
+
+    expect(result.errors).not.toContainEqual(expect.objectContaining({ code: 'NODE_SCHEMA_INCOMPATIBLE' }));
+    expect(result.valid).toBe(true);
+  });
+
+  it('multiplies only selected nodes inside each bounded loop body region', async () => {
+    // Break caught: reverse ancestry multiplying loop done paths and later sequential loops.
+    const result = await dryRunWorkflow({ workspaceId, resources, input: { outer: [1], inner: [1], later: [1] }, definition: {
+      nodes: [
+        { id: 'start', type: 'trigger' as const, config: {} },
+        { id: 'outer', type: 'loop' as const, config: { mode: 'forEach', collectionPath: 'input.outer', maxIterations: 3, onLimit: 'fail' } },
+        { id: 'before_inner', type: 'agent' as const, config: { agentId } },
+        { id: 'inner', type: 'loop' as const, config: { mode: 'forEach', collectionPath: 'input.inner', maxIterations: 2, onLimit: 'fail' } },
+        { id: 'nested_work', type: 'agent' as const, config: { agentId } },
+        { id: 'outer_tail', type: 'agent' as const, config: { agentId } },
+        { id: 'after_outer', type: 'agent' as const, config: { agentId } },
+        { id: 'later', type: 'loop' as const, config: { mode: 'forEach', collectionPath: 'input.later', maxIterations: 5, onLimit: 'fail' } },
+        { id: 'later_work', type: 'agent' as const, config: { agentId } },
+        { id: 'finish', type: 'output' as const, config: {} },
+      ],
+      edges: [
+        { source: 'start', target: 'outer' },
+        { source: 'outer', target: 'before_inner', condition: 'body' },
+        { source: 'outer', target: 'after_outer', condition: 'done' },
+        { source: 'before_inner', target: 'inner' },
+        { source: 'inner', target: 'nested_work', condition: 'body' },
+        { source: 'inner', target: 'outer_tail', condition: 'done' },
+        { source: 'nested_work', target: 'inner', condition: 'continue' },
+        { source: 'outer_tail', target: 'outer', condition: 'continue' },
+        { source: 'after_outer', target: 'later' },
+        { source: 'later', target: 'later_work', condition: 'body' },
+        { source: 'later', target: 'finish', condition: 'done' },
+        { source: 'later_work', target: 'later', condition: 'continue' },
+      ],
+    } });
+
+    expect(result.estimatedBudgets).toEqual({
+      agentCalls: 18,
+      maxLoopIterations: 10,
+      externalActions: 0,
+      maxNodeExecutions: 25,
+    });
   });
 });

@@ -512,7 +512,7 @@ export type WorkflowDryRun = {
   estimatedBudgets: { agentCalls: number; maxLoopIterations: number; externalActions: number; maxNodeExecutions: number };
   errors: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
   warnings: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
-  manifest: { definitionHash: string; inputHash: string; previewHash: string };
+  manifest: { definitionHash: string; inputHash: string; dependenciesHash: string; previewHash: string };
 };
 export type WorkflowNodeCatalogEntry = {
   type: WorkflowNode['type'];

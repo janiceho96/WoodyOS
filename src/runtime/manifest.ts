@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Pool, PoolClient } from 'pg';
+import type { QueryResultRow } from 'pg';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { decryptJson } from '../lib/crypto.js';
@@ -25,7 +25,14 @@ export interface ExecutionManifest {
   runtime: { version: string; stateSchemaVersion: 1 };
 }
 
-type Queryable = Pick<Pool | PoolClient, 'query'>;
+export type WorkflowDependencySnapshot = Pick<
+  ExecutionManifest,
+  'agents' | 'prompts' | 'models' | 'apiTools' | 'mcpActions' | 'policy' | 'adapters' | 'outputContracts' | 'artifactTemplates' | 'runtime'
+>;
+
+type Queryable = {
+  query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<{ rows: T[] }>;
+};
 
 type AgentVersionRow = {
   id: string;
@@ -58,6 +65,7 @@ const sensitiveKey = /token|password|secret|authorization|(^|[-_])auth($|[-_])|a
 const RUNTIME_VERSION = process.env.RUNTIME_VERSION ?? '0.1.0';
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const uuidRecord = <T extends z.ZodTypeAny>(entry: T) => z.record(z.string().uuid(), entry);
+const uniqueSorted = (values: string[]) => [...new Set(values)].sort();
 const exactManifestSchema = z.object({
   manifestVersion: z.literal(1),
   createdAt: z.string().datetime(),
@@ -167,7 +175,7 @@ async function publishedAgentVersions(
   workspaceId: string,
   agentIds: string[],
 ) {
-  const uniqueIds = [...new Set(agentIds)];
+  const uniqueIds = uniqueSorted(agentIds);
   if (!uniqueIds.length) return new Map<string, AgentVersionRow>();
   const result = await client.query<AgentVersionRow>(
     `SELECT version.id,version.agent_id,version.version,version.snapshot
@@ -203,7 +211,7 @@ async function apiToolManifest(
   workspaceId: string,
   toolIds: string[],
 ) {
-  const uniqueIds = [...new Set(toolIds)];
+  const uniqueIds = uniqueSorted(toolIds);
   if (!uniqueIds.length) return {};
   const result = await client.query<ToolManifestRow>(
     `SELECT id,kind,config,permissions FROM tools
@@ -218,7 +226,7 @@ async function apiToolManifest(
     return [id, {
       toolId: id,
       schemaHash: canonicalJsonHash(publicToolSchema(tool.config)),
-      permissionHash: canonicalJsonHash({ kind: tool.kind, permissions: tool.permissions }),
+      permissionHash: canonicalJsonHash({ kind: tool.kind, permissions: [...tool.permissions].sort() }),
     }];
   }));
 }
@@ -229,7 +237,7 @@ async function mcpActionManifest(
   agentIds: string[],
   requiredToolIds: string[] = [],
 ) {
-  const uniqueAgentIds = [...new Set(agentIds)];
+  const uniqueAgentIds = uniqueSorted(agentIds);
   if (!uniqueAgentIds.length) {
     if (requiredToolIds.length) throw manifestError('MCP_ACTION_UNAVAILABLE', { toolIds: requiredToolIds });
     return {};
@@ -258,7 +266,7 @@ async function mcpActionManifest(
   );
   const byId = new Map<string, McpManifestRow[]>();
   for (const row of result.rows) byId.set(row.id, [...(byId.get(row.id) ?? []), row]);
-  const missing = [...new Set(requiredToolIds)].filter((id) => !byId.has(id));
+  const missing = uniqueSorted(requiredToolIds).filter((id) => !byId.has(id));
   if (missing.length) throw manifestError('MCP_ACTION_UNAVAILABLE', { toolIds: missing });
   return Object.fromEntries([...byId.entries()].map(([id, rows]) => {
     const row = rows[0];
@@ -278,13 +286,15 @@ async function mcpActionManifest(
           connection: permission.connection_permission,
           tool: permission.tool_permission,
         }))
-        .sort((left, right) => left.agentId.localeCompare(right.agentId))),
+        .sort((left, right) => left.agentId.localeCompare(right.agentId)
+          || left.connection.localeCompare(right.connection)
+          || left.tool.localeCompare(right.tool))),
     }];
   }));
 }
 
 async function promptManifest(client: Queryable, workspaceId: string, versionIds: string[]) {
-  const uniqueIds = [...new Set(versionIds)];
+  const uniqueIds = uniqueSorted(versionIds);
   if (!uniqueIds.length) return {};
   const rows = await client.query<{ id: string; content: string; variables: unknown }>(
     `SELECT version.id,version.content,version.variables
@@ -303,7 +313,7 @@ async function promptManifest(client: Queryable, workspaceId: string, versionIds
 }
 
 async function artifactTemplateManifest(client: Queryable, workspaceId: string, templateIds: string[]) {
-  const uniqueIds = [...new Set(templateIds)];
+  const uniqueIds = uniqueSorted(templateIds);
   if (!uniqueIds.length) return {};
   const rows = await client.query<{ id: string; format: string; design_markdown: string; theme: unknown }>(
     `SELECT id,format,design_markdown,theme FROM artifact_templates
@@ -320,7 +330,7 @@ async function artifactTemplateManifest(client: Queryable, workspaceId: string, 
 }
 
 function agentEntries(versions: Map<string, AgentVersionRow>) {
-  return Object.fromEntries([...versions.entries()].map(([agentId, row]) => [agentId, {
+  return Object.fromEntries([...versions.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([agentId, row]) => [agentId, {
     versionId: row.id,
     version: row.version,
     snapshotHash: canonicalJsonHash(row.snapshot),
@@ -334,7 +344,7 @@ type ModelProviderDescriptor = {
 };
 
 function modelEntries(versions: Map<string, AgentVersionRow>, provider: ModelProviderDescriptor) {
-  return Object.fromEntries([...versions.entries()].map(([agentId, row]) => [agentId, {
+  return Object.fromEntries([...versions.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([agentId, row]) => [agentId, {
     provider: provider.provider,
     model: row.snapshot.model,
     parametersHash: canonicalJsonHash({
@@ -369,6 +379,41 @@ async function modelProvider(client: Queryable, workspaceId: string) {
     baseUrl: baseUrl || null,
     defaultModel: process.env.LLM_DEFAULT_MODEL ?? 'claude-sonnet-4-20250514',
   };
+}
+
+async function workflowDependencySnapshotForVersions(
+  input: { workspaceId: string; definition: WorkflowDefinition },
+  versions: Map<string, AgentVersionRow>,
+  client: Queryable,
+): Promise<WorkflowDependencySnapshot> {
+  const agentIds = workflowAgentIds(input.definition);
+  const [apiTools, mcpActions, prompts, artifactTemplates, provider] = await Promise.all([
+    apiToolManifest(client, input.workspaceId, workflowApiToolIds(input.definition, versions)),
+    mcpActionManifest(client, input.workspaceId, agentIds, workflowMcpToolIds(input.definition)),
+    promptManifest(client, input.workspaceId, workflowPromptVersionIds(input.definition)),
+    artifactTemplateManifest(client, input.workspaceId, workflowArtifactTemplateIds(input.definition)),
+    modelProvider(client, input.workspaceId),
+  ]);
+  return {
+    agents: agentEntries(versions),
+    prompts,
+    models: modelEntries(versions, provider),
+    apiTools,
+    mcpActions,
+    policy: { version: '1' },
+    adapters: workflowAdapters(input.definition),
+    outputContracts: workflowOutputContracts(input.definition),
+    artifactTemplates,
+    runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
+  };
+}
+
+export async function buildWorkflowDependencySnapshot(
+  input: { workspaceId: string; definition: WorkflowDefinition },
+  client: Queryable = db,
+): Promise<WorkflowDependencySnapshot> {
+  const versions = await publishedAgentVersions(client, input.workspaceId, workflowAgentIds(input.definition));
+  return workflowDependencySnapshotForVersions(input, versions, client);
 }
 
 export async function buildTaskManifest(
@@ -422,15 +467,10 @@ export async function buildWorkflowManifest(
     throw manifestError('WORKFLOW_VERSION_DEFINITION_MISMATCH');
   }
 
-  const agentIds = workflowAgentIds(input.definition);
-  const versions = await publishedAgentVersions(client, input.workspaceId, agentIds);
-  const [apiTools, mcpActions, prompts, artifactTemplates, provider] = await Promise.all([
-    apiToolManifest(client, input.workspaceId, workflowApiToolIds(input.definition, versions)),
-    mcpActionManifest(client, input.workspaceId, agentIds, workflowMcpToolIds(input.definition)),
-    promptManifest(client, input.workspaceId, workflowPromptVersionIds(input.definition)),
-    artifactTemplateManifest(client, input.workspaceId, workflowArtifactTemplateIds(input.definition)),
-    modelProvider(client, input.workspaceId),
-  ]);
+  const dependencies = await buildWorkflowDependencySnapshot({
+    workspaceId: input.workspaceId,
+    definition: input.definition,
+  }, client);
 
   return {
     manifestVersion: 1,
@@ -442,16 +482,7 @@ export async function buildWorkflowManifest(
       version: workflowVersion.version,
       definitionHash: canonicalJsonHash(workflowVersion.definition),
     },
-    agents: agentEntries(versions),
-    prompts,
-    models: modelEntries(versions, provider),
-    apiTools,
-    mcpActions,
-    policy: { version: '1' },
-    adapters: workflowAdapters(input.definition),
-    outputContracts: workflowOutputContracts(input.definition),
-    artifactTemplates,
-    runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
+    ...dependencies,
   };
 }
 
@@ -517,10 +548,10 @@ async function fixedAgentVersions(
 }
 
 function workflowAgentIds(definition: WorkflowDefinition) {
-  return definition.nodes
+  return uniqueSorted(definition.nodes
     .filter((node) => node.type === 'agent' || node.type === 'mcp_action')
     .map((node) => node.config.agentId)
-    .filter((id): id is string => typeof id === 'string');
+    .filter((id): id is string => typeof id === 'string'));
 }
 
 function workflowApiToolIds(definition: WorkflowDefinition, versions: Map<string, AgentVersionRow>) {
@@ -534,22 +565,22 @@ function workflowApiToolIds(definition: WorkflowDefinition, versions: Map<string
 }
 
 function workflowMcpToolIds(definition: WorkflowDefinition) {
-  return definition.nodes
+  return uniqueSorted(definition.nodes
     .filter((node) => node.type === 'mcp_action')
     .map((node) => node.config.mcpToolId)
-    .filter((id): id is string => typeof id === 'string');
+    .filter((id): id is string => typeof id === 'string'));
 }
 
 function workflowPromptVersionIds(definition: WorkflowDefinition) {
-  return definition.nodes
+  return uniqueSorted(definition.nodes
     .map((node) => node.config.promptVersionId)
-    .filter((id): id is string => typeof id === 'string');
+    .filter((id): id is string => typeof id === 'string'));
 }
 
 function workflowArtifactTemplateIds(definition: WorkflowDefinition) {
-  return definition.nodes
+  return uniqueSorted(definition.nodes
     .map((node) => node.config.artifactTemplateId)
-    .filter((id): id is string => typeof id === 'string');
+    .filter((id): id is string => typeof id === 'string'));
 }
 
 function workflowAdapters(definition: WorkflowDefinition) {
@@ -565,7 +596,7 @@ function workflowOutputContracts(definition: WorkflowDefinition) {
     .map((node) => [node.id, canonicalJsonHash(
       node.type === 'agent'
         ? String(node.config.outputContract ?? 'text')
-        : { artifactFormats: node.config.artifactFormats ?? [], fromNodeId: node.config.fromNodeId ?? null },
+        : { artifactFormats: Array.isArray(node.config.artifactFormats) ? [...new Set(node.config.artifactFormats)].sort() : [], fromNodeId: node.config.fromNodeId ?? null },
     )]));
 }
 
@@ -652,13 +683,10 @@ export async function assertWorkflowManifestDependencies(
     }
     const agentIds = workflowAgentIds(input.definition);
     const versions = await fixedAgentVersions(client, input.workspaceId, manifest, agentIds);
-    const [apiTools, mcpActions, prompts, artifactTemplates, provider] = await Promise.all([
-      apiToolManifest(client, input.workspaceId, workflowApiToolIds(input.definition, versions)),
-      mcpActionManifest(client, input.workspaceId, agentIds, workflowMcpToolIds(input.definition)),
-      promptManifest(client, input.workspaceId, workflowPromptVersionIds(input.definition)),
-      artifactTemplateManifest(client, input.workspaceId, workflowArtifactTemplateIds(input.definition)),
-      modelProvider(client, input.workspaceId),
-    ]);
+    const dependencies = await workflowDependencySnapshotForVersions({
+      workspaceId: input.workspaceId,
+      definition: input.definition,
+    }, versions, client);
     const current: ExecutionManifest = {
       manifestVersion: 1,
       createdAt: new Date().toISOString(),
@@ -669,16 +697,7 @@ export async function assertWorkflowManifestDependencies(
         version: workflowVersion.version,
         definitionHash: canonicalJsonHash(workflowVersion.definition),
       },
-      agents: agentEntries(versions),
-      prompts,
-      models: modelEntries(versions, provider),
-      apiTools,
-      mcpActions,
-      policy: { version: '1' },
-      adapters: workflowAdapters(input.definition),
-      outputContracts: workflowOutputContracts(input.definition),
-      artifactTemplates,
-      runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
+      ...dependencies,
     };
     assertManifestDependenciesMatch(manifest, current);
   } catch (error) {
