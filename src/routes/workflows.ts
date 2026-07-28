@@ -27,6 +27,7 @@ import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
 import { decryptJson } from '../lib/crypto.js';
 import { canonicalJsonHash } from '../runtime/manifest.js';
 import type { StoredConfig } from '../tools/runtime.js';
+import { toolRiskLevel } from '../tools/runtime.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -48,8 +49,8 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
   const toolIds = [...new Set(definition.nodes.filter((node) => ['action', 'api_action'].includes(node.type)).map((node) => node.config.toolId).filter((id): id is string => typeof id === 'string'))];
   const mcpIds = [...new Set(definition.nodes.filter((node) => node.type === 'mcp_action').map((node) => node.config.mcpToolId).filter((id): id is string => typeof id === 'string'))];
   const [agents, tools, mcpTools] = await Promise.all([
-    agentIds.length ? query<{ id: string; version_id: string | null; version: number | null }>(
-      `SELECT a.id,v.id version_id,v.version FROM agents a
+    agentIds.length ? query<{ id: string; version_id: string | null; version: number | null; snapshot: unknown }>(
+      `SELECT a.id,v.id version_id,v.version,v.snapshot FROM agents a
        LEFT JOIN agent_versions v ON v.id=a.published_version_id AND v.workspace_id=a.workspace_id
        WHERE a.workspace_id=$1 AND a.status='active' AND a.id=ANY($2::uuid[])`, [workspaceId, agentIds]) : Promise.resolve({ rows: [] }),
     toolIds.length ? query<{ id: string; kind: string; permissions: string[]; config: StoredConfig }>(
@@ -70,8 +71,8 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
     else mcpById.set(row.id, { id: row.id, kind: 'mcp', risk: row.risk_level, permissions: [row.connection_permission, row.tool_permission], connectionId: row.connection_id, agentIds: [row.agent_id], schema: row.input_schema, schemaHash: canonicalJsonHash(row.input_schema), permissionHash: canonicalJsonHash({ connection: row.connection_permission, tool: row.tool_permission }) });
   }
   return {
-    agents: new Map(agents.rows.map((row) => [row.id, { id: row.id, versionId: row.version_id, version: row.version }])),
-    tools: new Map(tools.rows.map((row) => { const config = decryptJson(row.config) as Record<string, unknown>; const schema = config.inputSchema ?? { type: 'object', properties: {} }; const risk = config.readOnly === true ? 'read' : 'unknown'; return [row.id, { id: row.id, kind: row.kind, risk, permissions: row.permissions ?? [], schema, schemaHash: canonicalJsonHash(schema), permissionHash: canonicalJsonHash({ kind: row.kind, permissions: row.permissions ?? [], risk }) }]; })),
+    agents: new Map(agents.rows.map((row) => [row.id, { id: row.id, versionId: row.version_id, version: row.version, snapshotHash: canonicalJsonHash(row.snapshot) }])),
+    tools: new Map(tools.rows.map((row) => { const config = decryptJson(row.config) as Record<string, unknown>; const schema = config.inputSchema ?? { type: 'object', properties: {} }; const record = { id: row.id, name: '', kind: row.kind as 'api' | 'mcp' | 'plugin' | 'internal', config: row.config, permissions: row.permissions ?? [] }; const risk = toolRiskLevel(record); return [row.id, { id: row.id, kind: row.kind, risk, permissions: row.permissions ?? [], schema, schemaHash: canonicalJsonHash(schema), permissionHash: canonicalJsonHash({ kind: row.kind, permissions: row.permissions ?? [], risk }) }]; })),
     mcpTools: mcpById,
   };
 }

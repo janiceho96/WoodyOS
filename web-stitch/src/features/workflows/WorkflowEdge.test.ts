@@ -23,6 +23,11 @@ describe('workflow edge editing', () => {
     expect(replaceWorkflowEdge(contracted, contracted[0], { source: 'writer', target: 'reviewer' })).toEqual([{ source: 'writer', target: 'reviewer', sourcePort: 'output', targetPort: 'input', sourceSchema: { type: 'object' }, targetSchema: { type: 'object' }, required: true, nullable: false }]);
   });
 
+  it('updates a condition branch when reconnecting from True to False', () => {
+    const edges = [{ source: 'check', target: 'yes', condition: 'true', sourcePort: 'true', targetPort: 'input' }];
+    expect(replaceWorkflowEdge(edges, edges[0], { source: 'check', target: 'no', condition: 'false', sourcePort: 'false' })).toEqual([{ source: 'check', target: 'no', condition: 'false', sourcePort: 'false', targetPort: 'input' }]);
+  });
+
   it('inserts a node by replacing one edge with two valid edges', () => {
     expect(insertNodeOnEdge(edges, edges[0], 'reviewer')).toEqual([
       { source: 'grader', target: 'loop', condition: 'continue' },

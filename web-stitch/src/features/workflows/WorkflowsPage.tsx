@@ -242,7 +242,8 @@ export function WorkflowsPage() {
     const sourcePort = catalog.find((entry) => entry.type === source.type)?.outputPorts.find((port) => port.id === (connection.sourceHandle ?? 'output'));
     const targetPort = catalog.find((entry) => entry.type === target.type)?.inputPorts.find((port) => port.id === (connection.targetHandle ?? 'input'));
     const schemaFor = (dataType: string) => dataType === 'text' ? { type: 'string' } : dataType === 'collection' ? { type: 'array' } : dataType === 'any' ? {} : { type: dataType };
-    commit({ nodes, edges: replaceWorkflowEdge(edges, edge, { source: source.id, target: target.id, sourcePort: sourcePort?.id ?? connection.sourceHandle ?? edge.sourcePort, targetPort: targetPort?.id ?? connection.targetHandle ?? edge.targetPort, sourceSchema: sourcePort ? schemaFor(sourcePort.dataType) : edge.sourceSchema, targetSchema: targetPort ? schemaFor(targetPort.dataType) : edge.targetSchema, required: targetPort ? Boolean(targetPort.required) : edge.required }), positions });
+    const condition = source.type === 'condition' || source.type === 'loop' ? (connection.sourceHandle ?? edge.condition) : edge.condition;
+    commit({ nodes, edges: replaceWorkflowEdge(edges, edge, { source: source.id, target: target.id, condition, sourcePort: sourcePort?.id ?? connection.sourceHandle ?? edge.sourcePort, targetPort: targetPort?.id ?? connection.targetHandle ?? edge.targetPort, sourceSchema: sourcePort ? schemaFor(sourcePort.dataType) : edge.sourceSchema, targetSchema: targetPort ? schemaFor(targetPort.dataType) : edge.targetSchema, required: targetPort ? Boolean(targetPort.required) : edge.required }), positions });
   };
   const deleteEdges = (removed: WorkflowDefinition['edges']) => {
     commit({ nodes, edges: edges.filter((edge) => !removed.some((candidate) => candidate.source === edge.source && candidate.target === edge.target && candidate.condition === edge.condition)), positions });

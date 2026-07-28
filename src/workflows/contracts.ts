@@ -43,8 +43,8 @@ export function resolveBinding(edge: ContractBinding, nodes: Map<string, Workflo
  * are accepted. Required output into an optional target is safe; no scalar/object/array coercion occurs. */
 export function contractCompatible(binding: ResolvedBinding): boolean {
   const source = binding.sourceSchema.type; const target = binding.targetSchema.type;
-  if (binding.transformId === 'json_parse' && source === 'string' && target === 'object') return true;
-  if (binding.transformId === 'stringify' && target === 'string' && ['object', 'array'].includes(source ?? '')) return true;
+  // Dry-run must never promise a conversion that the runtime does not perform.
+  if (binding.transformId) return false;
   if (!source || !target || source === 'any' || target === 'any') return true;
   if (source !== target) return false;
   if (binding.required && (binding.nullable || binding.sourceSchema.nullable) && !binding.targetSchema.nullable) return false;
