@@ -25,6 +25,7 @@ import {
   assertFencedMutation,
   type ExecutionLeaseContext,
 } from '../runtime/leases.js';
+import { advanceWorkflowCursor, WORKFLOW_STEP_LIMIT } from './traversal.js';
 
 export type { AgentTaskExecutor } from './adapters/types.js';
 export { loopResult } from './adapters/logic.js';
@@ -222,16 +223,6 @@ async function waitNode(run: WorkflowRunRecord, node: WorkflowNode, cursor: Work
   await workflowEvent(run, node.id, 'node.waiting', message, { iterationKey: key, attempt: cursor.attempt }, trace, lease);
 }
 
-function outgoing(definition: WorkflowDefinition, nodeId: string) {
-  return definition.edges.filter((edge) => edge.source === nodeId);
-}
-
-function edgeFor(node: WorkflowNode, edges: WorkflowEdge[], result: unknown) {
-  if (node.type === 'condition') return edges.find((edge) => edge.condition === String(Boolean(result)));
-  if (node.type === 'loop') return edges.find((edge) => edge.condition === result);
-  return edges[0];
-}
-
 function artifactFormats(node: WorkflowNode): ArtifactFormat[] {
   const raw = Array.isArray(node.config.artifactFormats) ? node.config.artifactFormats : [];
   return [...new Set(raw.map((item) => artifactFormatSchema.safeParse(item)).filter((item) => item.success).map((item) => item.data))];
@@ -332,7 +323,7 @@ export async function executeWorkflowStep(
     payload: Record<string, unknown> = {},
     parentTrace: TraceContext = authoritativeTraceContext(run),
   ) => workflowEvent(run, nodeId, type, message, payload, parentTrace, lease);
-  if (run.step_count > 10_000) {
+  if (run.step_count > WORKFLOW_STEP_LIMIT) {
     const failure = workflowFailure('Workflow exceeded the 10000-step safety limit', run.state);
     await transitionActiveRun(
       "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
@@ -458,16 +449,10 @@ export async function executeWorkflowStep(
       }
       return { completed: true, output: finalOutput };
     }
-    const edge = edgeFor(node, outgoing(run.definition_snapshot, node.id), execution.result);
-    if (!edge) throw new Error(`Node ${node.id} did not resolve an outgoing edge`);
+    const advanced = advanceWorkflowCursor(run.definition_snapshot, cursor, node, execution.result);
+    if (!advanced) throw new Error(`Node ${node.id} did not resolve an outgoing edge`);
+    const { edge, cursor: nextCursor } = advanced;
     if (node.type === 'condition' || node.type === 'loop') await emitWorkflowEvent(node.id, 'branch.selected', `Selected ${edge.condition} → ${edge.target}`, { condition: edge.condition, target: edge.target });
-    if (edge.condition === 'continue') {
-      const loop = cursor.loops[edge.target];
-      if (!loop) throw new Error(`Continue edge returned to inactive loop ${edge.target}`);
-      cursor.loops[edge.target] = { iteration: loop.iteration + 1 };
-    }
-    if (node.type === 'loop' && execution.result === 'done') delete cursor.loops[node.id];
-    const nextCursor: WorkflowCursor = { nodeId: edge.target, loops: cursor.loops, attempt: 1, previousNodeId: node.id };
     const nextStep = run.step_count + 1;
     await transitionActiveRun(
       "UPDATE workflow_runs SET status='queued',state=$1,cursor=$2,step_count=$3,updated_at=now() WHERE id=$4 AND status='running' RETURNING id",

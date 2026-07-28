@@ -1,14 +1,15 @@
 import Fastify from 'fastify';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const ids = vi.hoisted(() => ({ workspace: '00000000-0000-4000-8000-000000000001', user: '00000000-0000-4000-8000-000000000002', workflow: '00000000-0000-4000-8000-000000000003', case: '00000000-0000-4000-8000-000000000004', version: '00000000-0000-4000-8000-000000000005', run: '00000000-0000-4000-8000-000000000006' }));
-const state = vi.hoisted(() => ({ statements: [] as string[], selected: null as Record<string, unknown> | null, role: 'member' }));
-const apiDefinition = vi.hoisted(() => ({ nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'external', type: 'api_action', config: { toolId: 'weather-tool', operation: 'weather.lookup' } }, { id: 'finish', type: 'output', config: { fromNodeId: 'external' } }], edges: [{ source: 'start', target: 'external' }, { source: 'external', target: 'finish' }] }));
+const ids = vi.hoisted(() => ({ workspace: '00000000-0000-4000-8000-000000000001', user: '00000000-0000-4000-8000-000000000002', workflow: '00000000-0000-4000-8000-000000000003', case: '00000000-0000-4000-8000-000000000004', version: '00000000-0000-4000-8000-000000000005', run: '00000000-0000-4000-8000-000000000006', apiTool: '00000000-0000-4000-8000-000000000007' }));
+const state = vi.hoisted(() => ({ statements: [] as string[], selected: null as Record<string, unknown> | null, role: 'member', terminalRowCount: 1 }));
+const apiDefinition = vi.hoisted(() => ({ nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'external', type: 'api_action', config: { toolId: ids.apiTool, operation: 'weather.lookup' } }, { id: 'finish', type: 'output', config: { fromNodeId: 'external' } }], edges: [{ source: 'start', target: 'external' }, { source: 'external', target: 'finish' }] }));
 
 const client = vi.hoisted(() => ({ query: vi.fn(async (sql: string) => {
   state.statements.push(sql);
   if (sql.includes('FROM workflow_regression_cases regression')) return { rowCount: state.selected ? 1 : 0, rows: state.selected ? [state.selected] : [] };
   if (sql.includes('INSERT INTO workflow_evaluation_runs')) return { rowCount: 1, rows: [{ id: ids.run }] };
+  if (sql.includes('UPDATE workflow_evaluation_runs')) return { rowCount: state.terminalRowCount, rows: state.terminalRowCount ? [{ id: ids.run, status: 'failed' }] : [] };
   return { rowCount: 0, rows: [] };
 }), release: vi.fn() }));
 
@@ -16,13 +17,12 @@ vi.mock('../src/db/client.js', () => ({
   db: { connect: vi.fn(async () => client) },
   query: vi.fn(async (sql: string) => {
     state.statements.push(sql);
-    if (sql.includes('UPDATE workflow_evaluation_runs')) return { rowCount: 1, rows: [{ id: ids.run, status: 'failed' }] };
     return { rowCount: 0, rows: [] };
   }),
 }));
 vi.mock('../src/runtime/manifest.js', () => ({
-  buildWorkflowManifest: vi.fn(async () => ({ manifestVersion: 1, compatibility: 'exact', createdAt: '2026-07-28T00:00:00.000Z', workflow: { id: ids.workflow, versionId: ids.version, version: 1, definitionHash: 'a'.repeat(64) }, agents: {}, prompts: {}, models: {}, apiTools: {}, mcpActions: {}, policy: { version: '1' }, adapters: {}, outputContracts: {}, artifactTemplates: {}, runtime: { version: '0.1.0', stateSchemaVersion: 1 } })),
-  buildWorkflowDependencySnapshot: vi.fn(), validateManifestCompatibility: vi.fn(() => ({ ok: true, reasons: [] })), canonicalJsonHash: vi.fn(() => 'a'.repeat(64)),
+  buildWorkflowManifest: vi.fn(async () => ({ manifestVersion: 1, compatibility: 'exact', createdAt: '2026-07-28T00:00:00.000Z', workflow: { id: ids.workflow, versionId: ids.version, version: 1, definitionHash: 'a'.repeat(64) }, agents: {}, prompts: {}, models: {}, apiTools: { [ids.apiTool]: { toolId: ids.apiTool, schemaHash: 'b'.repeat(64), permissionHash: 'c'.repeat(64) } }, mcpActions: {}, policy: { version: '1' }, adapters: {}, outputContracts: {}, artifactTemplates: {}, runtime: { version: '0.1.0', stateSchemaVersion: 1 } })),
+  buildWorkflowDependencySnapshot: vi.fn(), assertManifestCompatible: vi.fn((manifest) => manifest), validateManifestCompatibility: vi.fn(() => ({ ok: true, reasons: [] })), canonicalJson: vi.fn((value) => JSON.stringify(value)), canonicalJsonHash: vi.fn(() => 'a'.repeat(64)),
 }));
 vi.mock('../src/queue/task-queue.js', () => ({ enqueueTask: vi.fn(), enqueueWorkflowRun: vi.fn() }));
 vi.mock('../src/lib/audit.js', () => ({ audit: vi.fn() }));
@@ -41,7 +41,7 @@ async function app() {
 
 describe('workflow evaluation route', () => {
   beforeEach(() => {
-    state.statements = []; state.role = 'member'; client.query.mockClear();
+    state.statements = []; state.role = 'member'; state.terminalRowCount = 1; client.query.mockClear();
     state.selected = { case_id: ids.case, case_input: {}, fixtures: {}, assertions: [], version_id: ids.version, definition: apiDefinition };
   });
 
@@ -68,6 +68,19 @@ describe('workflow evaluation route', () => {
     expect(response.statusCode).toBe(409);
     expect(response.json().error).toBe('EVALUATION_MODEL_EXECUTOR_REQUIRED');
     expect(state.statements.some((sql) => sql.includes('INSERT INTO workflow_evaluation_runs'))).toBe(false);
+  });
+
+  it('rolls back the synchronous evaluation transaction when no terminal row can be written', async () => {
+    // Break caught: a process/database interruption committing a durable running evaluation.
+    state.terminalRowCount = 0;
+    const instance = await app();
+    const response = await instance.inject({ method: 'POST', url: `/${ids.workflow}/evaluations`, payload: { caseId: ids.case, workflowVersionId: ids.version } });
+    await instance.close();
+
+    expect(response.statusCode).toBe(500);
+    expect(state.statements).toContain('BEGIN');
+    expect(state.statements).toContain('ROLLBACK');
+    expect(state.statements).not.toContain('COMMIT');
   });
 
   it('keeps the requested workflow version and workspace in the target query', async () => {

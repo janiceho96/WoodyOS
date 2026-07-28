@@ -1599,6 +1599,11 @@ describe.runIf(enabled)('database-backed API flow', () => {
     const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers });
     expect(me.statusCode, me.body).toBe(200);
     const { query } = await import('../src/db/client.js');
+    // 032 has already created the evaluation tables; 033 must be safe to apply repeatedly
+    // during an upgrade and must not recreate or alter the Task 5 schema.
+    const migration = await readFile(new URL('../src/db/migrations/033_workflow_evaluation_manifest_immutability.sql', import.meta.url), 'utf8');
+    await query(migration);
+    await query(migration);
     const workspaceId = me.json().workspace_id as string;
     const actorId = me.json().id as string;
     const definition = { nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'finish', type: 'output', config: {} }], edges: [{ source: 'start', target: 'finish' }] };
@@ -1631,6 +1636,8 @@ describe.runIf(enabled)('database-backed API flow', () => {
       `UPDATE workflow_evaluation_runs SET status='passed',completed_at=now() WHERE id=$1`,
       [evaluation.id],
     )).resolves.toMatchObject({ rowCount: 1 });
+    await query('DELETE FROM workflow_regression_cases WHERE id=$1 AND workspace_id=$2', [regression.id, workspaceId]);
+    await expect(query('SELECT 1 FROM workflow_evaluation_runs WHERE id=$1', [evaluation.id])).resolves.toMatchObject({ rowCount: 0 });
   });
 
   it('blocks new AI work after an enforced local budget is exhausted', async () => {

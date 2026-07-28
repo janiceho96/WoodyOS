@@ -11,6 +11,7 @@ import { artifactFormatSchema } from '../artifacts/types.js';
 import { retryPolicy } from '../workflows/definition.js';
 import { toolRequiresApproval, toolRiskLevel, type ToolRecord } from '../tools/runtime.js';
 import { workflowLayoutErrors, workflowLayoutInputSchema } from '../workflows/layout.js';
+import { workflowContractErrors } from '../workflows/contracts.js';
 import {
   buildWorkflowDependencySnapshot,
   buildWorkflowManifest,
@@ -218,6 +219,7 @@ async function validateMcpActionNodes(workspaceId: string, definition: WorkflowD
 
 async function definitionResourceError(workspaceId: string, definition: WorkflowDefinition) {
   const definitionErrors = workflowDefinitionErrors(definition);
+  definitionErrors.push(...workflowContractErrors(definition));
   if (definitionErrors.length) return { status: 400, body: { error: 'INVALID_WORKFLOW_DEFINITION', details: definitionErrors } };
   if (!(await validateAgentNodes(workspaceId, definition))) return { status: 400, body: { error: 'INVALID_OR_INACTIVE_AGENT_NODE' } };
   const actionValidation = await validateActionNodes(workspaceId, definition);
@@ -507,8 +509,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     const client = await db.connect();
     let evaluationId: string | null = null;
     let trace: ReturnType<typeof createTraceContext> | null = null;
+    let transactionOpen = false;
     try {
-      await client.query('BEGIN');
+      await client.query('BEGIN'); transactionOpen = true;
       const selected = await client.query<{
         case_id: string; case_input: Record<string, unknown>; fixtures: Record<string, unknown>; assertions: unknown;
         version_id: string; definition: WorkflowDefinition;
@@ -539,28 +542,31 @@ export async function workflowRoutes(app: FastifyInstance) {
       );
       evaluationId = created.rows[0]?.id ?? null;
       if (!evaluationId) throw new Error('EVALUATION_RUN_CREATE_FAILED');
-      await client.query('COMMIT');
+      let response: { statusCode: 201 | 409; body: Record<string, unknown>; auditAction: string; auditDetails: Record<string, unknown> };
       try {
-        const result = await runFixtureEvaluation({ definition: target.definition, input: target.case_input, fixtures: target.fixtures, assertions: target.assertions });
-        const terminal = await query(
+        const result = await runFixtureEvaluation({ definition: target.definition, manifest, input: target.case_input, fixtures: target.fixtures, assertions: target.assertions });
+        const terminal = await client.query(
           `UPDATE workflow_evaluation_runs SET status=$1,measurements=$2,assertion_results=$3,completed_at=now()
             WHERE id=$4 AND workspace_id=$5 AND status='running' RETURNING *`,
           [result.status, JSON.stringify(result.measurements), JSON.stringify(result.assertionResults), evaluationId, request.user.workspaceId],
         );
-        await audit(request.user.workspaceId, request.user.sub, 'workflow.evaluation_completed', 'workflow_evaluation_run', evaluationId, { workflowId, workflowVersionId: target.version_id, status: result.status, traceId: trace.traceId });
-        return reply.code(201).send({ ...terminal.rows[0], output: result.output });
+        if (!terminal.rowCount) throw new Error('EVALUATION_RUN_TERMINAL_TRANSITION_FAILED');
+        response = { statusCode: 201, body: { ...terminal.rows[0], output: result.output }, auditAction: 'workflow.evaluation_completed', auditDetails: { workflowId, workflowVersionId: target.version_id, status: result.status, traceId: trace.traceId } };
       } catch (error) {
         const code = typeof (error as { code?: unknown })?.code === 'string' ? String((error as { code: string }).code) : 'EVALUATION_FAILED';
-        const terminal = await query(
+        const terminal = await client.query(
           `UPDATE workflow_evaluation_runs SET status='failed',measurements=$1,assertion_results=$2,completed_at=now()
             WHERE id=$3 AND workspace_id=$4 AND status='running' RETURNING *`,
           [JSON.stringify({ costUsd: 0, durationMs: 0, qualityScore: null }), JSON.stringify([{ code, passed: false, message: error instanceof Error ? error.message : 'Evaluation failed' }]), evaluationId, request.user.workspaceId],
         );
-        await audit(request.user.workspaceId, request.user.sub, 'workflow.evaluation_failed', 'workflow_evaluation_run', evaluationId, { workflowId, workflowVersionId: target.version_id, code, traceId: trace.traceId });
-        return reply.code(409).send({ error: code, evaluation: terminal.rows[0] });
+        if (!terminal.rowCount) throw error;
+        response = { statusCode: 409, body: { error: code, evaluation: terminal.rows[0] }, auditAction: 'workflow.evaluation_failed', auditDetails: { workflowId, workflowVersionId: target.version_id, code, traceId: trace.traceId } };
       }
+      await client.query('COMMIT'); transactionOpen = false;
+      await audit(request.user.workspaceId, request.user.sub, response.auditAction, 'workflow_evaluation_run', evaluationId, response.auditDetails);
+      return reply.code(response.statusCode).send(response.body);
     } catch (error) {
-      await client.query('ROLLBACK');
+      if (transactionOpen) await client.query('ROLLBACK');
       throw error;
     } finally {
       client.release();

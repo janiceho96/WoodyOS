@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { dryRunWorkflow } from '../src/workflows/dry-run.js';
 import { workflowDefinitionSchema } from '../src/workflows/definition.js';
 import { evaluationFixtureKey, runFixtureEvaluation, validateRegressionAssertions } from '../src/workflows/evaluation.js';
+import type { ExecutionManifest } from '../src/runtime/manifest.js';
 
 const workspaceId = '00000000-0000-4000-8000-000000000010';
 const agentId = '00000000-0000-4000-8000-000000000011';
@@ -21,6 +22,11 @@ const definition = {
     { id: 'finish', type: 'output' as const, config: { fromNodeId: 'send' } },
   ],
   edges: [{ source: 'start', target: 'writer' }, { source: 'writer', target: 'send' }, { source: 'send', target: 'finish' }],
+};
+const evaluationManifest: ExecutionManifest = {
+  manifestVersion: 1, createdAt: '2026-07-28T00:00:00.000Z', compatibility: 'exact',
+  workflow: { id: workspaceId, versionId: '00000000-0000-4000-8000-000000000015', version: 1, definitionHash: 'a'.repeat(64) },
+  agents: {}, prompts: {}, models: {}, apiTools: { [toolId]: { toolId, schemaHash: 'b'.repeat(64), permissionHash: 'c'.repeat(64) } }, mcpActions: {}, policy: { version: '1' }, adapters: {}, outputContracts: {}, artifactTemplates: {}, runtime: { version: '0.1.0', stateSchemaVersion: 1 },
 };
 
 describe('workflow dry run', () => {
@@ -245,16 +251,14 @@ describe('workflow regression evaluation', () => {
 
   it('uses a stable fixture identity instead of a live external adapter', async () => {
     // Break caught: an external action reaching a production adapter during an evaluation.
-    const liveAction = vi.fn();
     const result = await runFixtureEvaluation({
       definition: evaluationDefinition,
       input: { city: 'Kuala Lumpur' },
-      fixtures: { [evaluationFixtureKey('api', toolId, 'weather.lookup')]: { temperature: 31 } },
-      liveAction,
+      manifest: evaluationManifest,
+      fixtures: { [evaluationFixtureKey('api', toolId, 'invoke')]: { temperature: 31 } },
       assertions: [{ kind: 'output.json_path', path: 'temperature', operator: 'equals', expected: 31 }],
     });
 
-    expect(liveAction).not.toHaveBeenCalled();
     expect(result.status).toBe('passed');
     expect(result.output).toEqual({ temperature: 31 });
     expect(result.assertionResults).toEqual([{ index: 0, kind: 'output.json_path', passed: true, actual: 31, expected: 31 }]);
@@ -265,9 +269,28 @@ describe('workflow regression evaluation', () => {
     await expect(runFixtureEvaluation({
       definition: evaluationDefinition,
       input: { city: 'Kuala Lumpur' },
+      manifest: evaluationManifest,
       fixtures: {},
       assertions: [],
     })).rejects.toMatchObject({ code: 'EVALUATION_FIXTURE_REQUIRED' });
+  });
+
+  it('resolves the production template input before matching an external fixture', async () => {
+    // Break caught: fixtures returning output even when their captured request no longer matches the workflow mapping.
+    const result = await runFixtureEvaluation({
+      definition: evaluationDefinition, input: { city: 'Kuala Lumpur' }, manifest: evaluationManifest,
+      fixtures: { [evaluationFixtureKey('api', toolId, 'invoke')]: { expectedInput: { city: 'Kuala Lumpur' }, output: { temperature: 31 } } },
+      assertions: [],
+    });
+    expect(result.output).toEqual({ temperature: 31 });
+  });
+
+  it('rejects external resources absent from the pinned manifest', async () => {
+    // Break caught: evaluation fixture keys bypassing the version-pinned dependency snapshot.
+    await expect(runFixtureEvaluation({
+      definition: evaluationDefinition, input: {}, fixtures: { [evaluationFixtureKey('api', toolId, 'invoke')]: {} }, assertions: [],
+      manifest: { ...evaluationManifest, apiTools: {} },
+    })).rejects.toMatchObject({ code: 'EVALUATION_MANIFEST_RESOURCE_MISSING' });
   });
 
   it('requires a fixture for file-backed knowledge sources instead of reading workspace data', async () => {
@@ -277,7 +300,8 @@ describe('workflow regression evaluation', () => {
         nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'knowledge', type: 'knowledge_search' as const, config: { documentId: 'doc-1', operation: 'search' } }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'knowledge' } }],
         edges: [{ source: 'start', target: 'knowledge' }, { source: 'knowledge', target: 'finish' }],
       },
-      input: {}, fixtures: { [evaluationFixtureKey('file', 'doc-1', 'search')]: { matches: [] } }, assertions: [],
+      input: {}, fixtures: { [evaluationFixtureKey('file', 'doc-1', 'read')]: { matches: [] } }, assertions: [],
+      manifest: evaluationManifest,
     });
     expect(result.output).toEqual({ matches: [] });
   });
@@ -289,7 +313,8 @@ describe('workflow regression evaluation', () => {
         nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'loop', type: 'loop' as const, config: { mode: 'forEach', collectionPath: 'input.items', maxIterations: 2 } }, { id: 'lookup', type: 'api_action' as const, config: { toolId, operation: 'lookup' } }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'lookup' } }],
         edges: [{ source: 'start', target: 'loop' }, { source: 'loop', target: 'lookup', condition: 'body' }, { source: 'lookup', target: 'loop', condition: 'continue' }, { source: 'loop', target: 'finish', condition: 'done' }],
       },
-      input: { items: ['one', 'two'] }, fixtures: { [evaluationFixtureKey('api', toolId, 'lookup')]: { ok: true } }, assertions: [],
+      input: { items: ['one', 'two'] }, fixtures: { [evaluationFixtureKey('api', toolId, 'invoke')]: { ok: true } }, assertions: [],
+      manifest: evaluationManifest,
     });
     expect(result.status).toBe('passed');
     expect(result.output).toEqual({ ok: true });
@@ -308,6 +333,7 @@ describe('workflow regression evaluation', () => {
         edges: [{ source: 'start', target: 'finish' }],
       },
       input: {},
+      manifest: evaluationManifest,
       fixtures: {},
       measurements: { costUsd: 0.02, durationMs: 15, qualityScore: 0.9 },
       assertions: [
@@ -321,5 +347,25 @@ describe('workflow regression evaluation', () => {
 
     expect(result.status).toBe('passed');
     expect(result.assertionResults.map((assertion) => assertion.passed)).toEqual([true, true, true, true, true]);
+  });
+
+  it('uses canonical deep JSON equality and validates only the supported schema subset', async () => {
+    // Break caught: object key order changing equality or unsupported JSON Schema keywords being silently ignored.
+    const result = await runFixtureEvaluation({
+      definition: { nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'finish', type: 'output' as const, config: { output: { nested: [{ b: 2, a: 1 }] } } }], edges: [{ source: 'start', target: 'finish' }] },
+      input: {}, manifest: evaluationManifest, fixtures: {},
+      assertions: [{ kind: 'output.json_path', path: 'nested', operator: 'equals', expected: [{ a: 1, b: 2 }] }, { kind: 'output.schema', schema: { type: 'object', required: ['nested'], properties: { nested: { type: 'array', items: { type: 'object', required: ['a'], properties: { a: { type: 'number' } } } } } } }],
+    });
+    expect(result.status).toBe('passed');
+    expect(() => validateRegressionAssertions([{ kind: 'output.schema', schema: { type: 'object', unknownKeyword: true } }])).toThrow(expect.objectContaining({ code: 'EVALUATION_ASSERTION_INVALID' }));
+    expect(() => validateRegressionAssertions([{ kind: 'output.schema', schema: { type: 'object', required: 'not-an-array' } }])).toThrow(expect.objectContaining({ code: 'EVALUATION_ASSERTION_INVALID' }));
+  });
+
+  it('fails closed when a workflow approval has no explicit evaluation fixture', async () => {
+    // Break caught: silently auto-approving a workflow branch in evaluation mode.
+    await expect(runFixtureEvaluation({
+      definition: { nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'approve', type: 'approval' as const, config: {} }, { id: 'finish', type: 'output' as const, config: {} }], edges: [{ source: 'start', target: 'approve' }, { source: 'approve', target: 'finish' }] },
+      input: {}, manifest: evaluationManifest, fixtures: {}, assertions: [],
+    })).rejects.toMatchObject({ code: 'EVALUATION_APPROVAL_FIXTURE_REQUIRED' });
   });
 });

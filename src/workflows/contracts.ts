@@ -1,4 +1,4 @@
-import type { WorkflowEdge, WorkflowNode } from './definition.js';
+import type { WorkflowDefinition, WorkflowEdge, WorkflowNode } from './definition.js';
 import { workflowNodeDefinition, type WorkflowPort } from './registry.js';
 
 export type JsonSchema = { type?: string; nullable?: boolean; items?: JsonSchema; properties?: Record<string, JsonSchema>; required?: string[] };
@@ -60,4 +60,23 @@ export function contractCompatible(binding: ResolvedBinding): boolean {
     }
   }
   return true;
+}
+
+/** Shared route/evaluation contract gate. Runtime adapters do not coerce bindings, so every
+ * executable path must reject an absent required port or incompatible contract before work starts. */
+export function workflowContractErrors(definition: WorkflowDefinition) {
+  const nodes = new Map(definition.nodes.map((node) => [node.id, node]));
+  const bindings = (definition.edges as ContractBinding[]).map((edge) => resolveBinding(edge, nodes));
+  const errors = bindings.flatMap((result) => result.issue ? [result.issue.message] : result.binding && !contractCompatible(result.binding)
+    ? [`Binding ${result.binding.source}.${result.binding.sourcePort} is incompatible with ${result.binding.target}.${result.binding.targetPort}`]
+    : []);
+  for (const node of definition.nodes) {
+    const required = workflowNodeDefinition(node.type)?.inputPorts.filter((port) => port.required) ?? [];
+    for (const port of required) {
+      if (!bindings.some((result) => result.binding?.target === node.id && result.binding.targetPort === port.id)) {
+        errors.push(`Required port ${node.id}.${port.id} has no binding`);
+      }
+    }
+  }
+  return errors;
 }
