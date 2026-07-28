@@ -149,6 +149,103 @@ describe('execution manifest compatibility', () => {
     }, noQueries)).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
   });
 
+  it('resumes standalone tasks created before permission-set canonicalization without accepting permission drift', async () => {
+    // Break caught: sorting a semantic permission set making an otherwise unchanged stored task manifest incompatible.
+    const workspaceId = '00000000-0000-4000-8000-000000000010';
+    const agentId = '00000000-0000-4000-8000-000000000011';
+    const versionId = '00000000-0000-4000-8000-000000000012';
+    const toolId = '00000000-0000-4000-8000-000000000013';
+    const snapshot = {
+      name: 'Legacy task agent',
+      role: 'Worker',
+      goal: 'Complete work',
+      instructions: 'Be exact',
+      personality: null,
+      model: 'model-a',
+      modelConfig: {},
+      capabilities: {},
+      apiToolIds: [toolId],
+      memoryConfig: {},
+      avatarIdentity: {},
+    };
+    const schemaHash = canonicalJsonHash({
+      inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+      endpoint: 'https://api.test/tasks',
+      method: undefined,
+      readOnly: true,
+    });
+    const stored: ExecutionManifest = {
+      ...exactManifest(),
+      agents: { [agentId]: { versionId, version: 1, snapshotHash: canonicalJsonHash(snapshot) } },
+      models: { [agentId]: { provider: 'test-provider', model: 'model-a', parametersHash: canonicalJsonHash({ modelConfig: {}, providerConfig: { baseUrl: null, defaultModel: 'model-a' } }) } },
+      apiTools: {
+        [toolId]: {
+          toolId,
+          schemaHash,
+          permissionHash: canonicalJsonHash({ kind: 'api', permissions: ['records.write', 'records.read'] }),
+        },
+      },
+      adapters: { agent: '1', api: '1', mcp: '1' },
+      outputContracts: { task: canonicalJsonHash('text') },
+    };
+    const clientFor = (permissions: string[]) => ({
+      query: async (sql: string) => {
+        if (sql.includes('FROM agent_versions')) return { rows: [{ id: versionId, agent_id: agentId, version: 1, snapshot }] };
+        if (sql.includes('FROM tools')) return { rows: [{ id: toolId, kind: 'api', config: encryptJson({ endpoint: 'https://api.test/tasks', readOnly: true }), permissions }] };
+        if (sql.includes('FROM mcp_connection_tools')) return { rows: [] };
+        if (sql.includes('FROM workspace_ai_provider_configs')) return { rows: [{ provider: 'test-provider', base_url: null, default_model: 'model-a' }] };
+        throw new Error(`Unexpected task dependency query: ${sql}`);
+      },
+    });
+    process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
+
+    await expect(assertTaskManifestDependencies({ workspaceId, agentId, manifest: stored }, clientFor(['records.write', 'records.read']))).resolves.toBeUndefined();
+    await expect(assertTaskManifestDependencies({ workspaceId, agentId, manifest: stored }, clientFor(['records.write', 'records.delete']))).rejects.toMatchObject({
+      code: 'RUN_MANIFEST_INCOMPATIBLE',
+    });
+  });
+
+  it('resumes workflow runs created before output-format canonicalization', async () => {
+    // Break caught: sorting output artifact formats invalidating a queued run whose published definition is unchanged.
+    const workspaceId = '00000000-0000-4000-8000-000000000020';
+    const workflowId = '00000000-0000-4000-8000-000000000021';
+    const workflowVersionId = '00000000-0000-4000-8000-000000000022';
+    const definition = {
+      nodes: [
+        { id: 'start', type: 'trigger' as const, config: {} },
+        { id: 'finish', type: 'output' as const, config: { artifactFormats: ['xlsx', 'pdf'] } },
+      ],
+      edges: [{ source: 'start', target: 'finish' }],
+    };
+    const stored: ExecutionManifest = {
+      ...exactManifest(),
+      workflow: {
+        id: workflowId,
+        versionId: workflowVersionId,
+        version: 1,
+        definitionHash: canonicalJsonHash(definition),
+      },
+      adapters: { start: 'logic:1', finish: 'file:1' },
+      outputContracts: {
+        finish: canonicalJsonHash({ artifactFormats: ['xlsx', 'pdf'], fromNodeId: null }),
+      },
+    };
+    const client = {
+      query: async (sql: string) => {
+        if (sql.includes('FROM workflow_versions')) return { rows: [{ id: workflowVersionId, workflow_id: workflowId, version: 1, definition }] };
+        if (sql.includes('FROM workspace_ai_provider_configs')) return { rows: [{ provider: 'test-provider', base_url: null, default_model: 'model-a' }] };
+        throw new Error(`Unexpected workflow dependency query: ${sql}`);
+      },
+    };
+
+    await expect(assertWorkflowManifestDependencies({
+      workspaceId,
+      workflowVersionId,
+      definition,
+      manifest: stored,
+    }, client)).resolves.toBeUndefined();
+  });
+
   it('builds dry-run dependencies with the exact sorted production identities', async () => {
     // Break caught: preview hashing a partial or differently canonicalized dependency set.
     process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');

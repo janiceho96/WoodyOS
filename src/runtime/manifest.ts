@@ -210,6 +210,7 @@ async function apiToolManifest(
   client: Queryable,
   workspaceId: string,
   toolIds: string[],
+  canonicalizePermissionOrder = true,
 ) {
   const uniqueIds = uniqueSorted(toolIds);
   if (!uniqueIds.length) return {};
@@ -226,7 +227,10 @@ async function apiToolManifest(
     return [id, {
       toolId: id,
       schemaHash: canonicalJsonHash(publicToolSchema(tool.config)),
-      permissionHash: canonicalJsonHash({ kind: tool.kind, permissions: [...tool.permissions].sort() }),
+      permissionHash: canonicalJsonHash({
+        kind: tool.kind,
+        permissions: canonicalizePermissionOrder ? [...tool.permissions].sort() : tool.permissions,
+      }),
     }];
   }));
 }
@@ -495,15 +499,22 @@ export function assertManifestCompatible(manifest: unknown) {
 }
 
 export function assertManifestDependenciesMatch(stored: unknown, current: unknown) {
+  assertManifestDependenciesMatchAny(stored, [current]);
+}
+
+function manifestDependenciesMatch(stored: unknown, current: unknown) {
   const storedManifest = assertManifestCompatible(stored);
   const currentManifest = assertManifestCompatible(current);
   const { createdAt: _storedCreatedAt, ...storedDependencies } = storedManifest;
   const { createdAt: _currentCreatedAt, ...currentDependencies } = currentManifest;
-  if (canonicalJsonHash(storedDependencies) !== canonicalJsonHash(currentDependencies)) {
-    throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
-      reasons: ['Execution dependencies changed after the run was created'],
-    });
-  }
+  return canonicalJsonHash(storedDependencies) === canonicalJsonHash(currentDependencies);
+}
+
+function assertManifestDependenciesMatchAny(stored: unknown, currentCandidates: unknown[]) {
+  if (currentCandidates.some((candidate) => manifestDependenciesMatch(stored, candidate))) return;
+  throw manifestError('RUN_MANIFEST_INCOMPATIBLE', {
+    reasons: ['Execution dependencies changed after the run was created'],
+  });
 }
 
 function sameIds(actual: string[], expected: string[]) {
@@ -590,13 +601,20 @@ function workflowAdapters(definition: WorkflowDefinition) {
   ]));
 }
 
-function workflowOutputContracts(definition: WorkflowDefinition) {
+function workflowOutputContracts(definition: WorkflowDefinition, canonicalizeFormatOrder = true) {
   return Object.fromEntries(definition.nodes
     .filter((node) => node.type === 'agent' || node.type === 'output')
     .map((node) => [node.id, canonicalJsonHash(
       node.type === 'agent'
         ? String(node.config.outputContract ?? 'text')
-        : { artifactFormats: Array.isArray(node.config.artifactFormats) ? [...new Set(node.config.artifactFormats)].sort() : [], fromNodeId: node.config.fromNodeId ?? null },
+        : {
+          artifactFormats: Array.isArray(node.config.artifactFormats)
+            ? canonicalizeFormatOrder
+              ? [...new Set(node.config.artifactFormats)].sort()
+              : node.config.artifactFormats
+            : [],
+          fromNodeId: node.config.fromNodeId ?? null,
+        },
     )]));
 }
 
@@ -640,7 +658,17 @@ export async function assertTaskManifestDependencies(
       artifactTemplates: {},
       runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
     };
-    assertManifestDependenciesMatch(manifest, current);
+    if (manifestDependenciesMatch(manifest, current)) return;
+    const legacyApiTools = await apiToolManifest(
+      client,
+      input.workspaceId,
+      version.snapshot.apiToolIds,
+      false,
+    );
+    assertManifestDependenciesMatchAny(manifest, [
+      current,
+      { ...current, apiTools: legacyApiTools },
+    ]);
   } catch (error) {
     asManifestIncompatible(error);
   }
@@ -699,7 +727,21 @@ export async function assertWorkflowManifestDependencies(
       },
       ...dependencies,
     };
-    assertManifestDependenciesMatch(manifest, current);
+    if (manifestDependenciesMatch(manifest, current)) return;
+    const legacyApiTools = await apiToolManifest(
+      client,
+      input.workspaceId,
+      workflowApiToolIds(input.definition, versions),
+      false,
+    );
+    assertManifestDependenciesMatchAny(manifest, [
+      current,
+      {
+        ...current,
+        apiTools: legacyApiTools,
+        outputContracts: workflowOutputContracts(input.definition, false),
+      },
+    ]);
   } catch (error) {
     asManifestIncompatible(error);
   }

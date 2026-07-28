@@ -139,7 +139,26 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
       ? total * bound
       : total;
   }, 1);
-  const estimatedBudgets = { agentCalls: input.definition.nodes.filter((node) => node.type === 'agent' && path.includes(node.id)).reduce((total, node) => total + multiplierFor(node.id), 0), maxLoopIterations, externalActions: externalActions.filter((action) => path.includes(action.nodeId)).reduce((total, action) => total + multiplierFor(action.nodeId), 0), maxNodeExecutions: path.reduce((total, nodeId) => total + multiplierFor(nodeId), 0) };
+  const estimatedBudgets = {
+    agentCalls: input.definition.nodes
+      .filter((node) => node.type === 'agent' && path.includes(node.id))
+      .reduce((total, node) => total + multiplierFor(node.id), 0),
+    maxLoopIterations,
+    externalActions: externalActions
+      .filter((action) => path.includes(action.nodeId))
+      .reduce((total, action) => total + multiplierFor(action.nodeId), 0),
+    maxNodeExecutions: path.reduce((total, nodeId) => {
+      const node = nodes.get(nodeId);
+      const bound = node?.config.maxIterations;
+      return total + (node?.type === 'loop'
+        && typeof bound === 'number'
+        && Number.isInteger(bound)
+        && bound >= 1
+        && bound <= 100
+        ? multiplierFor(nodeId) * (bound + 1)
+        : multiplierFor(nodeId));
+    }, 0),
+  };
   const definitionHash = canonicalJsonHash(input.definition); const inputHash = canonicalJsonHash(input.input);
   const sorted = <T extends { id: string }>(items: Iterable<T>) => [...items].sort((left, right) => left.id.localeCompare(right.id));
   const dependencies = input.resources.dependencies ?? {

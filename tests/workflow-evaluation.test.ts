@@ -204,7 +204,30 @@ describe('workflow dry run', () => {
       agentCalls: 18,
       maxLoopIterations: 10,
       externalActions: 0,
-      maxNodeExecutions: 25,
+      maxNodeExecutions: 39,
+    });
+  });
+
+  it('counts a loop controller for every iteration and its terminal evaluation', async () => {
+    // Break caught: counting the controller once even though runtime evaluates it before each body pass and once to exit.
+    const result = await dryRunWorkflow({ workspaceId, resources, input: { items: [1] }, definition: {
+      nodes: [
+        { id: 'start', type: 'trigger' as const, config: {} },
+        { id: 'loop', type: 'loop' as const, config: { mode: 'forEach', collectionPath: 'input.items', maxIterations: 3, onLimit: 'fail' } },
+        { id: 'work', type: 'agent' as const, config: { agentId } },
+        { id: 'finish', type: 'output' as const, config: {} },
+      ],
+      edges: [
+        { source: 'start', target: 'loop' },
+        { source: 'loop', target: 'work', condition: 'body' },
+        { source: 'loop', target: 'finish', condition: 'done' },
+        { source: 'work', target: 'loop', condition: 'continue' },
+      ],
+    } });
+
+    expect(result.estimatedBudgets).toMatchObject({
+      agentCalls: 3,
+      maxNodeExecutions: 9,
     });
   });
 });
