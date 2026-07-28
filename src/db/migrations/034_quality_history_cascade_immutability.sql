@@ -23,3 +23,8 @@ DROP TRIGGER IF EXISTS quality_history_entries_immutable ON quality_history_entr
 CREATE TRIGGER quality_history_entries_immutable
 BEFORE UPDATE OR DELETE ON quality_history_entries
 FOR EACH ROW EXECUTE FUNCTION reject_quality_history_mutation();
+
+DROP TRIGGER IF EXISTS quality_history_entries_immutable_truncate ON quality_history_entries;
+CREATE TRIGGER quality_history_entries_immutable_truncate
+BEFORE TRUNCATE ON quality_history_entries
+FOR EACH STATEMENT EXECUTE FUNCTION reject_quality_history_mutation();

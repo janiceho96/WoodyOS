@@ -1632,6 +1632,19 @@ describe.runIf(enabled)('database-backed API flow', () => {
       [entry.id],
     )).rejects.toThrow('Quality history entries are immutable');
 
+    const { db } = await import('../src/db/client.js');
+    const truncateClient = await db.connect();
+    try {
+      await truncateClient.query('BEGIN');
+      await truncateClient.query('SAVEPOINT quality_history_truncate');
+      await expect(truncateClient.query('TRUNCATE quality_history_entries')).rejects.toThrow('Quality history entries are immutable');
+      await truncateClient.query('ROLLBACK TO SAVEPOINT quality_history_truncate');
+      await expect(truncateClient.query('SELECT 1 FROM quality_history_entries WHERE id=$1', [entry.id])).resolves.toMatchObject({ rowCount: 1 });
+    } finally {
+      await truncateClient.query('ROLLBACK');
+      truncateClient.release();
+    }
+
     await query('DELETE FROM workflow_runs WHERE id=$1 AND workspace_id=$2', [run.id, workspaceId]);
     const remaining = await query('SELECT 1 FROM quality_history_entries WHERE id=$1', [entry.id]);
     expect(remaining.rowCount).toBe(0);
