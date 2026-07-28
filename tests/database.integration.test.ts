@@ -1594,6 +1594,45 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(remaining.rowCount).toBe(0);
   });
 
+  it('keeps an evaluation execution manifest immutable while allowing terminal results', async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const me = await app.inject({ method: 'GET', url: '/v1/auth/me', headers });
+    expect(me.statusCode, me.body).toBe(200);
+    const { query } = await import('../src/db/client.js');
+    const workspaceId = me.json().workspace_id as string;
+    const actorId = me.json().id as string;
+    const definition = { nodes: [{ id: 'start', type: 'trigger', config: {} }, { id: 'finish', type: 'output', config: {} }], edges: [{ source: 'start', target: 'finish' }] };
+    const workflow = (await query<{ id: string }>(
+      `INSERT INTO workflows(workspace_id,name,definition,created_by)
+       VALUES($1,$2,$3,$4) RETURNING id`,
+      [workspaceId, `Evaluation manifest ${suffix}`, JSON.stringify(definition), actorId],
+    )).rows[0];
+    const version = (await query<{ id: string }>(
+      `INSERT INTO workflow_versions(workspace_id,workflow_id,version,name,definition,published_by)
+       VALUES($1,$2,1,'Evaluation manifest',$3,$4) RETURNING id`,
+      [workspaceId, workflow.id, JSON.stringify(definition), actorId],
+    )).rows[0];
+    const regression = (await query<{ id: string }>(
+      `INSERT INTO workflow_regression_cases(workspace_id,workflow_id,name,input,fixtures,assertions,created_by)
+       VALUES($1,$2,'Manifest case','{}'::jsonb,'{}'::jsonb,'[]'::jsonb,$3) RETURNING id`,
+      [workspaceId, workflow.id, actorId],
+    )).rows[0];
+    const evaluation = (await query<{ id: string }>(
+      `INSERT INTO workflow_evaluation_runs(workspace_id,workflow_version_id,regression_case_id,execution_manifest,trace_id,status)
+       VALUES($1,$2,$3,$4,gen_random_uuid(),'running') RETURNING id`,
+      [workspaceId, version.id, regression.id, JSON.stringify({ manifestVersion: 1, marker: 'original' })],
+    )).rows[0];
+
+    await expect(query(
+      `UPDATE workflow_evaluation_runs SET execution_manifest='{"manifestVersion":1,"marker":"mutated"}'::jsonb WHERE id=$1`,
+      [evaluation.id],
+    )).rejects.toThrow('Workflow evaluation execution manifest is immutable');
+    await expect(query(
+      `UPDATE workflow_evaluation_runs SET status='passed',completed_at=now() WHERE id=$1`,
+      [evaluation.id],
+    )).resolves.toMatchObject({ rowCount: 1 });
+  });
+
   it('blocks new AI work after an enforced local budget is exhausted', async () => {
     const headers = { authorization: `Bearer ${token}` };
     const budget = await app.inject({

@@ -18,6 +18,11 @@ vi.mock('../../api', () => ({
     workflowResources: vi.fn(),
     workflowLayout: vi.fn(),
     workflowRun: vi.fn(),
+    workflowRegressionCases: vi.fn(),
+    workflowEvaluationRuns: vi.fn(),
+    createWorkflowRegressionCase: vi.fn(),
+    runWorkflowEvaluation: vi.fn(),
+    deleteWorkflowRegressionCase: vi.fn(),
   },
 }));
 
@@ -104,6 +109,8 @@ beforeEach(() => {
     positions: [],
     viewport: { x: 0, y: 0, zoom: 1 },
   });
+  vi.mocked(api.workflowRegressionCases).mockResolvedValue({ data: [] });
+  vi.mocked(api.workflowEvaluationRuns).mockResolvedValue({ data: [] });
 });
 
 afterEach(cleanup);
@@ -135,5 +142,7 @@ describe('WorkflowsPage pre-publish review', () => {
     expect(within(review as HTMLElement).getByText('MCP Actions')).toBeTruthy();
     expect(within(review as HTMLElement).getByText('Docs MCP · Search docs')).toBeTruthy();
     expect(within(review as HTMLElement).queryByText('Integrations')).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Fixture-backed checks' })).toBeTruthy();
+    expect(screen.getByText(/no live external action is invoked/i)).toBeTruthy();
   });
 });

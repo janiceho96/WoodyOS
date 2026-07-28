@@ -2,7 +2,7 @@ import type { Connection } from '@xyflow/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Blocks, Bot, BrainCircuit, CheckCircle2, Download, Edit3, Eye, FileOutput, GitBranch, Globe2, LoaderCircle, LockKeyhole, Play, Plus, RefreshCw, Rocket, Save, Search, ShieldCheck, TestTube2, Trash2, Wrench, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type Artifact, type Workflow, type WorkflowDefinition, type WorkflowDryRun, type WorkflowEditorLayout, type WorkflowNode, type WorkflowNodeCatalogEntry, type WorkflowResources, type WorkflowRun } from '../../api';
+import { api, type Artifact, type Workflow, type WorkflowDefinition, type WorkflowDryRun, type WorkflowEditorLayout, type WorkflowNode, type WorkflowNodeCatalogEntry, type WorkflowRegressionCase, type WorkflowResources, type WorkflowRun } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { OutputViewer } from '../../components/OutputViewer';
 import { groupInspectorFields, inspectorSectionLabels, type InspectorSection } from './NodeInspector';
@@ -316,6 +316,7 @@ export function WorkflowsPage() {
         </section>
       </div>
     </div>
+    {savedWorkflow && <WorkflowEvaluationPanel workflow={savedWorkflow} report={report} reportError={reportError}/>}
     <section className="saved-workflows panel"><div className="panel-header"><div><span className="eyebrow">Saved automation</span><h2>Workflows</h2></div></div>{data.workflows.length ? <div className="workflow-list">{data.workflows.map((workflow) => <div key={workflow.id}><span className="workflow-list-icon"><GitBranch size={18}/></span><span><strong>{workflow.name}</strong><small>{workflow.description || `${workflow.definition?.nodes?.length ?? 0} nodes`} · draft r{workflow.draft_revision}{workflow.published_version ? ` · live v${workflow.published_version}` : ''} · updated {relative(workflow.updated_at)}</small></span><Status value={workflow.status}/><button className="button" disabled={loadingWorkflowId === workflow.id} onClick={() => void loadWorkflow(workflow)}>{loadingWorkflowId === workflow.id ? <LoaderCircle className="spin" size={13}/> : <Edit3 size={13}/>}Edit</button><button className="button primary" disabled={workflow.status !== 'published' || !workflow.enabled} onClick={() => { setRunMode('production'); setTestTargetNodeId(null); setRunTarget(workflow); setRunInput('{}'); }}><Play size={14}/>Prepare run</button></div>)}</div> : <EmptyState Icon={GitBranch} title="No saved workflows" text="Build your first process on the canvas and save it."/>}</section>
     {runTarget && <section className="workflow-run-prep panel"><div><span className="eyebrow">{runMode === 'dry-run' ? 'Dry-run fixture input' : runMode === 'test' ? 'Test input' : 'Run input'}</span><h2>{runTarget.name}{testTargetNodeId ? ` · ${testTargetNodeId}` : ''}</h2><p>{runMode === 'dry-run' ? 'This read-only preview never starts adapters, a run, a worker, a queue, or generated files. It checks the saved draft, tenant-scoped resources, permissions, bindings, limits, and budget.' : runMode === 'test' ? testTargetNodeId ? 'Woody follows the real draft path and stops after this node, so mappings and permissions are tested safely.' : 'This isolated test uses the current saved draft and does not change the published version.' : 'This production run uses the immutable published version.'} Provide a JSON object. Safe mappings such as <code>{'{{ input.topic }}'}</code> use these values.</p></div><textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} spellCheck={false}/><div><button className="button" onClick={() => setRunTarget(null)}>Cancel</button><button className="button primary" disabled={run.isPending} onClick={() => run.mutate()}>{run.isPending ? <LoaderCircle className="spin" size={14}/> : runMode === 'dry-run' ? <Search size={14}/> : runMode === 'test' ? <TestTube2 size={14}/> : <Play size={14}/>} {runMode === 'dry-run' ? 'Preview dry run' : runMode === 'test' ? testTargetNodeId ? 'Test node path' : 'Test draft' : 'Run workflow'}</button></div></section>}
     {dryRunResult && <DryRunPanel result={dryRunResult} dismiss={() => setDryRunResult(null)}/>}
@@ -366,6 +367,45 @@ function ConfigField({ field, node, nodes, resources, update }: { field: Workflo
 function RetryEditor({ retry, update }: { retry: Record<string, unknown>; update: (value: Record<string, unknown>) => void }) {
   const change = (key: string, value: number) => update({ ...retry, [key]: value });
   return <fieldset className="retry-editor"><legend>Retry policy</legend><label>Maximum attempts<input type="number" min="1" max="5" value={Number(retry.maxAttempts ?? 1)} onChange={(event) => change('maxAttempts', Number(event.target.value))}/></label><label>Initial delay (ms)<input type="number" min="0" max="60000" step="500" value={Number(retry.initialDelayMs ?? 1000)} onChange={(event) => change('initialDelayMs', Number(event.target.value))}/></label><label>Backoff multiplier<input type="number" min="1" max="4" step="0.5" value={Number(retry.multiplier ?? 2)} onChange={(event) => change('multiplier', Number(event.target.value))}/></label><label>Maximum delay (ms)<input type="number" min="0" max="300000" step="1000" value={Number(retry.maxDelayMs ?? 60000)} onChange={(event) => change('maxDelayMs', Number(event.target.value))}/></label></fieldset>;
+}
+
+function WorkflowEvaluationPanel({ workflow, report, reportError }: { workflow: Workflow; report: (message: string) => void; reportError: (message: string) => void }) {
+  const queryClient = useQueryClient();
+  const cases = useQuery({ queryKey: ['workflow-regression-cases', workflow.id], queryFn: () => api.workflowRegressionCases(workflow.id) });
+  const history = useQuery({ queryKey: ['workflow-evaluations', workflow.id], queryFn: () => api.workflowEvaluationRuns(workflow.id) });
+  const [name, setName] = useState('Regression case');
+  const [caseInput, setCaseInput] = useState('{}');
+  const [fixtures, setFixtures] = useState('{}');
+  const [assertions, setAssertions] = useState('[\n  {"kind":"output.json_path","path":"result","operator":"equals","expected":"ok"}\n]');
+  const refresh = async () => { await Promise.all([queryClient.invalidateQueries({ queryKey: ['workflow-regression-cases', workflow.id] }), queryClient.invalidateQueries({ queryKey: ['workflow-evaluations', workflow.id] })]); };
+  const create = useMutation({
+    mutationFn: () => api.createWorkflowRegressionCase(workflow.id, { name: name.trim(), input: JSON.parse(caseInput), fixtures: JSON.parse(fixtures), assertions: JSON.parse(assertions) }),
+    onSuccess: async () => { report('Regression case saved.'); await refresh(); },
+    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not save regression case'),
+  });
+  const run = useMutation({
+    mutationFn: (regression: WorkflowRegressionCase) => {
+      if (!workflow.published_version_id) throw new Error('Publish a version before running a regression evaluation.');
+      return api.runWorkflowEvaluation(workflow.id, { caseId: regression.id, workflowVersionId: workflow.published_version_id });
+    },
+    onSuccess: async (result) => { report(result.status === 'passed' ? 'Regression evaluation passed.' : 'Regression evaluation completed with failures.'); await refresh(); },
+    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not run regression evaluation'),
+  });
+  const remove = useMutation({
+    mutationFn: (caseId: string) => api.deleteWorkflowRegressionCase(workflow.id, caseId),
+    onSuccess: async () => { report('Regression case removed.'); await refresh(); },
+    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not remove regression case'),
+  });
+  const regressionCases = cases.data?.data ?? [];
+  const evaluations = history.data?.data ?? [];
+  return <section className="workflow-evaluations panel" aria-label="Workflow regression evaluation">
+    <div className="panel-header"><div><span className="eyebrow">Regression evaluation</span><h2>Fixture-backed checks</h2></div><button className="icon-button" type="button" onClick={() => void refresh()} aria-label="Refresh evaluation history"><RefreshCw size={14}/></button></div>
+    <p>API, app, browser, and file fixtures are replayed locally by stable identity—no live external action is invoked. Each run uses the selected immutable published version and stores its trace and manifest.</p>
+    <p className="inline-warning">Model-node evaluations are unavailable until a pinned model executor is configured. When enabled, they may incur real model cost; Woody will show that disclosure before starting. Replay is available separately.</p>
+    <div className="workflow-evaluation-form"><label>Case name<input value={name} onChange={(event) => setName(event.target.value)} maxLength={160}/></label><label>Input JSON<textarea value={caseInput} onChange={(event) => setCaseInput(event.target.value)} spellCheck={false}/></label><label>Fixtures JSON <small>Use keys like <code>api:tool-id:operation</code></small><textarea value={fixtures} onChange={(event) => setFixtures(event.target.value)} spellCheck={false}/></label><label>Assertions JSON<textarea value={assertions} onChange={(event) => setAssertions(event.target.value)} spellCheck={false}/></label><button className="button" type="button" disabled={create.isPending || !name.trim()} onClick={() => create.mutate()}>{create.isPending ? <LoaderCircle className="spin" size={14}/> : <Plus size={14}/>}Save case</button></div>
+    <div className="workflow-evaluation-list"><h3>Cases</h3>{regressionCases.length ? regressionCases.map((regression) => <article key={regression.id}><span><strong>{regression.name}</strong><small>{regression.assertions.length} assertion{regression.assertions.length === 1 ? '' : 's'} · updated {relative(regression.updated_at)}</small></span><button className="button primary" type="button" disabled={!workflow.published_version_id || run.isPending} onClick={() => run.mutate(regression)}><TestTube2 size={14}/>Run</button><button className="icon-button" type="button" aria-label={`Delete ${regression.name}`} disabled={remove.isPending} onClick={() => remove.mutate(regression.id)}><Trash2 size={14}/></button></article>) : <p>No regression cases yet.</p>}</div>
+    <div className="workflow-evaluation-list"><h3>History</h3>{evaluations.length ? evaluations.map((evaluation) => <article key={evaluation.id}><span><strong>{evaluation.regression_case_name ?? 'Regression case'}</strong><small>v{evaluation.workflow_version ?? '?'} · trace {evaluation.trace_id} · {relative(evaluation.started_at)}</small></span><Status value={evaluation.status}/><details><summary>Assertions and measurements</summary><OutputViewer value={{ measurements: evaluation.measurements, assertions: evaluation.assertion_results }}/></details></article>) : <p>No evaluations have run for this workflow.</p>}</div>
+  </section>;
 }
 
 function DryRunPanel({ result, dismiss }: { result: WorkflowDryRun; dismiss: () => void }) {

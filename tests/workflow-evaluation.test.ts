@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { dryRunWorkflow } from '../src/workflows/dry-run.js';
 import { workflowDefinitionSchema } from '../src/workflows/definition.js';
+import { evaluationFixtureKey, runFixtureEvaluation, validateRegressionAssertions } from '../src/workflows/evaluation.js';
 
 const workspaceId = '00000000-0000-4000-8000-000000000010';
 const agentId = '00000000-0000-4000-8000-000000000011';
@@ -229,5 +230,96 @@ describe('workflow dry run', () => {
       agentCalls: 3,
       maxNodeExecutions: 9,
     });
+  });
+});
+
+describe('workflow regression evaluation', () => {
+  const evaluationDefinition = {
+    nodes: [
+      { id: 'start', type: 'trigger' as const, config: {} },
+      { id: 'weather', type: 'api_action' as const, config: { toolId, operation: 'weather.lookup', input: { city: '{{ input.city }}' } } },
+      { id: 'finish', type: 'output' as const, config: { fromNodeId: 'weather' } },
+    ],
+    edges: [{ source: 'start', target: 'weather' }, { source: 'weather', target: 'finish' }],
+  };
+
+  it('uses a stable fixture identity instead of a live external adapter', async () => {
+    // Break caught: an external action reaching a production adapter during an evaluation.
+    const liveAction = vi.fn();
+    const result = await runFixtureEvaluation({
+      definition: evaluationDefinition,
+      input: { city: 'Kuala Lumpur' },
+      fixtures: { [evaluationFixtureKey('api', toolId, 'weather.lookup')]: { temperature: 31 } },
+      liveAction,
+      assertions: [{ kind: 'output.json_path', path: 'temperature', operator: 'equals', expected: 31 }],
+    });
+
+    expect(liveAction).not.toHaveBeenCalled();
+    expect(result.status).toBe('passed');
+    expect(result.output).toEqual({ temperature: 31 });
+    expect(result.assertionResults).toEqual([{ index: 0, kind: 'output.json_path', passed: true, actual: 31, expected: 31 }]);
+  });
+
+  it('fails closed with a stable code when an external fixture is absent', async () => {
+    // Break caught: treating a missing fixture as permission to call a live integration.
+    await expect(runFixtureEvaluation({
+      definition: evaluationDefinition,
+      input: { city: 'Kuala Lumpur' },
+      fixtures: {},
+      assertions: [],
+    })).rejects.toMatchObject({ code: 'EVALUATION_FIXTURE_REQUIRED' });
+  });
+
+  it('requires a fixture for file-backed knowledge sources instead of reading workspace data', async () => {
+    // Break caught: an evaluation quietly querying a live knowledge/file source.
+    const result = await runFixtureEvaluation({
+      definition: {
+        nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'knowledge', type: 'knowledge_search' as const, config: { documentId: 'doc-1', operation: 'search' } }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'knowledge' } }],
+        edges: [{ source: 'start', target: 'knowledge' }, { source: 'knowledge', target: 'finish' }],
+      },
+      input: {}, fixtures: { [evaluationFixtureKey('file', 'doc-1', 'search')]: { matches: [] } }, assertions: [],
+    });
+    expect(result.output).toEqual({ matches: [] });
+  });
+
+  it('executes bounded fixture-backed loop bodies without reaching a live adapter', async () => {
+    // Break caught: a regression evaluator rejecting normal bounded control flow or losing its loop cursor.
+    const result = await runFixtureEvaluation({
+      definition: {
+        nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'loop', type: 'loop' as const, config: { mode: 'forEach', collectionPath: 'input.items', maxIterations: 2 } }, { id: 'lookup', type: 'api_action' as const, config: { toolId, operation: 'lookup' } }, { id: 'finish', type: 'output' as const, config: { fromNodeId: 'lookup' } }],
+        edges: [{ source: 'start', target: 'loop' }, { source: 'loop', target: 'lookup', condition: 'body' }, { source: 'lookup', target: 'loop', condition: 'continue' }, { source: 'loop', target: 'finish', condition: 'done' }],
+      },
+      input: { items: ['one', 'two'] }, fixtures: { [evaluationFixtureKey('api', toolId, 'lookup')]: { ok: true } }, assertions: [],
+    });
+    expect(result.status).toBe('passed');
+    expect(result.output).toEqual({ ok: true });
+  });
+
+  it('rejects malformed assertions rather than treating them as passing', () => {
+    // Break caught: a typo in a regression rule silently producing a successful evaluation.
+    expect(() => validateRegressionAssertions([{ kind: 'cost_usd', operator: '<=', expected: -1 }])).toThrow(expect.objectContaining({ code: 'EVALUATION_ASSERTION_INVALID' }));
+  });
+
+  it('evaluates bounded quality, cost, duration, contains, and schema assertions deterministically', async () => {
+    // Break caught: independently valid assertion kinds being skipped or using inconsistent pass semantics.
+    const result = await runFixtureEvaluation({
+      definition: {
+        nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'finish', type: 'output' as const, config: { output: { summary: 'safe output', score: 0.9 } } }],
+        edges: [{ source: 'start', target: 'finish' }],
+      },
+      input: {},
+      fixtures: {},
+      measurements: { costUsd: 0.02, durationMs: 15, qualityScore: 0.9 },
+      assertions: [
+        { kind: 'output.json_path', path: 'summary', operator: 'contains', expected: 'safe' },
+        { kind: 'output.schema', schema: { type: 'object', required: ['summary', 'score'], properties: { summary: { type: 'string' }, score: { type: 'number' } } } },
+        { kind: 'cost_usd', operator: '<=', expected: 0.02 },
+        { kind: 'duration_ms', operator: '<=', expected: 15 },
+        { kind: 'quality.score', operator: '>=', expected: 0.9 },
+      ],
+    });
+
+    expect(result.status).toBe('passed');
+    expect(result.assertionResults.map((assertion) => assertion.passed)).toEqual([true, true, true, true, true]);
   });
 });

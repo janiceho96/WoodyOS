@@ -25,12 +25,22 @@ import {
 } from '../runtime/errors.js';
 import { requestCancellation } from '../runtime/cancellation.js';
 import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
+import { runFixtureEvaluation, validateRegressionAssertions } from '../workflows/evaluation.js';
 import { decryptJson } from '../lib/crypto.js';
 import { canonicalJsonHash } from '../runtime/manifest.js';
 import type { StoredConfig } from '../tools/runtime.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
+const regressionCaseInputSchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  input: z.record(z.unknown()).default({}),
+  fixtures: z.record(z.unknown()).default({}),
+  assertions: z.array(z.unknown()).max(100),
+});
+const regressionCaseUpdateSchema = regressionCaseInputSchema.partial().refine((value) => Object.keys(value).length > 0, 'At least one field is required');
+const evaluationRunInputSchema = z.object({ caseId: z.string().uuid(), workflowVersionId: z.string().uuid() });
+type RegressionCasePayload = { name: string; input: Record<string, unknown>; fixtures: Record<string, unknown>; assertions: unknown[] };
 
 type WorkflowRecord = {
   id: string;
@@ -43,6 +53,21 @@ type WorkflowRecord = {
   draft_revision: number;
   published_version_id: string | null;
 };
+
+function regressionCasePayload(input: RegressionCasePayload) {
+  try {
+    validateRegressionAssertions(input.assertions);
+  } catch (error) {
+    const code = typeof (error as { code?: unknown })?.code === 'string' ? String((error as { code: string }).code) : 'EVALUATION_ASSERTION_INVALID';
+    throw Object.assign(new Error(code), { statusCode: 400 });
+  }
+  for (const key of Object.keys(input.fixtures)) {
+    if (!/^(api|mcp|browser|file):.+:.+$/.test(key)) {
+      throw Object.assign(new Error('EVALUATION_FIXTURE_KEY_INVALID'), { statusCode: 400 });
+    }
+  }
+  return input;
+}
 
 async function dryRunResources(workspaceId: string, definition: WorkflowDefinition): Promise<DryRunResources> {
   const agentIds = [...new Set(definition.nodes.filter((node) => ['agent', 'mcp_action'].includes(node.type)).map((node) => node.config.agentId).filter((id): id is string => typeof id === 'string'))];
@@ -406,6 +431,140 @@ export async function workflowRoutes(app: FastifyInstance) {
     if (!result.rowCount) return reply.code(404).send({ error: 'WORKFLOW_NOT_FOUND' });
     await audit(request.user.workspaceId, request.user.sub, 'workflow.deleted', 'workflow', result.rows[0].id);
     return reply.code(204).send();
+  }));
+  app.get('/:id/regression-cases', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const cases = await query(
+      `SELECT id,workspace_id,workflow_id,name,input,fixtures,assertions,created_by,created_at,updated_at
+         FROM workflow_regression_cases
+        WHERE workflow_id=$1 AND workspace_id=$2
+        ORDER BY updated_at DESC,id DESC`,
+      [(request.params as { id: string }).id, request.user.workspaceId],
+    );
+    return { data: cases.rows };
+  }));
+  app.post('/:id/regression-cases', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const input = parse(regressionCaseInputSchema, request.body, reply); if (!input) return;
+    const payload = regressionCasePayload({ name: input.name, input: input.input ?? {}, fixtures: input.fixtures ?? {}, assertions: input.assertions });
+    const workflowId = (request.params as { id: string }).id;
+    const created = await query(
+      `INSERT INTO workflow_regression_cases(workspace_id,workflow_id,name,input,fixtures,assertions,created_by)
+       SELECT $1,id,$2,$3,$4,$5,$6 FROM workflows WHERE id=$7 AND workspace_id=$1 AND status <> 'archived'
+       RETURNING id,workspace_id,workflow_id,name,input,fixtures,assertions,created_by,created_at,updated_at`,
+      [request.user.workspaceId, payload.name, JSON.stringify(payload.input), JSON.stringify(payload.fixtures), JSON.stringify(payload.assertions), request.user.sub, workflowId],
+    );
+    if (!created.rowCount) return reply.code(404).send({ error: 'WORKFLOW_NOT_FOUND' });
+    await audit(request.user.workspaceId, request.user.sub, 'workflow.regression_case_created', 'workflow_regression_case', created.rows[0].id, { workflowId });
+    return reply.code(201).send(created.rows[0]);
+  }));
+  app.patch('/:id/regression-cases/:caseId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const update = parse(regressionCaseUpdateSchema, request.body, reply); if (!update) return;
+    const existing = await query<{ id: string; name: string; input: Record<string, unknown>; fixtures: Record<string, unknown>; assertions: unknown }>(
+      `SELECT id,name,input,fixtures,assertions FROM workflow_regression_cases
+        WHERE id=$1 AND workflow_id=$2 AND workspace_id=$3`,
+      [(request.params as { caseId: string }).caseId, (request.params as { id: string }).id, request.user.workspaceId],
+    );
+    if (!existing.rowCount) return reply.code(404).send({ error: 'WORKFLOW_REGRESSION_CASE_NOT_FOUND' });
+    const payload = regressionCasePayload({
+      name: update.name ?? existing.rows[0].name,
+      input: update.input ?? existing.rows[0].input,
+      fixtures: update.fixtures ?? existing.rows[0].fixtures,
+      assertions: update.assertions ?? (Array.isArray(existing.rows[0].assertions) ? existing.rows[0].assertions : []),
+    });
+    const saved = await query(
+      `UPDATE workflow_regression_cases SET name=$1,input=$2,fixtures=$3,assertions=$4,updated_at=now()
+        WHERE id=$5 AND workflow_id=$6 AND workspace_id=$7
+        RETURNING id,workspace_id,workflow_id,name,input,fixtures,assertions,created_by,created_at,updated_at`,
+      [payload.name, JSON.stringify(payload.input), JSON.stringify(payload.fixtures), JSON.stringify(payload.assertions), existing.rows[0].id, (request.params as { id: string }).id, request.user.workspaceId],
+    );
+    await audit(request.user.workspaceId, request.user.sub, 'workflow.regression_case_updated', 'workflow_regression_case', existing.rows[0].id, { workflowId: (request.params as { id: string }).id });
+    return saved.rows[0];
+  }));
+  app.delete('/:id/regression-cases/:caseId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const removed = await query(
+      `DELETE FROM workflow_regression_cases WHERE id=$1 AND workflow_id=$2 AND workspace_id=$3 RETURNING id`,
+      [(request.params as { caseId: string }).caseId, (request.params as { id: string }).id, request.user.workspaceId],
+    );
+    if (!removed.rowCount) return reply.code(404).send({ error: 'WORKFLOW_REGRESSION_CASE_NOT_FOUND' });
+    await audit(request.user.workspaceId, request.user.sub, 'workflow.regression_case_deleted', 'workflow_regression_case', removed.rows[0].id, { workflowId: (request.params as { id: string }).id });
+    return reply.code(204).send();
+  }));
+  app.get('/:id/evaluations', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request) => ({
+    data: (await query(
+      `SELECT evaluation.id,evaluation.workflow_version_id,evaluation.regression_case_id,evaluation.execution_manifest,evaluation.trace_id,
+              evaluation.status,evaluation.measurements,evaluation.assertion_results,evaluation.started_at,evaluation.completed_at,
+              regression.name regression_case_name,version.version workflow_version
+         FROM workflow_evaluation_runs evaluation
+         JOIN workflow_regression_cases regression ON regression.id=evaluation.regression_case_id AND regression.workspace_id=evaluation.workspace_id
+         JOIN workflow_versions version ON version.id=evaluation.workflow_version_id AND version.workspace_id=evaluation.workspace_id
+        WHERE regression.workflow_id=$1 AND evaluation.workspace_id=$2
+        ORDER BY evaluation.started_at DESC,evaluation.id DESC`,
+      [(request.params as { id: string }).id, request.user.workspaceId],
+    )).rows,
+  })));
+  app.post('/:id/evaluations', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
+    const input = parse(evaluationRunInputSchema, request.body, reply); if (!input) return;
+    const workflowId = (request.params as { id: string }).id;
+    const client = await db.connect();
+    let evaluationId: string | null = null;
+    let trace: ReturnType<typeof createTraceContext> | null = null;
+    try {
+      await client.query('BEGIN');
+      const selected = await client.query<{
+        case_id: string; case_input: Record<string, unknown>; fixtures: Record<string, unknown>; assertions: unknown;
+        version_id: string; definition: WorkflowDefinition;
+      }>(
+        `SELECT regression.id case_id,regression.input case_input,regression.fixtures,regression.assertions,
+                version.id version_id,version.definition
+           FROM workflow_regression_cases regression
+           JOIN workflow_versions version ON version.id=$3 AND version.workflow_id=regression.workflow_id AND version.workspace_id=regression.workspace_id
+          WHERE regression.id=$1 AND regression.workflow_id=$2 AND regression.workspace_id=$4`,
+        [input.caseId, workflowId, input.workflowVersionId, request.user.workspaceId],
+      );
+      if (!selected.rowCount) {
+        await client.query('ROLLBACK');
+        return reply.code(404).send({ error: 'WORKFLOW_EVALUATION_TARGET_NOT_FOUND' });
+      }
+      const target = selected.rows[0];
+      regressionCasePayload({ name: 'validated', input: target.case_input, fixtures: target.fixtures, assertions: target.assertions as unknown[] });
+      if (target.definition.nodes.some((node) => node.type === 'agent')) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ error: 'EVALUATION_MODEL_EXECUTOR_REQUIRED', message: 'Model-node evaluation is not available until a pinned model executor is configured; no evaluation run was created.' });
+      }
+      const manifest = await buildWorkflowManifest({ workspaceId: request.user.workspaceId, workflowVersionId: target.version_id, definition: target.definition }, client);
+      trace = createTraceContext();
+      const created = await client.query<{ id: string }>(
+        `INSERT INTO workflow_evaluation_runs(workspace_id,workflow_version_id,regression_case_id,execution_manifest,trace_id,status)
+         VALUES($1,$2,$3,$4,$5,'running') RETURNING id`,
+        [request.user.workspaceId, target.version_id, target.case_id, JSON.stringify(manifest), trace.traceId],
+      );
+      evaluationId = created.rows[0]?.id ?? null;
+      if (!evaluationId) throw new Error('EVALUATION_RUN_CREATE_FAILED');
+      await client.query('COMMIT');
+      try {
+        const result = await runFixtureEvaluation({ definition: target.definition, input: target.case_input, fixtures: target.fixtures, assertions: target.assertions });
+        const terminal = await query(
+          `UPDATE workflow_evaluation_runs SET status=$1,measurements=$2,assertion_results=$3,completed_at=now()
+            WHERE id=$4 AND workspace_id=$5 AND status='running' RETURNING *`,
+          [result.status, JSON.stringify(result.measurements), JSON.stringify(result.assertionResults), evaluationId, request.user.workspaceId],
+        );
+        await audit(request.user.workspaceId, request.user.sub, 'workflow.evaluation_completed', 'workflow_evaluation_run', evaluationId, { workflowId, workflowVersionId: target.version_id, status: result.status, traceId: trace.traceId });
+        return reply.code(201).send({ ...terminal.rows[0], output: result.output });
+      } catch (error) {
+        const code = typeof (error as { code?: unknown })?.code === 'string' ? String((error as { code: string }).code) : 'EVALUATION_FAILED';
+        const terminal = await query(
+          `UPDATE workflow_evaluation_runs SET status='failed',measurements=$1,assertion_results=$2,completed_at=now()
+            WHERE id=$3 AND workspace_id=$4 AND status='running' RETURNING *`,
+          [JSON.stringify({ costUsd: 0, durationMs: 0, qualityScore: null }), JSON.stringify([{ code, passed: false, message: error instanceof Error ? error.message : 'Evaluation failed' }]), evaluationId, request.user.workspaceId],
+        );
+        await audit(request.user.workspaceId, request.user.sub, 'workflow.evaluation_failed', 'workflow_evaluation_run', evaluationId, { workflowId, workflowVersionId: target.version_id, code, traceId: trace.traceId });
+        return reply.code(409).send({ error: code, evaluation: terminal.rows[0] });
+      }
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }));
   app.post('/:id/dry-run', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(runInputSchema, request.body, reply); if (!input) return;

@@ -514,6 +514,31 @@ export type WorkflowDryRun = {
   warnings: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
   manifest: { definitionHash: string; inputHash: string; dependenciesHash: string; previewHash: string };
 };
+export type WorkflowRegressionCase = {
+  id: string;
+  workspace_id: string;
+  workflow_id: string;
+  name: string;
+  input: Record<string, unknown>;
+  fixtures: Record<string, unknown>;
+  assertions: Array<Record<string, unknown>>;
+  created_at: string;
+  updated_at: string;
+};
+export type WorkflowEvaluationRun = {
+  id: string;
+  workflow_version_id: string;
+  regression_case_id: string;
+  trace_id: string;
+  status: 'running' | 'passed' | 'failed';
+  measurements: { costUsd?: number; durationMs?: number; qualityScore?: number | null };
+  assertion_results: Array<{ index?: number; kind?: string; passed: boolean; actual?: unknown; expected?: unknown; code?: string; message?: string }>;
+  started_at: string;
+  completed_at?: string | null;
+  regression_case_name?: string;
+  workflow_version?: number;
+  output?: unknown;
+};
 export type WorkflowNodeCatalogEntry = {
   type: WorkflowNode['type'];
   category: 'trigger' | 'ai' | 'integration' | 'knowledge' | 'logic' | 'human' | 'output';
@@ -1089,6 +1114,16 @@ export const api = {
     request<WorkflowRun>(`/v1/workflows/${id}/nodes/${encodeURIComponent(nodeId)}/test-runs`, { method: 'POST', body: JSON.stringify({ input }) }),
   dryRunWorkflow: (id: string, input: Record<string, unknown> = {}) =>
     request<WorkflowDryRun>(`/v1/workflows/${id}/dry-run`, { method: 'POST', body: JSON.stringify({ input }) }),
+  workflowRegressionCases: (id: string) => request<{ data: WorkflowRegressionCase[] }>(`/v1/workflows/${id}/regression-cases`),
+  createWorkflowRegressionCase: (id: string, body: Pick<WorkflowRegressionCase, 'name' | 'input' | 'fixtures' | 'assertions'>) =>
+    request<WorkflowRegressionCase>(`/v1/workflows/${id}/regression-cases`, { method: 'POST', body: JSON.stringify(body) }),
+  updateWorkflowRegressionCase: (workflowId: string, caseId: string, body: Partial<Pick<WorkflowRegressionCase, 'name' | 'input' | 'fixtures' | 'assertions'>>) =>
+    request<WorkflowRegressionCase>(`/v1/workflows/${workflowId}/regression-cases/${caseId}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteWorkflowRegressionCase: (workflowId: string, caseId: string) =>
+    request<void>(`/v1/workflows/${workflowId}/regression-cases/${caseId}`, { method: 'DELETE' }),
+  workflowEvaluationRuns: (id: string) => request<{ data: WorkflowEvaluationRun[] }>(`/v1/workflows/${id}/evaluations`),
+  runWorkflowEvaluation: (id: string, body: { caseId: string; workflowVersionId: string }) =>
+    request<WorkflowEvaluationRun>(`/v1/workflows/${id}/evaluations`, { method: 'POST', body: JSON.stringify(body) }),
   publishWorkflow: (id: string) =>
     request<Workflow>(`/v1/workflows/${id}/publish`, { method: 'POST' }),
   workflowRun: (id: string) => request<WorkflowRun>(`/v1/workflows/runs/${id}`),
