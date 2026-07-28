@@ -9,6 +9,7 @@ import {
   disputeMemory,
   expireMemory,
   listEligibleMemories,
+  claimAgentMemoriesForPrompt,
   retrieveAgentMemories,
   supersedeMemory,
 } from '../src/memories/service.js';
@@ -364,8 +365,6 @@ describe('governed memories', () => {
         memoryRow({ id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', workspace_id: '77777777-7777-4777-8777-777777777777', scope: 'workspace', verification_status: 'user_confirmed' }),
       ],
     });
-    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
-
     const results = await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'weekly reports', limit: 8 });
 
     expect(results.map((item) => item.id)).toEqual(['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']);
@@ -384,8 +383,6 @@ describe('governed memories', () => {
         memoryRow({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', scope: 'workspace', verification_status: 'user_confirmed' }),
       ],
     });
-    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
-
     const results = await retrieveAgentMemories({
       workspaceId, agentId, userId, query: 'weekly reports', limit: 8, confirmedOnly: true,
     });
@@ -394,7 +391,7 @@ describe('governed memories', () => {
     expect(state.query.mock.calls[0][0]).toContain("verification_status <> 'agent_inferred'");
   });
 
-  it('uses deterministic score and ID ordering and accounts only for final limited prompt memories', async () => {
+  it('uses deterministic score and ID ordering without accounting candidates before prompt inclusion', async () => {
     state.query.mockResolvedValueOnce({
       rowCount: 3,
       rows: [
@@ -403,19 +400,70 @@ describe('governed memories', () => {
         memoryRow({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', scope: 'workspace', verification_status: 'user_confirmed' }),
       ],
     });
-    state.query.mockResolvedValueOnce({ rowCount: 2, rows: [] });
-
     const results = await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'unrelated', limit: 2 });
 
     expect(results.map((item) => item.id)).toEqual([
       'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
       'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     ]);
+    expect(state.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('claims only still-eligible final prompt memories atomically', async () => {
+    const selected = [{
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', content: 'Weekly reports', memoryType: 'preference' as const,
+      scope: 'workspace' as const, verificationStatus: 'user_confirmed' as const, score: 0.9,
+    }];
+    state.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await expect(claimAgentMemoriesForPrompt({ workspaceId, agentId, userId, selected, confirmedOnly: true }))
+      .resolves.toEqual([]);
+
+    const [sql, values] = state.query.mock.calls[0];
+    expect(sql).toMatch(/access_count=access_count\+1/);
+    expect(sql).toContain("verification_status <> 'agent_inferred'");
+    expect(sql).toContain("scope='agent'");
+    expect(values).toEqual(expect.arrayContaining([workspaceId, agentId, userId]));
+    expect(values[0]).toEqual([selected[0].id]);
+  });
+
+  it('paginates eligible candidates so an older high-trust memory can beat the first 100', async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => memoryRow({
+      id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+      scope: 'workspace', source_type: 'agent', verification_status: 'agent_inferred',
+      content: 'unrelated', importance: 0, confidence: 0,
+    }));
+    const olderWinner = memoryRow({
+      id: 'ffffffff-ffff-4fff-8fff-ffffffffffff', scope: 'workspace', source_type: 'user',
+      verification_status: 'user_confirmed', content: 'weekly reports', importance: 1, confidence: 1,
+      created_at: new Date('2026-04-26T00:00:00.000Z'),
+    });
+    state.query.mockResolvedValueOnce({ rowCount: 100, rows: firstPage });
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [olderWinner] });
+
+    const results = await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'weekly reports', limit: 1 });
+
+    expect(results.map((item) => item.id)).toEqual([olderWinner.id]);
     expect(state.query).toHaveBeenCalledTimes(2);
-    expect(state.query.mock.calls[1][0]).toMatch(/access_count=access_count\+1/);
-    expect(state.query.mock.calls[1][1]).toEqual([
-      ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'],
-      workspaceId,
-    ]);
+  });
+
+  it('uses a database scalar similarity when a query embedding is supplied without selecting vectors', async () => {
+    state.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    await retrieveAgentMemories({ workspaceId, agentId, userId, query: 'weekly reports', queryEmbedding: [0.1, 0.2] });
+
+    const [sql, values] = state.query.mock.calls[0];
+    expect(sql).toContain('embedding <=>');
+    expect(sql).not.toMatch(/,embedding(?:,|\s+FROM)/i);
+    expect(values).toContain('[0.1,0.2]');
+  });
+
+  it('does not let an agent actor forge user source authority', async () => {
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [memoryRow()] });
+    const memory = await createMemory({
+      workspaceId, agentId, type: 'hypothesis', content: 'Forged provenance',
+      source: { type: 'user', id: userId }, actor: { type: 'agent', id: agentId },
+    });
+
+    expect(memory.sourceType).toBe('agent');
   });
 });

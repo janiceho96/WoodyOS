@@ -24,7 +24,7 @@ import { embeddingFor } from './lib/embeddings.js';
 import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from './lib/ai-provider.js';
 import { assertWorkspaceAiBudgetAvailable, estimatedWorkspaceAiCost, recordAiUsage } from './lib/ai-usage.js';
 import { isPublicIp } from './lib/network.js';
-import { agentRuntimeSourceFromSnapshot, resolveAgentRuntimePolicy, retrieveAgentKnowledge } from './lib/agent-runtime.js';
+import { agentRuntimeSourceFromSnapshot, resolveAgentRuntimePolicy, retrieveAgentKnowledge, retrieveAgentMemoryContext } from './lib/agent-runtime.js';
 import {
   anthropicMcpDefinition,
   authorizedMcpTools,
@@ -463,9 +463,20 @@ export async function executeAgentTask(
     let finalText = checkpoint?.state.finalText ?? '';
     let toolCallCount = checkpoint?.state.toolCallCount ?? 0;
     const requestText = `${task.title}\n${JSON.stringify(task.input)}`;
-    const [knowledge, attachments, requestedArtifacts] = await Promise.all([
+    const [knowledge, memoryContext, attachments, requestedArtifacts] = await Promise.all([
       runtimePolicy.knowledgeEnabled
         ? retrieveAgentKnowledge(task.workspace_id, requestText, 4, childTraceContext(taskTrace), signal)
+        : Promise.resolve(''),
+      !checkpoint && runtimePolicy.memoryEnabled
+        ? (async () => retrieveAgentMemoryContext({
+          workspaceId: task.workspace_id,
+          agentId: task.agent_id,
+          userId: task.requested_by,
+          requestText,
+          queryEmbedding: runtimePolicy.memorySemanticEnabled
+            ? await embeddingFor(requestText).catch(() => null) ?? undefined
+            : undefined,
+        }))()
         : Promise.resolve(''),
       retrieveTaskAttachmentContext(task.id, requestText, signal),
       query<{ format: string }>('SELECT format FROM artifacts WHERE task_id=$1 OR ($2::uuid IS NOT NULL AND workflow_run_id=$2) ORDER BY format', [task.id, task.workflow_run_id]),
@@ -486,6 +497,7 @@ export async function executeAgentTask(
       artifactInstruction,
       attachments.text,
       knowledge ? `Use the following workspace knowledge when it is relevant. Do not invent facts beyond it:\n\n${knowledge}` : '',
+      memoryContext,
     ].filter(Boolean).join('\n\n');
     if (anthropic) {
       const toolDefinitions: Tool[] = [...configuredTools.map(definitionFor), ...configuredMcpTools.map(anthropicMcpDefinition)];

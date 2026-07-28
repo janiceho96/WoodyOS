@@ -97,7 +97,9 @@ function resolvedCreate(input: CreateMemoryInput) {
     type,
     scope: input.scope ?? (input.agentId ? 'agent' : input.userId ? 'user' : 'workspace'),
     verificationStatus,
-    sourceType: input.source?.type ?? input.actor?.type ?? 'system',
+    // The actor is authenticated at the route/worker boundary; caller-supplied
+    // source labels are provenance detail, not an authority claim.
+    sourceType: input.actor?.type ?? 'system',
     sourceId: input.source?.id ?? input.actor?.id ?? null,
   };
 }
@@ -310,6 +312,7 @@ export type RetrieveAgentMemoriesInput = {
   limit?: number;
   confirmedOnly?: boolean;
   now?: Date;
+  queryEmbedding?: number[];
 };
 
 export type AgentPromptMemory = {
@@ -332,26 +335,33 @@ export async function retrieveAgentMemories(input: RetrieveAgentMemoriesInput): 
     '(expires_at IS NULL OR expires_at > $4)',
   ];
   if (input.confirmedOnly) conditions.push("verification_status <> 'agent_inferred'");
-  values.push(100);
-  const result = await query<MemoryRow>(
-    `SELECT ${memoryColumns} FROM memories WHERE ${conditions.join(' AND ')}
-      ORDER BY created_at DESC, id ASC LIMIT $${values.length}`,
-    values,
-  );
+  const vector = input.queryEmbedding?.length ? `[${input.queryEmbedding.join(',')}]` : null;
+  if (vector) values.push(vector);
+  const similarityColumn = vector
+    ? `,CASE WHEN embedding IS NULL THEN NULL ELSE 1-(embedding <=> $${values.length}::vector) END semantic_relevance`
+    : ',NULL::real semantic_relevance';
+  const rows: Array<MemoryRow & { semantic_relevance: number | null }> = [];
+  const pageSize = 100;
+  for (let offset = 0; ; offset += pageSize) {
+    const pageValues = [...values, pageSize, offset];
+    const result = await query<MemoryRow & { semantic_relevance: number | null }>(
+      `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}
+        ORDER BY id ASC LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
+      pageValues,
+    );
+    rows.push(...result.rows);
+    if (result.rows.length < pageSize) break;
+  }
   const rankingContext = { ...input, now };
-  const selected = result.rows
-    .map(mapMemory)
-    .filter((memory) => isEligibleMemoryCandidate(memory, rankingContext))
-    .map((memory) => ({ memory, score: rankMemoryCandidate(memory, rankingContext) }))
+  const selected = rows
+    .map((row) => ({ memory: mapMemory(row), semanticRelevance: row.semantic_relevance }))
+    .filter(({ memory }) => isEligibleMemoryCandidate(memory, rankingContext))
+    .map(({ memory, semanticRelevance }) => ({ memory, score: rankMemoryCandidate(memory, {
+      ...rankingContext,
+      semanticRelevance: semanticRelevance ?? undefined,
+    }) }))
     .sort((left, right) => right.score - left.score || left.memory.id.localeCompare(right.memory.id))
     .slice(0, limit);
-
-  if (selected.length) {
-    await query(
-      'UPDATE memories SET last_accessed_at=now(),access_count=access_count+1 WHERE id=ANY($1::uuid[]) AND workspace_id=$2',
-      [selected.map(({ memory }) => memory.id), input.workspaceId],
-    );
-  }
 
   return selected.map(({ memory, score }) => ({
     id: memory.id,
@@ -361,6 +371,37 @@ export async function retrieveAgentMemories(input: RetrieveAgentMemoriesInput): 
     verificationStatus: memory.verificationStatus,
     score,
   }));
+}
+
+export async function claimAgentMemoriesForPrompt(input: {
+  workspaceId: string;
+  agentId: string;
+  userId: string;
+  selected: AgentPromptMemory[];
+  confirmedOnly?: boolean;
+  now?: Date;
+}): Promise<AgentPromptMemory[]> {
+  if (!input.selected.length) return [];
+  const values: unknown[] = [input.selected.map((memory) => memory.id), input.workspaceId, input.agentId, input.userId, input.now ?? new Date()];
+  const conditions = [
+    'id=ANY($1::uuid[])',
+    'workspace_id=$2',
+    "(scope='workspace' OR (scope='agent' AND agent_id=$3) OR (scope='user' AND user_id=$4))",
+    "verification_status NOT IN ('disputed','superseded')",
+    '(expires_at IS NULL OR expires_at > $5)',
+  ];
+  if (input.confirmedOnly) conditions.push("verification_status <> 'agent_inferred'");
+  const claimed = await query<MemoryRow>(
+    `UPDATE memories SET last_accessed_at=now(),access_count=access_count+1
+      WHERE ${conditions.join(' AND ')} RETURNING ${memoryColumns}`,
+    values,
+  );
+  const selectedById = new Map(input.selected.map((memory) => [memory.id, memory]));
+  return claimed.rows
+    .map(mapMemory)
+    .map((memory) => selectedById.get(memory.id))
+    .filter((memory): memory is AgentPromptMemory => Boolean(memory))
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
 }
 
 export function serializeMemory(memory: MemoryRecord) {

@@ -17,6 +17,7 @@ const state = vi.hoisted(() => ({
   controller: new AbortController(),
   finalized: [] as string[],
   providerSignals: [] as Array<AbortSignal | undefined>,
+  providerInputs: [] as Array<{ system?: string }>,
   statements: [] as string[],
   providerError: false,
   workflowManifestError: false,
@@ -35,6 +36,8 @@ const state = vi.hoisted(() => ({
   workflowStepCalls: 0,
   abortLeaseOnWorkflowStep: false,
   takeoverOnTaskTerminal: false,
+  memoryEnabled: true,
+  memoryContext: '',
 }));
 
 const manifest = {
@@ -164,7 +167,7 @@ vi.mock('../src/db/client.js', () => ({
             modelConfig: { temperature: 0.2, maxTokens: 128, topP: 1 },
             capabilities: { webBrowser: false, codeInterpreter: false, knowledgeBase: false },
             apiToolIds: state.withTool ? [ids.tool] : [],
-            memoryConfig: {},
+            memoryConfig: { longTerm: state.memoryEnabled },
           },
         }],
       };
@@ -281,7 +284,8 @@ vi.mock('../src/lib/ai-provider.js', () => ({
     openAiCompatible: null,
     anthropic: {
       messages: {
-        create: vi.fn((_input: unknown, options?: { signal?: AbortSignal }) => {
+        create: vi.fn((input: { system?: string }, options?: { signal?: AbortSignal }) => {
+          state.providerInputs.push(input);
           state.providerSignals.push(options?.signal);
           return {
             withResponse: vi.fn(async () => {
@@ -331,6 +335,7 @@ vi.mock('../src/lib/ai-usage.js', () => ({
 vi.mock('../src/lib/agent-runtime.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/lib/agent-runtime.js')>(),
   retrieveAgentKnowledge: vi.fn(async () => ''),
+  retrieveAgentMemoryContext: vi.fn(async () => state.memoryContext),
 }));
 vi.mock('../src/files/context.js', () => ({
   retrieveTaskAttachmentContext: vi.fn(async () => ({ text: '', citations: [] })),
@@ -385,6 +390,7 @@ describe('task worker cancellation', () => {
     state.controller = new AbortController();
     state.finalized = [];
     state.providerSignals = [];
+    state.providerInputs = [];
     state.statements = [];
     state.providerError = false;
     state.workflowManifestError = false;
@@ -402,6 +408,8 @@ describe('task worker cancellation', () => {
     state.workflowStepCalls = 0;
     state.abortLeaseOnWorkflowStep = false;
     state.takeoverOnTaskTerminal = false;
+    state.memoryEnabled = true;
+    state.memoryContext = '';
   });
 
   it('finalizes queued cancellation without starting the provider', async () => {
@@ -423,6 +431,18 @@ describe('task worker cancellation', () => {
     expect(state.providerSignals[0]?.aborted).toBe(false);
     expect(state.leaseStops).toEqual([ids.task]);
     expect(state.leaseReleases).toEqual([ids.task]);
+  });
+
+  it('includes governed memory in the initial prompt and obeys long-term memory policy', async () => {
+    state.memoryContext = '<UNTRUSTED_MEMORY_CONTEXT>\nMemory fact\n</UNTRUSTED_MEMORY_CONTEXT>';
+    await executeAgentTask(ids.task, ids.trace);
+    expect(state.providerInputs[0]?.system).toContain('<UNTRUSTED_MEMORY_CONTEXT>');
+
+    state.taskStatus = 'queued';
+    state.memoryEnabled = false;
+    state.memoryContext = '<UNTRUSTED_MEMORY_CONTEXT>\nMust not appear\n</UNTRUSTED_MEMORY_CONTEXT>';
+    await executeAgentTask(ids.task, ids.trace);
+    expect(state.providerInputs[1]?.system).not.toContain('Must not appear');
   });
 
   it('finalizes when cancellation wins before a task failure write observes the poll signal', async () => {
