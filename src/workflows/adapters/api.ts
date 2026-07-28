@@ -3,7 +3,10 @@ import { authorizeWorkflowAction, beginWorkflowAction, completeWorkflowAction, f
 import { invokeTool, toolRiskLevel, type ToolRecord } from '../../tools/runtime.js';
 import type { WorkflowAdapterContext } from './types.js';
 import { limitedActionResult } from '../../lib/action-safety.js';
-import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
+import {
+  apiToolManifestEntry,
+  assertWorkflowRunManifestDependencies,
+} from '../../runtime/manifest.js';
 import { childTraceContext } from '../../runtime/trace.js';
 import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/errors.js';
 import { expirationPolicy } from '../../runtime/approval-expiry.js';
@@ -19,10 +22,12 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     [toolId, run.workspace_id],
   )).rows[0];
   if (!tool) throw Object.assign(new Error(`API action ${node.id} references an unavailable tool`), { retryable: false });
+  const manifestEntry = apiToolManifestEntry(tool);
   context.registerActionIdentity({
     adapter: 'api',
     resourceId: tool.id,
-    riskLevel: toolRiskLevel(tool),
+    riskLevel: manifestEntry.riskLevel,
+    manifestEntry,
   });
   execution.signal.throwIfAborted();
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : run.state;

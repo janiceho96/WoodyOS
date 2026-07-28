@@ -2,7 +2,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const gateway = vi.hoisted(() => ({
   failWorkflowAction: vi.fn(async () => undefined),
-  invokeTool: vi.fn(async () => {
+  loadedTool: {
+    id: '00000000-0000-4000-8000-000000000010',
+    name: 'send_update',
+    kind: 'api',
+    config: {},
+    permissions: ['write'],
+  },
+  identitySource: null as unknown,
+  invokedTool: null as unknown,
+  registeredIdentity: null as unknown,
+  invokeTool: vi.fn(async (tool: unknown) => {
+    gateway.invokedTool = tool;
     throw new Error('connection dropped with token=remote-secret');
   }),
 }));
@@ -12,13 +23,7 @@ vi.mock('../src/db/client.js', () => ({
     if (sql.includes('FROM tools')) {
       return {
         rowCount: 1,
-        rows: [{
-          id: '00000000-0000-4000-8000-000000000010',
-          name: 'send_update',
-          kind: 'api',
-          config: {},
-          permissions: ['write'],
-        }],
+        rows: [gateway.loadedTool],
       };
     }
     return { rowCount: 0, rows: [] };
@@ -39,6 +44,15 @@ vi.mock('../src/policy/action-gateway.js', () => ({
 }));
 vi.mock('../src/runtime/manifest.js', () => ({
   assertWorkflowRunManifestDependencies: vi.fn(async () => undefined),
+  apiToolManifestEntry: vi.fn((tool: unknown) => {
+    gateway.identitySource = tool;
+    return {
+      toolId: gateway.loadedTool.id,
+      schemaHash: 'a'.repeat(64),
+      permissionHash: 'b'.repeat(64),
+      riskLevel: 'write',
+    };
+  }),
 }));
 
 import { executeApiActionNode } from '../src/workflows/adapters/api.js';
@@ -49,6 +63,9 @@ describe('action retry safety', () => {
     gateway.failWorkflowAction.mockReset();
     gateway.failWorkflowAction.mockResolvedValue(undefined);
     gateway.invokeTool.mockClear();
+    gateway.identitySource = null;
+    gateway.invokedTool = null;
+    gateway.registeredIdentity = null;
   });
 
   it('maps an uncertain write outcome before it reaches workflow retry authority', async () => {
@@ -187,5 +204,48 @@ describe('action retry safety', () => {
     } as never).catch(() => undefined);
 
     expect(gateway.invokeTool.mock.calls[0]?.[3]).toBe(controller.signal);
+  });
+
+  it('derives retry identity from the same loaded tool object used for execution', async () => {
+    await executeApiActionNode({
+      execution: {
+        mode: 'test',
+        manifest: null,
+        signal: new AbortController().signal,
+        trace: {
+          traceId: '00000000-0000-4000-8000-000000000001',
+          spanId: '00000000-0000-4000-8000-000000000002',
+          parentSpanId: null,
+        },
+      },
+      run: {
+        id: '00000000-0000-4000-8000-000000000003',
+        workspace_id: '00000000-0000-4000-8000-000000000004',
+        created_by: '00000000-0000-4000-8000-000000000005',
+        state: {},
+      },
+      node: {
+        id: 'write',
+        type: 'api_action',
+        config: { toolId: gateway.loadedTool.id, input: {} },
+      },
+      cursor: { nodeId: 'write', loops: {}, attempt: 1 },
+      iterationKey: 'root',
+      resolve: (value: unknown) => value,
+      emitEvent: async () => undefined,
+      setNodeOutput: () => undefined,
+      registerActionIdentity: (identity: unknown) => {
+        gateway.registeredIdentity = identity;
+      },
+    } as never).catch(() => undefined);
+
+    expect(gateway.identitySource).toBe(gateway.loadedTool);
+    expect(gateway.invokedTool).toBe(gateway.loadedTool);
+    expect(gateway.registeredIdentity).toMatchObject({
+      adapter: 'api',
+      resourceId: gateway.loadedTool.id,
+      riskLevel: 'write',
+      manifestEntry: { toolId: gateway.loadedTool.id },
+    });
   });
 });

@@ -61,9 +61,17 @@ export type WorkflowAdapterExecution = {
 };
 
 export type WorkflowActionIdentity = {
-  adapter: 'api' | 'mcp';
+  adapter: 'api';
   resourceId: string;
   riskLevel: WorkflowNodeRisk;
+  manifestEntry: ExecutionManifest['apiTools'][string];
+} | {
+  adapter: 'mcp';
+  resourceId: string;
+  agentId: string;
+  agentManifestEntry?: ExecutionManifest['agents'][string];
+  riskLevel: WorkflowNodeRisk;
+  manifestEntry: ExecutionManifest['mcpActions'][string];
 };
 
 export type WorkflowAdapterContext = {

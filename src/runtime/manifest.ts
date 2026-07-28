@@ -5,8 +5,15 @@ import { db } from '../db/client.js';
 import { decryptJson } from '../lib/crypto.js';
 import type { AgentVersionSnapshot } from '../agents/versions.js';
 import type { WorkflowDefinition } from '../workflows/definition.js';
-import { workflowNodeDefinition } from '../workflows/registry.js';
-import type { StoredConfig } from '../tools/runtime.js';
+import {
+  workflowNodeDefinition,
+  type WorkflowNodeRisk,
+} from '../workflows/registry.js';
+import {
+  toolRiskLevel,
+  type StoredConfig,
+  type ToolRecord,
+} from '../tools/runtime.js';
 
 export interface ExecutionManifest {
   manifestVersion: 1;
@@ -16,8 +23,8 @@ export interface ExecutionManifest {
   agents: Record<string, { versionId: string; version: number; snapshotHash: string }>;
   prompts: Record<string, { versionId: string; contentHash: string }>;
   models: Record<string, { provider: string; model: string; parametersHash: string }>;
-  apiTools: Record<string, { toolId: string; schemaHash: string; permissionHash: string }>;
-  mcpActions: Record<string, { connectionId: string; toolId: string; schemaHash: string; permissionHash: string }>;
+  apiTools: Record<string, { toolId: string; schemaHash: string; permissionHash: string; riskLevel?: WorkflowNodeRisk }>;
+  mcpActions: Record<string, { connectionId: string; toolId: string; schemaHash: string; permissionHash: string; riskLevel?: WorkflowNodeRisk }>;
   policy: { version: string };
   adapters: Record<string, string>;
   outputContracts: Record<string, string>;
@@ -43,12 +50,13 @@ type AgentVersionRow = {
 
 type ToolManifestRow = {
   id: string;
+  name: string;
   kind: string;
   config: StoredConfig;
   permissions: string[];
 };
 
-type McpManifestRow = {
+export type McpManifestRow = {
   id: string;
   agent_id: string;
   connection_id: string;
@@ -94,12 +102,14 @@ const exactManifestSchema = z.object({
     toolId: z.string().uuid(),
     schemaHash: sha256Schema,
     permissionHash: sha256Schema,
+    riskLevel: z.enum(['read', 'write', 'external_write', 'destructive', 'unknown']).optional(),
   }).strict()),
   mcpActions: uuidRecord(z.object({
     connectionId: z.string().uuid(),
     toolId: z.string().uuid(),
     schemaHash: sha256Schema,
     permissionHash: sha256Schema,
+    riskLevel: z.enum(['read', 'write', 'external_write', 'destructive', 'unknown']).optional(),
   }).strict()),
   policy: z.object({ version: z.string().min(1) }).strict(),
   adapters: z.record(z.string().min(1), z.string().min(1)),
@@ -206,6 +216,20 @@ function publicToolSchema(config: StoredConfig) {
   };
 }
 
+export function apiToolManifestEntry(
+  tool: Pick<ToolRecord, 'id' | 'name' | 'kind' | 'config' | 'permissions'>,
+) {
+  return {
+    toolId: tool.id,
+    schemaHash: canonicalJsonHash(publicToolSchema(tool.config)),
+    permissionHash: canonicalJsonHash({
+      kind: tool.kind,
+      permissions: [...tool.permissions].sort(),
+    }),
+    riskLevel: toolRiskLevel(tool),
+  };
+}
+
 async function apiToolManifest(
   client: Queryable,
   workspaceId: string,
@@ -214,24 +238,48 @@ async function apiToolManifest(
   const uniqueIds = uniqueSorted(toolIds);
   if (!uniqueIds.length) return {};
   const result = await client.query<ToolManifestRow>(
-    `SELECT id,kind,config,permissions FROM tools
+    `SELECT id,name,kind,config,permissions FROM tools
       WHERE workspace_id=$1 AND enabled=true AND id=ANY($2::uuid[])`,
     [workspaceId, uniqueIds],
   );
   const rows = new Map(result.rows.map((row) => [row.id, row]));
   const missing = uniqueIds.filter((id) => !rows.has(id));
   if (missing.length) throw manifestError('API_TOOL_UNAVAILABLE', { toolIds: missing });
-  return Object.fromEntries(uniqueIds.map((id) => {
-    const tool = rows.get(id)!;
-    return [id, {
-      toolId: id,
-      schemaHash: canonicalJsonHash(publicToolSchema(tool.config)),
-      permissionHash: canonicalJsonHash({
-        kind: tool.kind,
-        permissions: [...tool.permissions].sort(),
-      }),
-    }];
-  }));
+  return Object.fromEntries(uniqueIds.map((id) => [id, apiToolManifestEntry(
+    rows.get(id)! as Pick<ToolRecord, 'id' | 'name' | 'kind' | 'config' | 'permissions'>,
+  )]));
+}
+
+function canonicalRiskLevel(value: string): WorkflowNodeRisk {
+  return ['read', 'write', 'external_write', 'destructive'].includes(value)
+    ? value as WorkflowNodeRisk
+    : 'unknown';
+}
+
+export function mcpActionManifestEntry(rows: McpManifestRow[]) {
+  if (!rows.length) throw new Error('MCP manifest identity requires at least one authorized tool row');
+  const row = rows[0]!;
+  return {
+    connectionId: row.connection_id,
+    toolId: row.id,
+    schemaHash: canonicalJsonHash({
+      inputSchema: row.input_schema,
+      remoteName: row.remote_name,
+      transport: row.transport,
+      endpoint: row.endpoint_url,
+      riskLevel: row.risk_level,
+    }),
+    permissionHash: canonicalJsonHash(rows
+      .map((permission) => ({
+        agentId: permission.agent_id,
+        connection: permission.connection_permission,
+        tool: permission.tool_permission,
+      }))
+      .sort((left, right) => left.agentId.localeCompare(right.agentId)
+        || left.connection.localeCompare(right.connection)
+        || left.tool.localeCompare(right.tool))),
+    riskLevel: canonicalRiskLevel(row.risk_level),
+  };
 }
 
 async function mcpActionManifest(
@@ -271,29 +319,10 @@ async function mcpActionManifest(
   for (const row of result.rows) byId.set(row.id, [...(byId.get(row.id) ?? []), row]);
   const missing = uniqueSorted(requiredToolIds).filter((id) => !byId.has(id));
   if (missing.length) throw manifestError('MCP_ACTION_UNAVAILABLE', { toolIds: missing });
-  return Object.fromEntries([...byId.entries()].map(([id, rows]) => {
-    const row = rows[0];
-    return [id, {
-      connectionId: row.connection_id,
-      toolId: id,
-      schemaHash: canonicalJsonHash({
-        inputSchema: row.input_schema,
-        remoteName: row.remote_name,
-        transport: row.transport,
-        endpoint: row.endpoint_url,
-        riskLevel: row.risk_level,
-      }),
-      permissionHash: canonicalJsonHash(rows
-        .map((permission) => ({
-          agentId: permission.agent_id,
-          connection: permission.connection_permission,
-          tool: permission.tool_permission,
-        }))
-        .sort((left, right) => left.agentId.localeCompare(right.agentId)
-          || left.connection.localeCompare(right.connection)
-          || left.tool.localeCompare(right.tool))),
-    }];
-  }));
+  return Object.fromEntries([...byId.entries()].map(([id, rows]) => [
+    id,
+    mcpActionManifestEntry(rows),
+  ]));
 }
 
 async function promptManifest(client: Queryable, workspaceId: string, versionIds: string[]) {
@@ -516,6 +545,27 @@ function assertManifestDependenciesMatchAny(stored: unknown, currentCandidates: 
   });
 }
 
+function withoutActionRiskLevels(manifest: ExecutionManifest): ExecutionManifest {
+  return {
+    ...manifest,
+    apiTools: Object.fromEntries(Object.entries(manifest.apiTools).map(([id, entry]) => {
+      const { riskLevel: _riskLevel, ...legacyEntry } = entry;
+      return [id, legacyEntry];
+    })),
+    mcpActions: Object.fromEntries(Object.entries(manifest.mcpActions).map(([id, entry]) => {
+      const { riskLevel: _riskLevel, ...legacyEntry } = entry;
+      return [id, legacyEntry];
+    })),
+  };
+}
+
+function resumeManifestCandidates(candidates: ExecutionManifest[]) {
+  return candidates.flatMap((candidate) => [
+    candidate,
+    withoutActionRiskLevels(candidate),
+  ]);
+}
+
 const LEGACY_V1_PERMISSION_PERMUTATION_LIMIT = 7;
 const LEGACY_V1_PERMISSION_HASH_BUDGET = 20_000;
 const LEGACY_V1_PERMISSION_VALUE_LENGTH_LIMIT = 256;
@@ -728,18 +778,22 @@ export async function assertTaskManifestDependencies(
       artifactTemplates: {},
       runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
     };
-    if (manifestDependenciesMatch(manifest, current)) return;
+    if (resumeManifestCandidates([current]).some((candidate) => (
+      manifestDependenciesMatch(manifest, candidate)
+    ))) return;
     const legacyApiTools = await legacyV1ApiToolCandidate(
       client,
       input.workspaceId,
       manifest.apiTools,
       current.apiTools,
     );
-    if (!legacyApiTools) assertManifestDependenciesMatch(manifest, current);
-    assertManifestDependenciesMatchAny(manifest, [
+    if (!legacyApiTools) {
+      assertManifestDependenciesMatchAny(manifest, resumeManifestCandidates([current]));
+    }
+    assertManifestDependenciesMatchAny(manifest, resumeManifestCandidates([
       current,
       { ...current, apiTools: legacyApiTools! },
-    ]);
+    ]));
   } catch (error) {
     asManifestIncompatible(error);
   }
@@ -798,15 +852,19 @@ export async function assertWorkflowManifestDependencies(
       },
       ...dependencies,
     };
-    if (manifestDependenciesMatch(manifest, current)) return;
+    if (resumeManifestCandidates([current]).some((candidate) => (
+      manifestDependenciesMatch(manifest, candidate)
+    ))) return;
     const legacyApiTools = await legacyV1ApiToolCandidate(
       client,
       input.workspaceId,
       manifest.apiTools,
       current.apiTools,
     );
-    if (!legacyApiTools) assertManifestDependenciesMatch(manifest, current);
-    assertManifestDependenciesMatchAny(manifest, [
+    if (!legacyApiTools) {
+      assertManifestDependenciesMatchAny(manifest, resumeManifestCandidates([current]));
+    }
+    assertManifestDependenciesMatchAny(manifest, resumeManifestCandidates([
       current,
       {
         ...current,
@@ -814,7 +872,7 @@ export async function assertWorkflowManifestDependencies(
         outputContracts: workflowOutputContracts(input.definition, false),
       },
       { ...current, apiTools: legacyApiTools! },
-    ]);
+    ]));
   } catch (error) {
     asManifestIncompatible(error);
   }

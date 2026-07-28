@@ -1,7 +1,10 @@
-import { authorizedMcpTool, executeAuthorizedMcpTool } from '../../mcp/runtime.js';
+import { authorizedMcpAction, executeAuthorizedMcpTool } from '../../mcp/runtime.js';
 import { authorizeWorkflowAction, beginWorkflowAction, completeWorkflowAction, failWorkflowAction } from '../../policy/action-gateway.js';
 import type { WorkflowAdapterContext } from './types.js';
-import { assertWorkflowRunManifestDependencies } from '../../runtime/manifest.js';
+import {
+  assertWorkflowRunManifestDependencies,
+  mcpActionManifestEntry,
+} from '../../runtime/manifest.js';
 import { childTraceContext } from '../../runtime/trace.js';
 import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/errors.js';
 import { expirationPolicy } from '../../runtime/approval-expiry.js';
@@ -13,12 +16,24 @@ export async function executeMcpActionNode(context: WorkflowAdapterContext) {
   const agentId = node.config.agentId;
   const mcpToolId = node.config.mcpToolId;
   if (typeof agentId !== 'string' || typeof mcpToolId !== 'string') throw new Error(`App action ${node.id} needs an agent and MCP tool`);
-  const tool = await authorizedMcpTool(run.workspace_id, agentId, mcpToolId);
-  if (!tool) throw Object.assign(new Error(`App action ${node.id} is unavailable or not allowed for the selected agent`), { retryable: false });
+  const action = await authorizedMcpAction(
+    run.workspace_id,
+    agentId,
+    mcpToolId,
+    execution.mode === 'production' ? Object.keys(execution.manifest.agents) : [agentId],
+  );
+  if (!action) throw Object.assign(new Error(`App action ${node.id} is unavailable or not allowed for the selected agent`), { retryable: false });
+  const { tool, manifestRows } = action;
+  const manifestEntry = mcpActionManifestEntry(manifestRows);
   context.registerActionIdentity({
     adapter: 'mcp',
     resourceId: tool.id,
-    riskLevel: tool.risk_level,
+    agentId,
+    ...(execution.mode === 'production'
+      ? { agentManifestEntry: execution.manifest.agents[agentId] }
+      : {}),
+    riskLevel: manifestEntry.riskLevel,
+    manifestEntry,
   });
   execution.signal.throwIfAborted();
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : {};

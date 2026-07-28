@@ -27,28 +27,57 @@ export type AuthorizedMcpTool = {
   tool_permission: 'read' | 'read_write';
 };
 
+export type AuthorizedMcpToolBinding = AuthorizedMcpTool & {
+  agent_id: string;
+};
+
 export function mcpToolRuntimeName(toolId: string) {
   return `mcp_${toolId.replaceAll('-', '_')}`;
 }
 
-export async function authorizedMcpTools(workspaceId: string, agentId: string) {
-  return (await query<AuthorizedMcpTool>(
+async function authorizedMcpToolBindings(workspaceId: string, agentIds: string[]) {
+  const uniqueAgentIds = [...new Set(agentIds)].sort();
+  if (!uniqueAgentIds.length) return [];
+  return (await query<AuthorizedMcpToolBinding>(
     `SELECT t.id,t.remote_name,t.title,t.description,t.input_schema,t.risk_level,
+     connection_access.agent_id,
      c.id connection_id,c.name connection_name,c.workspace_id,c.transport,c.endpoint_url,c.auth_type,c.encrypted_credentials,
      connection_access.permission_level connection_permission,tool_access.permission_level tool_permission
      FROM mcp_connection_tools t
      JOIN mcp_connections c ON c.id=t.connection_id
-     JOIN mcp_agent_access connection_access ON connection_access.connection_id=c.id AND connection_access.agent_id=$2
-     JOIN mcp_agent_tool_access tool_access ON tool_access.mcp_tool_id=t.id AND tool_access.agent_id=$2
+     JOIN mcp_agent_access connection_access ON connection_access.connection_id=c.id AND connection_access.agent_id=ANY($2::uuid[])
+     JOIN mcp_agent_tool_access tool_access ON tool_access.mcp_tool_id=t.id AND tool_access.agent_id=connection_access.agent_id
      WHERE c.workspace_id=$1 AND c.deleted_at IS NULL AND c.enabled=true AND c.health_status='healthy'
      AND t.enabled=true AND connection_access.enabled=true AND tool_access.enabled=true`,
-    [workspaceId, agentId],
+    [workspaceId, uniqueAgentIds],
   )).rows;
+}
+
+export async function authorizedMcpTools(workspaceId: string, agentId: string) {
+  return authorizedMcpToolBindings(workspaceId, [agentId]);
 }
 
 export async function authorizedMcpTool(workspaceId: string, agentId: string, toolId: string) {
   const tools = await authorizedMcpTools(workspaceId, agentId);
   return tools.find((tool) => tool.id === toolId) ?? null;
+}
+
+export async function authorizedMcpAction(
+  workspaceId: string,
+  agentId: string,
+  toolId: string,
+  manifestAgentIds: string[],
+) {
+  if (!manifestAgentIds.includes(agentId)) return null;
+  const bindings = await authorizedMcpToolBindings(workspaceId, manifestAgentIds);
+  const tool = bindings.find((candidate) => (
+    candidate.id === toolId && candidate.agent_id === agentId
+  ));
+  if (!tool) return null;
+  return {
+    tool,
+    manifestRows: bindings.filter((candidate) => candidate.id === toolId),
+  };
 }
 
 function description(tool: AuthorizedMcpTool) {

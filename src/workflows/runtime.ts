@@ -23,7 +23,11 @@ import {
   childTraceContext,
   type TraceContext,
 } from '../runtime/trace.js';
-import { assertManifestCompatible } from '../runtime/manifest.js';
+import {
+  assertManifestCompatible,
+  canonicalJson,
+  type ExecutionManifest,
+} from '../runtime/manifest.js';
 import { cancellationError } from '../runtime/cancellation.js';
 import { isLeaseFailure } from '../runtime/leases.js';
 import {
@@ -236,6 +240,7 @@ function artifactFormats(node: WorkflowNode): ArtifactFormat[] {
 function authoritativeActionRisk(
   node: WorkflowNode,
   identity: WorkflowActionIdentity | null,
+  manifest: ExecutionManifest | null,
 ): WorkflowNodeRisk | undefined {
   const expected = node.type === 'mcp_action'
     ? { adapter: 'mcp' as const, resourceId: node.config.mcpToolId }
@@ -244,10 +249,31 @@ function authoritativeActionRisk(
       : null;
   if (!expected) return undefined;
   if (
-    !identity
+    !manifest
+    || !identity
     || typeof expected.resourceId !== 'string'
     || identity.adapter !== expected.adapter
     || identity.resourceId !== expected.resourceId
+  ) return 'unknown';
+  if (
+    identity.adapter === 'mcp'
+    && (
+      typeof node.config.agentId !== 'string'
+      || identity.agentId !== node.config.agentId
+      || !manifest.agents[identity.agentId]
+      || !identity.agentManifestEntry
+      || canonicalJson(identity.agentManifestEntry) !== canonicalJson(manifest.agents[identity.agentId])
+    )
+  ) return 'unknown';
+  const pinned = identity.adapter === 'api'
+    ? manifest.apiTools[identity.resourceId]
+    : manifest.mcpActions[identity.resourceId];
+  if (
+    !pinned
+    || pinned.toolId !== identity.resourceId
+    || pinned.riskLevel === undefined
+    || pinned.riskLevel !== identity.riskLevel
+    || canonicalJson(pinned) !== canonicalJson(identity.manifestEntry)
   ) return 'unknown';
   return identity.riskLevel;
 }
@@ -396,13 +422,14 @@ export async function executeWorkflowStep(
   const runTrace = authoritativeTraceContext(run);
   const nodeTrace = childTraceContext(runTrace);
   let actionIdentity: WorkflowActionIdentity | null = null;
+  let executionManifest: ExecutionManifest | null = null;
   try {
     signal.throwIfAborted();
     if (run.step_count === 0) await emitWorkflowEvent(null, 'workflow.started', `${run.name} started`);
     signal.throwIfAborted();
     await startNode(run, node, cursor, nodeTrace, lease);
     const key = iterationKey(cursor);
-    const executionManifest = run.run_mode === 'production'
+    executionManifest = run.run_mode === 'production'
       ? assertManifestCompatible(run.execution_manifest)
       : null;
     const execution = await executeRegisteredWorkflowNode({
@@ -430,14 +457,6 @@ export async function executeWorkflowStep(
         run.state.nodes = nodeState;
       },
       registerActionIdentity: (identity) => {
-        const expectedRisk = authoritativeActionRisk(node, identity);
-        const pinned = identity.adapter === 'api'
-          ? executionManifest?.apiTools[identity.resourceId]
-          : executionManifest?.mcpActions[identity.resourceId];
-        if (
-          expectedRisk !== identity.riskLevel
-          || (executionManifest && (!pinned || pinned.toolId !== identity.resourceId))
-        ) return;
         actionIdentity = identity;
       },
     });
@@ -534,7 +553,7 @@ export async function executeWorkflowStep(
       cursor,
       error,
       nodeTrace,
-      authoritativeActionRisk(node, actionIdentity),
+      authoritativeActionRisk(node, actionIdentity, executionManifest),
       lease,
     );
     return { failed: true };

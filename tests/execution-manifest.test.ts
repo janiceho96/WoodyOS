@@ -403,10 +403,10 @@ describe('execution manifest compatibility', () => {
         [agentB]: { provider: 'openai-compatible', model: 'model-b', parametersHash: 'cc3d662e9f4a3e3b46d7307849ab076a908a64567bd8de4ff92b905a0ab5c857' },
       },
       apiTools: {
-        [explicitTool]: { toolId: explicitTool, schemaHash: '5b6007a34f75efed6c77d19577b2ed0cdef3e0053fcd66d6d619a255e5484201', permissionHash: '98755d0787c53348b161083f2ccd2506b9df8183d21f8aa7f159cc683f9e17ac' },
-        [inheritedTool]: { toolId: inheritedTool, schemaHash: 'dad58d0fbc78e65b514a0e690bcc88c2d170dd2b7f808257f17082a315e9d40c', permissionHash: '5db56212646466bdddd7234073c0499fe1bec0f1e3f3810216952954df737320' },
+        [explicitTool]: { toolId: explicitTool, schemaHash: '5b6007a34f75efed6c77d19577b2ed0cdef3e0053fcd66d6d619a255e5484201', permissionHash: '98755d0787c53348b161083f2ccd2506b9df8183d21f8aa7f159cc683f9e17ac', riskLevel: 'write' },
+        [inheritedTool]: { toolId: inheritedTool, schemaHash: 'dad58d0fbc78e65b514a0e690bcc88c2d170dd2b7f808257f17082a315e9d40c', permissionHash: '5db56212646466bdddd7234073c0499fe1bec0f1e3f3810216952954df737320', riskLevel: 'read' },
       },
-      mcpActions: { [mcpTool]: { connectionId, toolId: mcpTool, schemaHash: '19ceb1e04464cc2f718e6f2463481202496aa0950f7c531835248c06506d27d9', permissionHash: '35bdffe5870d68c4e59ce4409a302cd939e9366abf56aaad41d530cb766cd40a' } },
+      mcpActions: { [mcpTool]: { connectionId, toolId: mcpTool, schemaHash: '19ceb1e04464cc2f718e6f2463481202496aa0950f7c531835248c06506d27d9', permissionHash: '35bdffe5870d68c4e59ce4409a302cd939e9366abf56aaad41d530cb766cd40a', riskLevel: 'write' } },
       policy: { version: '1' },
       adapters: { start: 'logic:1', writer: 'agent:1', reviewer: 'agent:1', call_api: 'api:1', call_mcp: 'mcp:1', finish: 'file:1' },
       outputContracts: {

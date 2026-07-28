@@ -20,13 +20,23 @@ const state = vi.hoisted(() => ({
   insertValues: null as unknown[] | null,
   invokeCount: 0,
   invokeError: null as Error | null,
+  identitySource: null as unknown,
+  invokedTool: null as unknown,
+  loadedTool: {
+    id: ids.tool,
+    name: 'send_update',
+    kind: 'api',
+    config: {},
+    permissions: ['write'],
+  },
   workflowStatus: 'running',
 }));
 
 vi.mock('../src/tools/runtime.js', () => ({
   toolRequiresApproval: vi.fn(() => true),
   toolRiskLevel: vi.fn(() => 'write'),
-  invokeTool: vi.fn(async () => {
+  invokeTool: vi.fn(async (tool: unknown) => {
+    state.invokedTool = tool;
     state.invokeCount += 1;
     if (state.invokeError) throw state.invokeError;
     return { delivered: true };
@@ -34,6 +44,15 @@ vi.mock('../src/tools/runtime.js', () => ({
 }));
 vi.mock('../src/runtime/manifest.js', () => ({
   assertWorkflowRunManifestDependencies: vi.fn(async () => undefined),
+  apiToolManifestEntry: vi.fn((tool: unknown) => {
+    state.identitySource = tool;
+    return {
+      toolId: ids.tool,
+      schemaHash: 'a'.repeat(64),
+      permissionHash: 'b'.repeat(64),
+      riskLevel: 'write',
+    };
+  }),
 }));
 vi.mock('../src/lib/crypto.js', () => ({
   encryptJsonWithContext: vi.fn(() => ({
@@ -50,13 +69,7 @@ vi.mock('../src/db/client.js', () => ({
     if (sql.includes('FROM tools')) {
       return {
         rowCount: 1,
-        rows: [{
-          id: ids.tool,
-          name: 'send_update',
-          kind: 'api',
-          config: {},
-          permissions: ['write'],
-        }],
+        rows: [state.loadedTool],
       };
     }
     if (sql.includes('workflow_run_node_states') && sql.includes('approved')) {
@@ -197,6 +210,8 @@ describe('legacy workflow action ledger', () => {
     state.insertValues = null;
     state.invokeCount = 0;
     state.invokeError = null;
+    state.identitySource = null;
+    state.invokedTool = null;
     state.workflowStatus = 'running';
   });
 
@@ -215,6 +230,8 @@ describe('legacy workflow action ledger', () => {
     expect(state.insertValues?.[13]).toBe('write');
     expect(state.insertValues?.[16]).toBe('approved');
     expect(String(state.insertValues?.[15])).toHaveLength(64);
+    expect(state.identitySource).toBe(state.loadedTool);
+    expect(state.invokedTool).toBe(state.loadedTool);
   });
 
   it('persists an uncertain write outcome so cancellation cannot finalize false-clean', async () => {
