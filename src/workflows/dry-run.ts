@@ -3,9 +3,9 @@ import { valueAtPath, workflowDefinitionErrors, type WorkflowDefinition, type Wo
 import { contractCompatible, resolveBinding, type ContractBinding } from './contracts.js';
 import { workflowNodeDefinition } from './registry.js';
 
-type AgentResource = { id: string; versionId: string | null; version: number | null };
-type ToolResource = { id: string; kind: string; risk: string; permissions: string[]; connectionId?: string; agentIds?: string[] };
-export type DryRunResources = { agents: Map<string, AgentResource>; tools: Map<string, ToolResource>; mcpTools: Map<string, ToolResource> };
+type AgentResource = { id: string; versionId: string | null; version: number | null; snapshotHash?: string };
+type ToolResource = { id: string; kind: string; risk: string; permissions: string[]; connectionId?: string; agentIds?: string[]; schema?: unknown; permissionHash?: string; schemaHash?: string; policyVersion?: string };
+export type DryRunResources = { agents: Map<string, AgentResource>; tools: Map<string, ToolResource>; mcpTools: Map<string, ToolResource>; policyVersion?: string; runtimeVersion?: string };
 export type DryRunIssue = { code: string; message: string; nodeId?: string; guidance: string };
 export type DryRunResult = {
   valid: boolean; executionPath: string[]; bindings: ReturnType<typeof resolveBinding>[]; errors: DryRunIssue[]; warnings: DryRunIssue[];
@@ -13,7 +13,7 @@ export type DryRunResult = {
   requiredApprovals: Array<{ nodeId: string; reason: string; prompt?: string }>;
   missingResources: Array<{ nodeId: string; resourceId: string; kind: string }>;
   pinnedAgents: Array<{ nodeId: string; agentId: string; versionId: string; version: number }>;
-  estimatedBudgets: { agentCalls: number; maxLoopIterations: number; externalActions: number };
+  estimatedBudgets: { agentCalls: number; maxLoopIterations: number; externalActions: number; maxNodeExecutions: number };
   manifest: { definitionHash: string; inputHash: string; previewHash: string };
 };
 
@@ -27,13 +27,22 @@ function references(value: unknown, result: string[] = []): string[] {
   return result;
 }
 
-function graph(definition: WorkflowDefinition, errors: DryRunIssue[]) {
+function graph(definition: WorkflowDefinition, input: Record<string, unknown>, errors: DryRunIssue[]) {
   const nodes = new Map(definition.nodes.map((node) => [node.id, node]));
   const trigger = definition.nodes.find((node) => node.type === 'trigger');
   const reachable = new Set<string>(); const path: string[] = [];
   if (trigger) {
     const queue = [trigger.id]; reachable.add(trigger.id);
-    while (queue.length) { const id = queue.shift()!; path.push(id); for (const edge of definition.edges) if (edge.source === id && !reachable.has(edge.target)) { reachable.add(edge.target); queue.push(edge.target); } }
+    while (queue.length) { const id = queue.shift()!; path.push(id); const node = nodes.get(id); for (const edge of definition.edges) {
+      if (edge.source !== id || reachable.has(edge.target)) continue;
+      if (node?.type === 'condition') {
+        const value = valueAtPath({ input }, String(node.config.path ?? node.config.key ?? ''));
+        const expected = node.config.value ?? node.config.equals;
+        const selected = (node.config.operator === 'equals' ? value === expected : node.config.operator === 'not_equals' ? value !== expected : undefined);
+        if (selected !== undefined && edge.condition !== String(selected)) continue;
+      }
+      reachable.add(edge.target); queue.push(edge.target);
+    } }
   } else errors.push(issue('WORKFLOW_TRIGGER_MISSING', 'Workflow has no trigger node', undefined, 'Add one manual trigger node.'));
   for (const node of definition.nodes) if (!reachable.has(node.id)) errors.push(issue('NODE_UNREACHABLE', `Node ${node.id} is not reachable from the trigger`, node.id, 'Connect it to the workflow path or remove it.'));
   const visiting = new Set<string>(); const visited = new Set<string>();
@@ -45,7 +54,7 @@ function graph(definition: WorkflowDefinition, errors: DryRunIssue[]) {
 export async function dryRunWorkflow(input: { workspaceId: string; definition: WorkflowDefinition; input: Record<string, unknown>; resources: DryRunResources; adapterSpy?: (...args: never[]) => unknown }): Promise<DryRunResult> {
   // Intentionally no adapter, queue, artifact, worker, manifest persistence, audit, or write call.
   const errors: DryRunIssue[] = []; const warnings: DryRunIssue[] = [];
-  const { nodes, path } = graph(input.definition, errors);
+  const { nodes, path } = graph(input.definition, input.input, errors);
   for (const message of workflowDefinitionErrors(input.definition)) errors.push(issue('DEFINITION_INVALID', message));
   const bindings: ReturnType<typeof resolveBinding>[] = [];
   for (const edge of input.definition.edges as ContractBinding[]) {
@@ -55,7 +64,7 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
     if (result.binding && !contractCompatible(result.binding)) errors.push(issue('NODE_SCHEMA_INCOMPATIBLE', `Binding ${edge.source}.${result.binding.sourcePort} is incompatible with ${edge.target}.${result.binding.targetPort}`, edge.target, 'Use matching schema types or add an explicit registered transformation.'));
   }
   const externalActions: DryRunResult['externalActions'] = []; const requiredApprovals: DryRunResult['requiredApprovals'] = []; const missingResources: DryRunResult['missingResources'] = []; const pinnedAgents: DryRunResult['pinnedAgents'] = [];
-  let maxLoopIterations = 0;
+  let maxLoopIterations = 0; let loopMultiplier = 1;
   for (const node of input.definition.nodes) {
     const config = node.config;
     for (const reference of references(config)) {
@@ -63,8 +72,8 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
       else if (reference.startsWith('input.') && valueAtPath({ input: input.input }, reference) === undefined) warnings.push(issue('REFERENCE_UNRESOLVED', `Fixture input does not provide ${reference}`, node.id, 'Provide a fixture value or make the binding optional.'));
     }
     if (node.type === 'trigger' && Array.isArray(config.inputSchema)) for (const field of config.inputSchema as Array<Record<string, unknown>>) if (field.required && typeof field.key === 'string' && input.input[field.key] === undefined) errors.push(issue('INPUT_REQUIRED', `Required fixture input ${field.key} is missing`, node.id, 'Supply the required trigger input.'));
-    if (node.type === 'loop') { const bound = config.maxIterations; if (typeof bound !== 'number' || !Number.isInteger(bound) || bound < 1 || bound > 100) errors.push(issue('LOOP_BOUND_INVALID', `Loop ${node.id} must have a maximum between 1 and 100`, node.id, 'Set a finite integer loop limit from 1 to 100.')); else maxLoopIterations += bound; }
-    if (node.type === 'agent') { const id = typeof config.agentId === 'string' ? config.agentId : ''; const agent = input.resources.agents.get(id); if (!agent) { missingResources.push({ nodeId: node.id, resourceId: id, kind: 'agent' }); errors.push(issue('RESOURCE_NOT_FOUND', `Agent ${id || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an active workspace agent.')); } else if (!agent.versionId || !agent.version) errors.push(issue('AGENT_VERSION_REQUIRED', `Agent ${id} has no pinned published version`, node.id, 'Publish an agent version before using it in a workflow.')); else pinnedAgents.push({ nodeId: node.id, agentId: id, versionId: agent.versionId, version: agent.version }); }
+    if (node.type === 'loop') { const bound = config.maxIterations; if (typeof bound !== 'number' || !Number.isInteger(bound) || bound < 1 || bound > 100) errors.push(issue('LOOP_BOUND_INVALID', `Loop ${node.id} must have a maximum between 1 and 100`, node.id, 'Set a finite integer loop limit from 1 to 100.')); else { maxLoopIterations += bound; loopMultiplier *= bound; } }
+    if (node.type === 'agent' || node.type === 'mcp_action') { const id = typeof config.agentId === 'string' ? config.agentId : ''; const agent = input.resources.agents.get(id); if (!agent) { missingResources.push({ nodeId: node.id, resourceId: id, kind: 'agent' }); errors.push(issue('RESOURCE_NOT_FOUND', `Agent ${id || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an active workspace agent.')); } else if (!agent.versionId || !agent.version) errors.push(issue('AGENT_VERSION_REQUIRED', `Agent ${id} has no pinned published version`, node.id, 'Publish an agent version before using it in a workflow.')); else pinnedAgents.push({ nodeId: node.id, agentId: id, versionId: agent.versionId, version: agent.version }); }
     if (externalTypes.has(node.type)) {
       const resourceId = typeof config.toolId === 'string' ? config.toolId : typeof config.mcpToolId === 'string' ? config.mcpToolId : '';
       const adapter = node.type === 'mcp_action' ? 'mcp' : node.type === 'action' ? 'legacy_tool' : node.type === 'browser' ? 'browser' : 'api';
@@ -78,7 +87,9 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
     if (node.type === 'approval') requiredApprovals.push({ nodeId: node.id, reason: 'Human approval node', prompt: typeof config.prompt === 'string' ? config.prompt : undefined });
     if (!workflowNodeDefinition(node.type)?.available) errors.push(issue('NODE_UNAVAILABLE', `Node ${node.id} has no available runtime adapter`, node.id, 'Replace the unavailable node before execution.'));
   }
+  const estimatedBudgets = { agentCalls: input.definition.nodes.filter((node) => node.type === 'agent').length * loopMultiplier, maxLoopIterations, externalActions: externalActions.length * loopMultiplier, maxNodeExecutions: input.definition.nodes.length * loopMultiplier };
   const definitionHash = canonicalJsonHash(input.definition); const inputHash = canonicalJsonHash(input.input);
-  const manifest = { definitionHash, inputHash, previewHash: canonicalJsonHash({ definitionHash, inputHash, path, externalActions, pinnedAgents }) };
-  return { valid: errors.length === 0, executionPath: path, bindings, errors, warnings, externalActions, requiredApprovals, missingResources, pinnedAgents, estimatedBudgets: { agentCalls: input.definition.nodes.filter((node) => node.type === 'agent').length, maxLoopIterations, externalActions: externalActions.length }, manifest };
+  const dependencies = { agents: [...input.resources.agents.values()], tools: [...input.resources.tools.values()], mcpTools: [...input.resources.mcpTools.values()], policyVersion: input.resources.policyVersion ?? 'default', runtimeVersion: input.resources.runtimeVersion ?? '0.1.0' };
+  const manifest = { definitionHash, inputHash, previewHash: canonicalJsonHash({ definitionHash, inputHash, path, bindings, externalActions, requiredApprovals, pinnedAgents, estimatedBudgets, dependencies }) };
+  return { valid: errors.length === 0, executionPath: path, bindings, errors, warnings, externalActions, requiredApprovals, missingResources, pinnedAgents, estimatedBudgets, manifest };
 }

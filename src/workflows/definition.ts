@@ -7,16 +7,17 @@ export const workflowNodeSchema = z.object({
   type: workflowNodeTypeSchema,
   config: z.record(z.unknown()).default({}),
 });
-const bindingSchema: z.ZodType<{ type?: string; nullable?: boolean; items?: unknown; properties?: Record<string, unknown> }> = z.lazy(() => z.object({
+const bindingSchema: z.ZodType<{ type?: string; nullable?: boolean; items?: unknown; properties?: Record<string, unknown>; required?: string[] }> = z.lazy(() => z.object({
   type: z.enum(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null', 'any']).optional(),
   nullable: z.boolean().optional(),
   items: bindingSchema.optional(),
   properties: z.record(bindingSchema).optional(),
+  required: z.array(z.string().min(1)).optional(),
 }).passthrough());
 export const workflowEdgeSchema = z.object({
   source: z.string().min(1), target: z.string().min(1), condition: z.string().max(30).optional(),
   sourcePort: z.string().min(1).max(100).optional(), targetPort: z.string().min(1).max(100).optional(),
-  sourceSchema: bindingSchema.optional(), targetSchema: bindingSchema.optional(), required: z.boolean().optional(), nullable: z.boolean().optional(),
+  sourceSchema: bindingSchema.optional(), targetSchema: bindingSchema.optional(), required: z.boolean().optional(), nullable: z.boolean().optional(), transformId: z.enum(['json_parse', 'stringify']).optional(),
 });
 export const workflowDefinitionSchema = z.object({ nodes: z.array(workflowNodeSchema).min(2).max(200), edges: z.array(workflowEdgeSchema).max(500) });
 

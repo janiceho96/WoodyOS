@@ -9,10 +9,10 @@ function sameEdge(left: WorkflowEdge, right: WorkflowEdge) {
 export function replaceWorkflowEdge(
   edges: WorkflowDefinition['edges'],
   previous: WorkflowEdge,
-  next: Pick<WorkflowEdge, 'source' | 'target'>,
+  next: Pick<WorkflowEdge, 'source' | 'target'> & Partial<Omit<WorkflowEdge, 'source' | 'target' | 'condition'>>,
 ) {
   return edges.map((edge) => sameEdge(edge, previous)
-    ? { ...next, ...(previous.condition ? { condition: previous.condition } : {}) }
+    ? { ...previous, ...next, ...(previous.condition ? { condition: previous.condition } : {}) }
     : edge);
 }
 

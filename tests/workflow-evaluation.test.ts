@@ -101,4 +101,28 @@ describe('workflow dry run', () => {
     });
     expect(result.errors).toContainEqual(expect.objectContaining({ code: 'MCP_ACCESS_DENIED', nodeId: 'call' }));
   });
+
+  it('pins MCP-only agents and includes mutable resource identities in the preview hash', async () => {
+    const mcpToolId = '00000000-0000-4000-8000-000000000014';
+    const base = { workspaceId, input: {}, definition: { nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'call', type: 'mcp_action' as const, config: { agentId, mcpToolId, input: {} } }, { id: 'finish', type: 'output' as const, config: {} }], edges: [{ source: 'start', target: 'call' }, { source: 'call', target: 'finish' }] } };
+    const allowed = { ...resources, mcpTools: new Map([[mcpToolId, { id: mcpToolId, kind: 'mcp', risk: 'read', permissions: ['calendar:read'], agentIds: [agentId], schema: { type: 'object', properties: { title: { type: 'string' } } }, permissionHash: 'v1' }]]) };
+    const first = await dryRunWorkflow({ ...base, resources: allowed });
+    const changed = await dryRunWorkflow({ ...base, resources: { ...allowed, mcpTools: new Map([[mcpToolId, { ...allowed.mcpTools.get(mcpToolId)!, permissionHash: 'v2' }]]) } });
+    expect(first.errors).not.toContainEqual(expect.objectContaining({ code: 'AGENT_VERSION_REQUIRED' }));
+    expect(first.pinnedAgents).toEqual([expect.objectContaining({ nodeId: 'call', agentId })]);
+    expect(changed.manifest.previewHash).not.toBe(first.manifest.previewHash);
+  });
+
+  it('validates deep contracts, nullable required ports, registered transforms, and fixture-resolved paths', async () => {
+    const result = await dryRunWorkflow({ workspaceId, resources, input: { take: true }, definition: {
+      nodes: [{ id: 'start', type: 'trigger' as const, config: {} }, { id: 'check', type: 'condition' as const, config: { path: 'input.take', operator: 'equals', value: true } }, { id: 'yes', type: 'output' as const, config: {} }, { id: 'no', type: 'output' as const, config: {} }],
+      edges: [
+        { source: 'start', target: 'check' },
+        { source: 'check', target: 'yes', condition: 'true', sourceSchema: { type: 'object', properties: { nested: { type: 'array', items: { type: 'string' } } } }, targetSchema: { type: 'object', properties: { nested: { type: 'array', items: { type: 'number' } } } }, required: true },
+        { source: 'check', target: 'no', condition: 'false' },
+      ],
+    } });
+    expect(result.executionPath).toEqual(['start', 'check', 'yes']);
+    expect(result.errors).toContainEqual(expect.objectContaining({ code: 'NODE_SCHEMA_INCOMPATIBLE', nodeId: 'yes' }));
+  });
 });

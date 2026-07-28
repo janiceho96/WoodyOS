@@ -464,7 +464,7 @@ export type WorkflowNode = {
 };
 export type WorkflowDefinition = {
   nodes: WorkflowNode[];
-  edges: Array<{ source: string; target: string; condition?: string }>;
+  edges: Array<{ source: string; target: string; condition?: string; sourcePort?: string; targetPort?: string; sourceSchema?: Record<string, unknown>; targetSchema?: Record<string, unknown>; required?: boolean; nullable?: boolean; transformId?: 'json_parse' | 'stringify' }>;
 };
 export type Workflow = {
   id: string;

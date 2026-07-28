@@ -1,7 +1,7 @@
 import type { WorkflowEdge, WorkflowNode } from './definition.js';
 import { workflowNodeDefinition, type WorkflowPort } from './registry.js';
 
-export type JsonSchema = { type?: string; nullable?: boolean; items?: JsonSchema; properties?: Record<string, JsonSchema> };
+export type JsonSchema = { type?: string; nullable?: boolean; items?: JsonSchema; properties?: Record<string, JsonSchema>; required?: string[] };
 export type ContractBinding = WorkflowEdge & {
   sourcePort?: string;
   targetPort?: string;
@@ -9,10 +9,11 @@ export type ContractBinding = WorkflowEdge & {
   targetSchema?: JsonSchema;
   required?: boolean;
   nullable?: boolean;
+  transformId?: 'json_parse' | 'stringify';
 };
 
 export type ContractIssue = { code: 'NODE_PORT_UNKNOWN' | 'NODE_SCHEMA_INCOMPATIBLE'; nodeId: string; message: string; guidance: string };
-export type ResolvedBinding = { source: string; target: string; sourcePort: string; targetPort: string; required: boolean; nullable: boolean; sourceSchema: JsonSchema; targetSchema: JsonSchema; legacy: boolean };
+export type ResolvedBinding = { source: string; target: string; sourcePort: string; targetPort: string; required: boolean; nullable: boolean; transformId?: ContractBinding['transformId']; sourceSchema: JsonSchema; targetSchema: JsonSchema; legacy: boolean };
 
 function schemaFor(port: WorkflowPort | undefined): JsonSchema {
   const type = port?.dataType;
@@ -35,18 +36,27 @@ export function resolveBinding(edge: ContractBinding, nodes: Map<string, Workflo
   const sourcePort = port(sourcePorts, edge.sourcePort, sourcePorts.find((item) => item.id === 'output')?.id ?? sourcePorts[0]?.id ?? 'output');
   const targetPort = port(targetPorts, edge.targetPort, targetPorts.find((item) => item.id === 'input')?.id ?? targetPorts[0]?.id ?? 'input');
   if (!sourcePort || !targetPort) return { issue: { code: 'NODE_PORT_UNKNOWN', nodeId: target.id, message: `Binding ${source.id} → ${target.id} references an unavailable port`, guidance: 'Choose a port exposed by both connected nodes.' } };
-  return { binding: { source: source.id, target: target.id, sourcePort: sourcePort.id, targetPort: targetPort.id, required: edge.required ?? Boolean(targetPort.required), nullable: edge.nullable ?? false, sourceSchema: edge.sourceSchema ?? schemaFor(sourcePort), targetSchema: edge.targetSchema ?? schemaFor(targetPort), legacy } };
+  return { binding: { source: source.id, target: target.id, sourcePort: sourcePort.id, targetPort: targetPort.id, required: edge.required ?? Boolean(targetPort.required), nullable: edge.nullable ?? false, transformId: edge.transformId, sourceSchema: edge.sourceSchema ?? schemaFor(sourcePort), targetSchema: edge.targetSchema ?? schemaFor(targetPort), legacy } };
 }
 
 /** Contract compatibility is deliberately strict: only identical JSON value shapes (or any)
  * are accepted. Required output into an optional target is safe; no scalar/object/array coercion occurs. */
 export function contractCompatible(binding: ResolvedBinding): boolean {
   const source = binding.sourceSchema.type; const target = binding.targetSchema.type;
+  if (binding.transformId === 'json_parse' && source === 'string' && target === 'object') return true;
+  if (binding.transformId === 'stringify' && target === 'string' && ['object', 'array'].includes(source ?? '')) return true;
   if (!source || !target || source === 'any' || target === 'any') return true;
   if (source !== target) return false;
-  if (binding.required && binding.nullable && !binding.targetSchema.nullable) return false;
+  if (binding.required && (binding.nullable || binding.sourceSchema.nullable) && !binding.targetSchema.nullable) return false;
   if (source === 'array' && binding.sourceSchema.items && binding.targetSchema.items) {
     return contractCompatible({ ...binding, sourceSchema: binding.sourceSchema.items, targetSchema: binding.targetSchema.items });
+  }
+  if (source === 'object' && binding.targetSchema.properties) {
+    for (const [key, targetProperty] of Object.entries(binding.targetSchema.properties)) {
+      const sourceProperty = binding.sourceSchema.properties?.[key];
+      if (!sourceProperty && binding.targetSchema.required?.includes(key)) return false;
+      if (sourceProperty && !contractCompatible({ ...binding, sourceSchema: sourceProperty, targetSchema: targetProperty })) return false;
+    }
   }
   return true;
 }

@@ -24,6 +24,9 @@ import {
 } from '../runtime/errors.js';
 import { requestCancellation } from '../runtime/cancellation.js';
 import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
+import { decryptJson } from '../lib/crypto.js';
+import { canonicalJsonHash } from '../runtime/manifest.js';
+import type { StoredConfig } from '../tools/runtime.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -49,10 +52,10 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
       `SELECT a.id,v.id version_id,v.version FROM agents a
        LEFT JOIN agent_versions v ON v.id=a.published_version_id AND v.workspace_id=a.workspace_id
        WHERE a.workspace_id=$1 AND a.status='active' AND a.id=ANY($2::uuid[])`, [workspaceId, agentIds]) : Promise.resolve({ rows: [] }),
-    toolIds.length ? query<{ id: string; kind: string; permissions: string[] }>(
-      "SELECT id,kind,permissions FROM tools WHERE workspace_id=$1 AND enabled=true AND kind <> 'mcp' AND id=ANY($2::uuid[])", [workspaceId, toolIds]) : Promise.resolve({ rows: [] }),
-    mcpIds.length ? query<{ id: string; connection_id: string; risk_level: string; agent_id: string }>(
-      `SELECT t.id,t.connection_id,t.risk_level,access.agent_id FROM mcp_connection_tools t
+    toolIds.length ? query<{ id: string; kind: string; permissions: string[]; config: StoredConfig }>(
+      "SELECT id,kind,permissions,config FROM tools WHERE workspace_id=$1 AND enabled=true AND kind <> 'mcp' AND id=ANY($2::uuid[])", [workspaceId, toolIds]) : Promise.resolve({ rows: [] }),
+    mcpIds.length ? query<{ id: string; connection_id: string; risk_level: string; agent_id: string; input_schema: unknown; connection_permission: string; tool_permission: string }>(
+      `SELECT t.id,t.connection_id,t.risk_level,t.input_schema,access.agent_id,access.permission_level connection_permission,tool_access.permission_level tool_permission FROM mcp_connection_tools t
        JOIN mcp_connections c ON c.id=t.connection_id
        JOIN mcp_agent_access access ON access.connection_id=c.id AND access.enabled=true
        JOIN mcp_agent_tool_access tool_access ON tool_access.mcp_tool_id=t.id AND tool_access.agent_id=access.agent_id AND tool_access.enabled=true
@@ -60,15 +63,15 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
        WHERE c.workspace_id=$1 AND c.deleted_at IS NULL AND c.enabled=true AND c.health_status='healthy'
          AND t.enabled=true AND t.id=ANY($2::uuid[])`, [workspaceId, mcpIds]) : Promise.resolve({ rows: [] }),
   ]);
-  const mcpById = new Map<string, { id: string; kind: string; risk: string; permissions: string[]; connectionId: string; agentIds: string[] }>();
+  const mcpById = new Map<string, { id: string; kind: string; risk: string; permissions: string[]; connectionId: string; agentIds: string[]; schema: unknown; schemaHash: string; permissionHash: string }>();
   for (const row of mcpTools.rows) {
     const current = mcpById.get(row.id);
     if (current) current.agentIds.push(row.agent_id);
-    else mcpById.set(row.id, { id: row.id, kind: 'mcp', risk: row.risk_level, permissions: [], connectionId: row.connection_id, agentIds: [row.agent_id] });
+    else mcpById.set(row.id, { id: row.id, kind: 'mcp', risk: row.risk_level, permissions: [row.connection_permission, row.tool_permission], connectionId: row.connection_id, agentIds: [row.agent_id], schema: row.input_schema, schemaHash: canonicalJsonHash(row.input_schema), permissionHash: canonicalJsonHash({ connection: row.connection_permission, tool: row.tool_permission }) });
   }
   return {
     agents: new Map(agents.rows.map((row) => [row.id, { id: row.id, versionId: row.version_id, version: row.version }])),
-    tools: new Map(tools.rows.map((row) => [row.id, { id: row.id, kind: row.kind, risk: 'unknown', permissions: row.permissions ?? [] }])),
+    tools: new Map(tools.rows.map((row) => { const config = decryptJson(row.config) as Record<string, unknown>; const schema = config.inputSchema ?? { type: 'object', properties: {} }; const risk = config.readOnly === true ? 'read' : 'unknown'; return [row.id, { id: row.id, kind: row.kind, risk, permissions: row.permissions ?? [], schema, schemaHash: canonicalJsonHash(schema), permissionHash: canonicalJsonHash({ kind: row.kind, permissions: row.permissions ?? [], risk }) }]; })),
     mcpTools: mcpById,
   };
 }

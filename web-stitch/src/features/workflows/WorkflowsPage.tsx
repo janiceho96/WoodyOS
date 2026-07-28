@@ -227,7 +227,8 @@ export function WorkflowsPage() {
     if (source.type === 'condition' && !['true', 'false'].includes(condition ?? '')) return reportError('Use the True or False handle from a Condition.');
     if (source.type === 'loop' && !['body', 'done'].includes(condition ?? '')) return reportError('Use the Body or Done handle from a Loop.');
     if (edges.some((edge) => edge.source === source.id && edge.target === target.id && edge.condition === condition)) return reportError('That connection already exists.');
-    const nextEdge = { source: source.id, target: target.id, ...(condition ? { condition } : {}) };
+    const schemaFor = (dataType: string) => dataType === 'text' ? { type: 'string' } : dataType === 'collection' ? { type: 'array' } : dataType === 'any' ? {} : { type: dataType };
+    const nextEdge = { source: source.id, target: target.id, sourcePort: sourcePort?.id ?? connection.sourceHandle ?? 'output', targetPort: targetPort?.id ?? connection.targetHandle ?? 'input', sourceSchema: schemaFor(sourcePort?.dataType ?? 'any'), targetSchema: schemaFor(targetPort?.dataType ?? 'any'), required: Boolean(targetPort?.required), nullable: false, ...(condition ? { condition } : {}) };
     const replaceable = !['condition', 'loop'].includes(source.type)
       ? edges.find((edge) => edge.source === source.id && edge.condition !== 'continue')
       : undefined;
@@ -238,7 +239,10 @@ export function WorkflowsPage() {
     const source = nodes.find((node) => node.id === connection.source);
     const target = nodes.find((node) => node.id === connection.target);
     if (!source || !target || target.type === 'trigger' || source.type === 'output') return reportError('That connection direction is not valid.');
-    commit({ nodes, edges: replaceWorkflowEdge(edges, edge, { source: source.id, target: target.id }), positions });
+    const sourcePort = catalog.find((entry) => entry.type === source.type)?.outputPorts.find((port) => port.id === (connection.sourceHandle ?? 'output'));
+    const targetPort = catalog.find((entry) => entry.type === target.type)?.inputPorts.find((port) => port.id === (connection.targetHandle ?? 'input'));
+    const schemaFor = (dataType: string) => dataType === 'text' ? { type: 'string' } : dataType === 'collection' ? { type: 'array' } : dataType === 'any' ? {} : { type: dataType };
+    commit({ nodes, edges: replaceWorkflowEdge(edges, edge, { source: source.id, target: target.id, sourcePort: sourcePort?.id ?? connection.sourceHandle ?? edge.sourcePort, targetPort: targetPort?.id ?? connection.targetHandle ?? edge.targetPort, sourceSchema: sourcePort ? schemaFor(sourcePort.dataType) : edge.sourceSchema, targetSchema: targetPort ? schemaFor(targetPort.dataType) : edge.targetSchema, required: targetPort ? Boolean(targetPort.required) : edge.required }), positions });
   };
   const deleteEdges = (removed: WorkflowDefinition['edges']) => {
     commit({ nodes, edges: edges.filter((edge) => !removed.some((candidate) => candidate.source === edge.source && candidate.target === edge.target && candidate.condition === edge.condition)), positions });

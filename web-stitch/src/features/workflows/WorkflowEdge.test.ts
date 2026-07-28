@@ -18,6 +18,11 @@ describe('workflow edge editing', () => {
     ]);
   });
 
+  it('retains explicit binding contracts when an edge is reconnected', () => {
+    const contracted = [{ source: 'writer', target: 'grader', sourcePort: 'output', targetPort: 'input', sourceSchema: { type: 'object' }, targetSchema: { type: 'object' }, required: true, nullable: false }];
+    expect(replaceWorkflowEdge(contracted, contracted[0], { source: 'writer', target: 'reviewer' })).toEqual([{ source: 'writer', target: 'reviewer', sourcePort: 'output', targetPort: 'input', sourceSchema: { type: 'object' }, targetSchema: { type: 'object' }, required: true, nullable: false }]);
+  });
+
   it('inserts a node by replacing one edge with two valid edges', () => {
     expect(insertNodeOnEdge(edges, edges[0], 'reviewer')).toEqual([
       { source: 'grader', target: 'loop', condition: 'continue' },
