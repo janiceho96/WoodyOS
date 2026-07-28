@@ -16,6 +16,8 @@ type Queryable = {
   query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
 };
 
+const INLINE_EMBEDDING_TIMEOUT_MS = 5_000;
+
 const memoryColumns = `id,workspace_id,agent_id,user_id,kind,content,importance,metadata,
   memory_type,scope,source_type,source_id,confidence,verification_status,expires_at,
   superseded_by,last_accessed_at,access_count,created_at,updated_at`;
@@ -154,6 +156,16 @@ async function policyEmbedding(
   return enabled ? await embeddingFor(input.content).catch(() => null) : null;
 }
 
+async function boundedEmbedding(content: string): Promise<number[] | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INLINE_EMBEDDING_TIMEOUT_MS);
+  try {
+    return await embeddingFor(content, { signal: controller.signal }).catch(() => null);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function createMemoryWithExecutor(input: CreateMemoryInput, executor: Queryable): Promise<MemoryRecord> {
   const embedding = await policyEmbedding(input, executor);
   return insertMemory(input, executor, embedding);
@@ -258,6 +270,19 @@ export async function supersedeMemory(input: {
 }): Promise<{ memory: MemoryRecord; replacement: MemoryRecord }> {
   if (!input.replacementMemoryId && !input.replacement) throw new MemoryServiceError('REPLACEMENT_REQUIRED', 400);
   if (input.replacementMemoryId === input.memoryId) throw new MemoryServiceError('INVALID_REPLACEMENT', 400);
+  const inlineReplacement = input.replacement
+    ? { ...input.replacement, workspaceId: input.workspaceId }
+    : null;
+  const preflightSemanticEnabled = inlineReplacement
+    ? await authoritativeSemanticSearch(
+      inlineReplacement.workspaceId,
+      inlineReplacement.agentId,
+      { query },
+    )
+    : false;
+  const prefetchedEmbedding = inlineReplacement && preflightSemanticEnabled
+    ? await boundedEmbedding(inlineReplacement.content)
+    : null;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -303,9 +328,15 @@ export async function supersedeMemory(input: {
       );
       const previous = previousResult.rows[0];
       if (!previous) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
-      replacement = await createMemoryWithExecutor(
-        { ...input.replacement!, workspaceId: input.workspaceId },
+      const semanticStillEnabled = await authoritativeSemanticSearch(
+        inlineReplacement!.workspaceId,
+        inlineReplacement!.agentId,
         client,
+      );
+      replacement = await insertMemory(
+        inlineReplacement!,
+        client,
+        preflightSemanticEnabled && semanticStillEnabled ? prefetchedEmbedding : null,
       );
     }
     const superseded = await client.query<MemoryRow>(

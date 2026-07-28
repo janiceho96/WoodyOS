@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { memoryRoutes } from '../src/routes/memories.js';
 import {
   MemoryServiceError,
@@ -92,6 +92,10 @@ describe('governed memories', () => {
     state.connect.mockReset();
     state.embeddingFor.mockReset();
     state.embeddingFor.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('accepts an agent-inferred governed payload without requiring legacy kind', async () => {
@@ -362,7 +366,12 @@ describe('governed memories', () => {
   it('embeds an inline supersession replacement when authoritative agent policy enables semantic search', async () => {
     const replacementId = '66666666-6666-4666-8666-666666666666';
     const replacementContent = 'Use monthly reports instead';
-    state.embeddingFor.mockResolvedValueOnce([0.25, 0.75]);
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ semantic_search: true }] });
+    state.embeddingFor.mockImplementationOnce(async (_content, options) => {
+      expect(state.connect).not.toHaveBeenCalled();
+      expect(options?.signal).toBeInstanceOf(AbortSignal);
+      return [0.25, 0.75];
+    });
     const client = {
       query: vi.fn(async (sql: string, values?: unknown[]) => {
         if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
@@ -401,9 +410,129 @@ describe('governed memories', () => {
     });
 
     expect(result.replacement.id).toBe(replacementId);
-    expect(state.embeddingFor).toHaveBeenCalledWith(replacementContent);
+    expect(state.embeddingFor).toHaveBeenCalledWith(
+      replacementContent,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     const insertCall = client.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO memories'));
     expect(insertCall?.[1]?.[14]).toBe('[0.25,0.75]');
+  });
+
+  it('times out inline replacement embedding before opening the transaction and safely inserts without a vector', async () => {
+    vi.useFakeTimers();
+    const replacementId = '66666666-6666-4666-8666-666666666666';
+    const replacementContent = 'Embedding request that never completes';
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ semantic_search: true }] });
+    let receivedSignal: AbortSignal | undefined;
+    state.embeddingFor.mockImplementationOnce(async (_content, options) => {
+      receivedSignal = options?.signal;
+      if (!receivedSignal) throw new Error('missing abort signal');
+      return new Promise<number[]>((_, reject) => {
+        receivedSignal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    });
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
+        if (sql.startsWith('SELECT') && sql.includes("verification_status <> 'superseded'")) {
+          return { rowCount: 1, rows: [memoryRow()] };
+        }
+        if (sql.includes('FROM agents')) return { rowCount: 1, rows: [{ semantic_search: true }] };
+        if (sql.includes('INSERT INTO memories')) {
+          return {
+            rowCount: 1,
+            rows: [memoryRow({
+              id: replacementId,
+              content: values?.[4],
+              verification_status: values?.[12],
+            })],
+          };
+        }
+        return {
+          rowCount: 1,
+          rows: [memoryRow({ verification_status: 'superseded', superseded_by: replacementId })],
+        };
+      }),
+      release: vi.fn(),
+    };
+    state.connect.mockResolvedValueOnce(client);
+
+    const supersession = supersedeMemory({
+      workspaceId,
+      memoryId: memoryRow().id,
+      replacement: {
+        agentId,
+        type: 'fact',
+        content: replacementContent,
+        actor: { type: 'user', id: userId },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = await supersession;
+
+    expect(result.replacement.id).toBe(replacementId);
+    expect(receivedSignal?.aborted).toBe(true);
+    const insertCall = client.query.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO memories'));
+    expect(insertCall?.[1]?.[14]).toBeNull();
+  });
+
+  it('revalidates inline replacement policy after locking the source and discards a prefetched vector when policy turns off', async () => {
+    const replacementId = '66666666-6666-4666-8666-666666666666';
+    const replacementContent = 'Policy changes during supersession';
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [{ semantic_search: true }] });
+    state.embeddingFor.mockResolvedValueOnce([0.25, 0.75]);
+    const statements: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        statements.push(sql);
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
+        if (sql.startsWith('SELECT') && sql.includes("verification_status <> 'superseded'")) {
+          return { rowCount: 1, rows: [memoryRow()] };
+        }
+        if (sql.includes('FROM agents')) return { rowCount: 1, rows: [{ semantic_search: false }] };
+        if (sql.includes('INSERT INTO memories')) {
+          return {
+            rowCount: 1,
+            rows: [memoryRow({
+              id: replacementId,
+              content: values?.[4],
+              verification_status: values?.[12],
+            })],
+          };
+        }
+        return {
+          rowCount: 1,
+          rows: [memoryRow({ verification_status: 'superseded', superseded_by: replacementId })],
+        };
+      }),
+      release: vi.fn(),
+    };
+    state.connect.mockResolvedValueOnce(client);
+
+    await supersedeMemory({
+      workspaceId,
+      memoryId: memoryRow().id,
+      replacement: {
+        agentId,
+        type: 'fact',
+        content: replacementContent,
+        actor: { type: 'user', id: userId },
+      },
+    });
+
+    expect(state.embeddingFor).toHaveBeenCalledOnce();
+    expect(state.query).toHaveBeenCalledWith(
+      expect.stringContaining('FROM agents'),
+      [agentId, workspaceId],
+    );
+    const lockIndex = statements.findIndex((sql) => sql.includes('FOR UPDATE'));
+    const policyIndex = statements.findIndex((sql) => sql.includes('FROM agents'));
+    const insertIndex = statements.findIndex((sql) => sql.includes('INSERT INTO memories'));
+    expect(lockIndex).toBeGreaterThan(-1);
+    expect(policyIndex).toBeGreaterThan(lockIndex);
+    expect(insertIndex).toBeGreaterThan(policyIndex);
+    const insertCall = client.query.mock.calls[insertIndex];
+    expect(insertCall?.[1]?.[14]).toBeNull();
   });
 
   it('refreshes the embedding atomically with edited content when authoritative policy is on', async () => {
