@@ -210,7 +210,6 @@ async function apiToolManifest(
   client: Queryable,
   workspaceId: string,
   toolIds: string[],
-  canonicalizePermissionOrder = true,
 ) {
   const uniqueIds = uniqueSorted(toolIds);
   if (!uniqueIds.length) return {};
@@ -229,7 +228,7 @@ async function apiToolManifest(
       schemaHash: canonicalJsonHash(publicToolSchema(tool.config)),
       permissionHash: canonicalJsonHash({
         kind: tool.kind,
-        permissions: canonicalizePermissionOrder ? [...tool.permissions].sort() : tool.permissions,
+        permissions: [...tool.permissions].sort(),
       }),
     }];
   }));
@@ -517,6 +516,77 @@ function assertManifestDependenciesMatchAny(stored: unknown, currentCandidates: 
   });
 }
 
+const LEGACY_V1_PERMISSION_PERMUTATION_LIMIT = 7;
+const LEGACY_V1_PERMISSION_HASH_BUDGET = 20_000;
+const LEGACY_V1_PERMISSION_VALUE_LENGTH_LIMIT = 256;
+const LEGACY_V1_PERMISSION_BYTES_LIMIT = 2_048;
+
+function nextLexicalPermutation(values: string[]) {
+  let pivot = values.length - 2;
+  while (pivot >= 0 && values[pivot] >= values[pivot + 1]) pivot -= 1;
+  if (pivot < 0) return false;
+  let successor = values.length - 1;
+  while (values[successor] <= values[pivot]) successor -= 1;
+  [values[pivot], values[successor]] = [values[successor], values[pivot]];
+  for (let left = pivot + 1, right = values.length - 1; left < right; left += 1, right -= 1) {
+    [values[left], values[right]] = [values[right], values[left]];
+  }
+  return true;
+}
+
+function legacyV1PermissionHashMatches(
+  expectedHash: string,
+  kind: string,
+  permissions: string[],
+  budget: { remaining: number },
+) {
+  if (canonicalJsonHash({ kind, permissions }) === expectedHash) return true;
+  if (permissions.length > LEGACY_V1_PERMISSION_PERMUTATION_LIMIT
+    || permissions.some((permission) => permission.length > LEGACY_V1_PERMISSION_VALUE_LENGTH_LIMIT)
+    || permissions.reduce((total, permission) => total + Buffer.byteLength(permission, 'utf8'), 0) > LEGACY_V1_PERMISSION_BYTES_LIMIT) return false;
+  const candidate = [...permissions].sort();
+  do {
+    if (budget.remaining <= 0) return false;
+    budget.remaining -= 1;
+    if (canonicalJsonHash({ kind, permissions: candidate }) === expectedHash) return true;
+  } while (nextLexicalPermutation(candidate));
+  return false;
+}
+
+async function legacyV1ApiToolCandidate(
+  client: Queryable,
+  workspaceId: string,
+  stored: ExecutionManifest['apiTools'],
+  current: ExecutionManifest['apiTools'],
+) {
+  const toolIds = uniqueSorted(Object.keys(current));
+  if (!sameIds(Object.keys(stored), toolIds)) return null;
+  if (!toolIds.length) return current;
+  const result = await client.query<Pick<ToolManifestRow, 'id' | 'kind' | 'permissions'>>(
+    `SELECT id,kind,permissions FROM tools
+      WHERE workspace_id=$1 AND enabled=true AND id=ANY($2::uuid[])`,
+    [workspaceId, toolIds],
+  );
+  const rows = new Map(result.rows.map((row) => [row.id, row]));
+  if (toolIds.some((id) => !rows.has(id))) return null;
+  const budget = { remaining: LEGACY_V1_PERMISSION_HASH_BUDGET };
+  const compatible = Object.fromEntries(toolIds.map((id) => {
+    const row = rows.get(id)!;
+    const storedEntry = stored[id];
+    const currentEntry = current[id];
+    if (!legacyV1PermissionHashMatches(
+      storedEntry.permissionHash,
+      row.kind,
+      row.permissions,
+      budget,
+    )) return [id, null];
+    return [id, { ...currentEntry, permissionHash: storedEntry.permissionHash }];
+  }));
+  return Object.values(compatible).some((entry) => entry === null)
+    ? null
+    : compatible as ExecutionManifest['apiTools'];
+}
+
 function sameIds(actual: string[], expected: string[]) {
   const left = [...new Set(actual)].sort();
   const right = [...new Set(expected)].sort();
@@ -659,15 +729,16 @@ export async function assertTaskManifestDependencies(
       runtime: { version: RUNTIME_VERSION, stateSchemaVersion: 1 },
     };
     if (manifestDependenciesMatch(manifest, current)) return;
-    const legacyApiTools = await apiToolManifest(
+    const legacyApiTools = await legacyV1ApiToolCandidate(
       client,
       input.workspaceId,
-      version.snapshot.apiToolIds,
-      false,
+      manifest.apiTools,
+      current.apiTools,
     );
+    if (!legacyApiTools) assertManifestDependenciesMatch(manifest, current);
     assertManifestDependenciesMatchAny(manifest, [
       current,
-      { ...current, apiTools: legacyApiTools },
+      { ...current, apiTools: legacyApiTools! },
     ]);
   } catch (error) {
     asManifestIncompatible(error);
@@ -728,19 +799,21 @@ export async function assertWorkflowManifestDependencies(
       ...dependencies,
     };
     if (manifestDependenciesMatch(manifest, current)) return;
-    const legacyApiTools = await apiToolManifest(
+    const legacyApiTools = await legacyV1ApiToolCandidate(
       client,
       input.workspaceId,
-      workflowApiToolIds(input.definition, versions),
-      false,
+      manifest.apiTools,
+      current.apiTools,
     );
+    if (!legacyApiTools) assertManifestDependenciesMatch(manifest, current);
     assertManifestDependenciesMatchAny(manifest, [
       current,
       {
         ...current,
-        apiTools: legacyApiTools,
+        apiTools: legacyApiTools!,
         outputContracts: workflowOutputContracts(input.definition, false),
       },
+      { ...current, apiTools: legacyApiTools! },
     ]);
   } catch (error) {
     asManifestIncompatible(error);

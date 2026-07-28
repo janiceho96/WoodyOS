@@ -199,17 +199,108 @@ describe('execution manifest compatibility', () => {
     });
     process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
 
-    await expect(assertTaskManifestDependencies({ workspaceId, agentId, manifest: stored }, clientFor(['records.write', 'records.read']))).resolves.toBeUndefined();
+    await expect(assertTaskManifestDependencies({ workspaceId, agentId, manifest: stored }, clientFor(['records.read', 'records.write']))).resolves.toBeUndefined();
     await expect(assertTaskManifestDependencies({ workspaceId, agentId, manifest: stored }, clientFor(['records.write', 'records.delete']))).rejects.toMatchObject({
+      code: 'RUN_MANIFEST_INCOMPATIBLE',
+    });
+  });
+
+  it('resumes legacy workflow manifests after permission reordering without accepting changed membership', async () => {
+    // Break caught: requiring one raw database order for an opaque legacy permission hash on workflow resume.
+    const workspaceId = '00000000-0000-4000-8000-000000000020';
+    const workflowId = '00000000-0000-4000-8000-000000000021';
+    const workflowVersionId = '00000000-0000-4000-8000-000000000022';
+    const agentId = '00000000-0000-4000-8000-000000000023';
+    const versionId = '00000000-0000-4000-8000-000000000024';
+    const toolId = '00000000-0000-4000-8000-000000000025';
+    const snapshot = {
+      name: 'Legacy workflow agent',
+      role: 'Worker',
+      goal: 'Complete work',
+      instructions: 'Be exact',
+      personality: null,
+      model: 'model-a',
+      modelConfig: {},
+      capabilities: {},
+      apiToolIds: [toolId],
+      memoryConfig: {},
+      avatarIdentity: {},
+    };
+    const definition = {
+      nodes: [
+        { id: 'start', type: 'trigger' as const, config: {} },
+        { id: 'worker', type: 'agent' as const, config: { agentId } },
+        { id: 'call_api', type: 'api_action' as const, config: { toolId } },
+        { id: 'finish', type: 'output' as const, config: { artifactFormats: ['xlsx', 'pdf'] } },
+      ],
+      edges: [
+        { source: 'start', target: 'worker' },
+        { source: 'worker', target: 'call_api' },
+        { source: 'call_api', target: 'finish' },
+      ],
+    };
+    const schemaHash = canonicalJsonHash({
+      inputSchema: { type: 'object', properties: {}, additionalProperties: true },
+      endpoint: 'https://api.test/workflows',
+      method: undefined,
+      readOnly: true,
+    });
+    const stored: ExecutionManifest = {
+      ...exactManifest(),
+      workflow: {
+        id: workflowId,
+        versionId: workflowVersionId,
+        version: 1,
+        definitionHash: canonicalJsonHash(definition),
+      },
+      agents: { [agentId]: { versionId, version: 1, snapshotHash: canonicalJsonHash(snapshot) } },
+      models: { [agentId]: { provider: 'test-provider', model: 'model-a', parametersHash: canonicalJsonHash({ modelConfig: {}, providerConfig: { baseUrl: null, defaultModel: 'model-a' } }) } },
+      apiTools: {
+        [toolId]: {
+          toolId,
+          schemaHash,
+          permissionHash: canonicalJsonHash({ kind: 'api', permissions: ['records.write', 'records.read'] }),
+        },
+      },
+      adapters: { start: 'logic:1', worker: 'agent:1', call_api: 'api:1', finish: 'file:1' },
+      outputContracts: {
+        worker: canonicalJsonHash('text'),
+        finish: canonicalJsonHash({ artifactFormats: ['xlsx', 'pdf'], fromNodeId: null }),
+      },
+    };
+    const clientFor = (permissions: string[]) => ({
+      query: async (sql: string) => {
+        if (sql.includes('FROM workflow_versions')) return { rows: [{ id: workflowVersionId, workflow_id: workflowId, version: 1, definition }] };
+        if (sql.includes('FROM agent_versions')) return { rows: [{ id: versionId, agent_id: agentId, version: 1, snapshot }] };
+        if (sql.includes('FROM tools')) return { rows: [{ id: toolId, kind: 'api', config: encryptJson({ endpoint: 'https://api.test/workflows', readOnly: true }), permissions }] };
+        if (sql.includes('FROM mcp_connection_tools')) return { rows: [] };
+        if (sql.includes('FROM workspace_ai_provider_configs')) return { rows: [{ provider: 'test-provider', base_url: null, default_model: 'model-a' }] };
+        throw new Error(`Unexpected workflow dependency query: ${sql}`);
+      },
+    });
+    process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
+
+    await expect(assertWorkflowManifestDependencies({
+      workspaceId,
+      workflowVersionId,
+      definition,
+      manifest: stored,
+    }, clientFor(['records.read', 'records.write']))).resolves.toBeUndefined();
+    await expect(assertWorkflowManifestDependencies({
+      workspaceId,
+      workflowVersionId,
+      definition,
+      manifest: stored,
+    }, clientFor(['records.read', 'records.delete']))).rejects.toMatchObject({
       code: 'RUN_MANIFEST_INCOMPATIBLE',
     });
   });
 
   it('resumes workflow runs created before output-format canonicalization', async () => {
     // Break caught: sorting output artifact formats invalidating a queued run whose published definition is unchanged.
-    const workspaceId = '00000000-0000-4000-8000-000000000020';
-    const workflowId = '00000000-0000-4000-8000-000000000021';
-    const workflowVersionId = '00000000-0000-4000-8000-000000000022';
+    const workspaceId = '00000000-0000-4000-8000-000000000030';
+    const workflowId = '00000000-0000-4000-8000-000000000031';
+    const workflowVersionId = '00000000-0000-4000-8000-000000000032';
     const definition = {
       nodes: [
         { id: 'start', type: 'trigger' as const, config: {} },
