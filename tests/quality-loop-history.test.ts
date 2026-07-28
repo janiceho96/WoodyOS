@@ -92,7 +92,7 @@ function context(input: {
         worker: { text: 'Candidate' },
         grader: { data: graderStateVerdict },
       },
-      ...(input.identitySchemaVersion === false ? {} : { agentExecutionIdentitySchemaVersion: 1 }),
+      ...(input.identitySchemaVersion === false ? {} : { __runtime: { agentExecutionIdentitySchemaVersion: 1 } }),
       ...(input.storedIdentities === false ? {} : {
         agentExecutionIdentities: {
           ...(input.candidateIdentity === false ? {} : {
@@ -227,6 +227,18 @@ describe('quality-loop durable history', () => {
     });
     expect(state.order).toEqual([]);
     expect(adapterContext.run.state.qualityHistory).toBeUndefined();
+  });
+
+  it('keeps exact-run history strict after a node output uses the former marker key', async () => {
+    const adapterContext = context();
+    adapterContext.run.state.agentExecutionIdentitySchemaVersion = { text: 'ordinary node output' };
+
+    await executeLogicNode(adapterContext);
+
+    expect(state.order).toEqual(['append', 'state']);
+    expect(adapterContext.run.state.qualityHistory).toMatchObject({
+      quality_loop: { entryIds: [ids.entry] },
+    });
   });
 
   it('keeps successful test-mode quality loops publishable without durable identities', async () => {

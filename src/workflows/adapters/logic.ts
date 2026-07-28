@@ -84,7 +84,13 @@ function requiresDurableQualityHistory(context: WorkflowAdapterContext) {
 }
 
 function hasCurrentIdentitySchema(state: Record<string, unknown>) {
-  return state.agentExecutionIdentitySchemaVersion === 1;
+  const runtime = state.__runtime;
+  return Boolean(
+    runtime
+    && typeof runtime === 'object'
+    && !Array.isArray(runtime)
+    && (runtime as Record<string, unknown>).agentExecutionIdentitySchemaVersion === 1,
+  );
 }
 
 async function persistPendingQualityIteration(context: WorkflowAdapterContext) {

@@ -165,7 +165,7 @@ async function createQueuedRun(input: {
     input: input.runInput,
     nodes: {},
     variables: {},
-    agentExecutionIdentitySchemaVersion: 1,
+    __runtime: { agentExecutionIdentitySchemaVersion: 1 },
   };
   const cursor = { nodeId: trigger.id, loops: {}, attempt: 1 };
   const trace = createTraceContext();
