@@ -3,6 +3,169 @@ import { evaluateCondition, valueAtPath, type WorkflowNode } from '../definition
 import type { WorkflowAdapterContext, WorkflowCursor } from './types.js';
 import { cancellationError } from '../../runtime/cancellation.js';
 import { assertFencedMutation } from '../../runtime/leases.js';
+import { appendQualityHistoryEntry } from '../../quality/history.js';
+import { getTaskOutputDocument, initializeTaskOutputDocument } from '../../outputs/service.js';
+import { runtimeError } from '../../runtime/errors.js';
+import type { AgentNodeExecutionIdentity } from './types.js';
+
+type QualitySummary = {
+  entryId: string;
+  iteration: number;
+  automatedRevision: number;
+  manualRevision: number;
+  candidate: unknown;
+  verdict: Record<string, unknown>;
+  revisionAgentNodeId: string;
+};
+
+type QualityMaterialization = {
+  entryIds: string[];
+  current: QualitySummary;
+};
+
+function recordQualityMaterialization(
+  state: Record<string, unknown>,
+  loopNodeId: string,
+  summary: QualitySummary,
+) {
+  const historyRoot = state.qualityHistory
+    && typeof state.qualityHistory === 'object'
+    && !Array.isArray(state.qualityHistory)
+    ? state.qualityHistory as Record<string, unknown>
+    : {};
+  const previous = historyRoot[loopNodeId]
+    && typeof historyRoot[loopNodeId] === 'object'
+    && !Array.isArray(historyRoot[loopNodeId])
+    ? historyRoot[loopNodeId] as Partial<QualityMaterialization>
+    : {};
+  const entryIds = Array.isArray(previous.entryIds)
+    ? previous.entryIds.filter((id): id is string => typeof id === 'string')
+    : [];
+  if (!entryIds.includes(summary.entryId)) entryIds.push(summary.entryId);
+  historyRoot[loopNodeId] = { entryIds, current: summary };
+  state.qualityHistory = historyRoot;
+}
+
+function identityFor(
+  state: Record<string, unknown>,
+  nodeId: string,
+): AgentNodeExecutionIdentity | null {
+  const identities = state.agentExecutionIdentities
+    && typeof state.agentExecutionIdentities === 'object'
+    && !Array.isArray(state.agentExecutionIdentities)
+    ? state.agentExecutionIdentities as Record<string, unknown>
+    : {};
+  const identity = identities[nodeId];
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return null;
+  const candidate = identity as Partial<AgentNodeExecutionIdentity>;
+  return typeof candidate.taskId === 'string'
+    && typeof candidate.agentVersionId === 'string'
+    && typeof candidate.outputDocumentVersionId === 'string'
+    && typeof candidate.modelIdentity === 'string'
+    ? candidate as AgentNodeExecutionIdentity
+    : null;
+}
+
+async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
+  const { execution, run, node, cursor } = context;
+  const quality = node.config.quality
+    && typeof node.config.quality === 'object'
+    && !Array.isArray(node.config.quality)
+    ? node.config.quality as Record<string, unknown>
+    : null;
+  const loop = cursor.loops[node.id] ?? { iteration: 0 };
+  if (!quality || loop.iteration <= 0) return;
+  const nodes = run.state.nodes && typeof run.state.nodes === 'object' && !Array.isArray(run.state.nodes)
+    ? run.state.nodes as Record<string, unknown>
+    : {};
+  const graderNodeId = String(quality.graderNodeId ?? 'grader');
+  const workerNodeId = String(quality.workerNodeId ?? 'worker');
+  const revisionNodeId = String(quality.revisionNodeId ?? workerNodeId);
+  const candidateNodeId = loop.iteration === 1 ? workerNodeId : revisionNodeId;
+  const grader = nodes[graderNodeId] && typeof nodes[graderNodeId] === 'object' && !Array.isArray(nodes[graderNodeId])
+    ? nodes[graderNodeId] as Record<string, unknown>
+    : {};
+  const verdict = grader.data && typeof grader.data === 'object' && !Array.isArray(grader.data)
+    ? grader.data as Record<string, unknown>
+    : null;
+  if (!verdict) return;
+  const candidateIdentity = identityFor(run.state, candidateNodeId);
+  if (!candidateIdentity) {
+    throw runtimeError('QUALITY_CANDIDATE_VERSION_REQUIRED', {
+      category: 'validation',
+      retryable: false,
+      message: 'Quality candidates require a completed versioned text output',
+      details: { nodeId: candidateNodeId, iteration: loop.iteration },
+    });
+  }
+  const graderIdentity = identityFor(run.state, graderNodeId);
+  if (!graderIdentity) {
+    throw runtimeError('QUALITY_GRADER_IDENTITY_REQUIRED', {
+      category: 'validation',
+      retryable: false,
+      message: 'Quality grades require an exact grader execution identity',
+      details: { nodeId: graderNodeId, iteration: loop.iteration },
+    });
+  }
+  let candidateDocument = await getTaskOutputDocument(run.workspace_id, candidateIdentity.taskId);
+  if (!candidateDocument) {
+    try {
+      candidateDocument = await initializeTaskOutputDocument({
+        workspaceId: run.workspace_id,
+        taskId: candidateIdentity.taskId,
+        actorId: run.created_by,
+      });
+    } catch (error) {
+      if (!(error instanceof Error && error.message === 'OUTPUT_SOURCE_EMPTY')) throw error;
+      throw runtimeError('QUALITY_CANDIDATE_VERSION_REQUIRED', {
+        category: 'validation',
+        retryable: false,
+        message: 'Quality candidates require a completed versioned text output',
+        details: { nodeId: candidateNodeId, iteration: loop.iteration },
+      });
+    }
+  }
+  const outputVersion = candidateDocument.currentVersion;
+  const passingScore = Number(node.config.passingScore ?? 0);
+  const passed = verdict.passed === true
+    && typeof verdict.score === 'number'
+    && verdict.score >= passingScore;
+  const maxIterations = Number(node.config.maxIterations ?? 10);
+  const atLimit = loop.iteration >= maxIterations;
+  const exitReason = passed
+    ? 'quality_passed'
+    : atLimit
+      ? String(node.config.onLimit ?? 'fail') === 'exit' ? 'limit_exit' : 'limit_fail'
+      : null;
+  const automatedRevision = Math.max(0, loop.iteration - 1);
+  const manualRevision = Math.max(0, outputVersion.version_number - 1);
+  const entry = await appendQualityHistoryEntry({
+    workspaceId: run.workspace_id,
+    workflowRunId: run.id,
+    sequence: loop.iteration,
+    automatedRevision,
+    manualRevision,
+    candidateTaskId: candidateIdentity.taskId,
+    outputDocumentVersionId: outputVersion.id,
+    candidateHash: outputVersion.content_hash,
+    graderTaskId: graderIdentity.taskId,
+    graderAgentVersionId: graderIdentity.agentVersionId,
+    modelIdentity: graderIdentity.modelIdentity,
+    result: verdict,
+    exitReason,
+    traceId: run.trace_id,
+    leaseOwnerId: execution.leaseOwnerId,
+  });
+  recordQualityMaterialization(run.state, node.id, {
+    entryId: entry.id,
+    iteration: loop.iteration,
+    automatedRevision,
+    manualRevision,
+    candidate: nodes[candidateNodeId] ?? null,
+    verdict,
+    revisionAgentNodeId: candidateNodeId,
+  });
+}
 
 export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Record<string, unknown>) {
   const mode = String(node.config.mode ?? 'forEach');
@@ -43,8 +206,15 @@ export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Re
     const historyRoot = state.qualityHistory && typeof state.qualityHistory === 'object' && !Array.isArray(state.qualityHistory)
       ? state.qualityHistory as Record<string, unknown>
       : {};
-    const history = Array.isArray(historyRoot[node.id]) ? historyRoot[node.id] as Array<Record<string, unknown>> : [];
-    if (loop.iteration > 0 && verdict && !history.some((entry) => entry.iteration === loop.iteration)) {
+    const storedHistory = historyRoot[node.id];
+    const materialized = storedHistory && typeof storedHistory === 'object' && !Array.isArray(storedHistory)
+      ? storedHistory as Partial<QualityMaterialization>
+      : null;
+    const history = Array.isArray(storedHistory) ? storedHistory as Array<Record<string, unknown>> : [];
+    const materializedCurrent = materialized?.current?.iteration === loop.iteration
+      ? materialized.current
+      : null;
+    if (loop.iteration > 0 && verdict && !materializedCurrent && !history.some((entry) => entry.iteration === loop.iteration)) {
       const candidateNodeId = loop.iteration === 1 ? workerNodeId : revisionNodeId;
       history.push({ iteration: loop.iteration, candidate: nodes[candidateNodeId] ?? null, verdict, revisionAgentNodeId: candidateNodeId });
       historyRoot[node.id] = history;
@@ -53,10 +223,13 @@ export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Re
     if (verdict) {
       const passingScore = Number(node.config.passingScore ?? 0);
       const passed = verdict.passed === true && typeof verdict.score === 'number' && verdict.score >= passingScore;
-      const latest = history.at(-1);
-      if (passed) return { branch: 'done', output: { iterations: loop.iteration, reason: 'quality_passed', candidate: latest?.candidate ?? null, verdict, history } };
+      const latest = materializedCurrent ?? history.at(-1);
+      const historyOutput = materialized
+        ? materialized.entryIds ?? []
+        : history;
+      if (passed) return { branch: 'done', output: { iterations: loop.iteration, reason: 'quality_passed', candidate: latest?.candidate ?? null, verdict, history: historyOutput } };
       if (loop.iteration >= maxIterations) {
-        if (onLimit === 'exit') return { branch: 'done', output: { iterations: loop.iteration, reason: 'limit_exit', candidate: latest?.candidate ?? null, verdict, history, warning: 'Quality threshold was not reached before the revision limit.' } };
+        if (onLimit === 'exit') return { branch: 'done', output: { iterations: loop.iteration, reason: 'limit_exit', candidate: latest?.candidate ?? null, verdict, history: historyOutput, warning: 'Quality threshold was not reached before the revision limit.' } };
         throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
       }
       cursor.loops[node.id] = loop;
@@ -85,6 +258,7 @@ export async function executeLogicNode(context: WorkflowAdapterContext) {
     return { result, output: result };
   }
   if (node.type === 'loop') {
+    await persistPendingQualityIteration(context);
     const result = loopResult(node, cursor, run.state);
     setNodeOutput(result.output);
     await emitEvent(result.branch === 'body' ? 'loop.iteration' : 'loop.completed', result.branch === 'body' ? `Loop iteration ${(result.output as { iteration: number }).iteration + 1} started` : 'Loop exit selected', result.output as Record<string, unknown>);

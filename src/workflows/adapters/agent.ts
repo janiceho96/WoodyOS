@@ -3,6 +3,9 @@ import type { WorkflowAdapterContext } from './types.js';
 import { resolveNodeInput } from './templates.js';
 import { childTraceContext } from '../../runtime/trace.js';
 import { assertFencedMutation } from '../../runtime/leases.js';
+import { initializeTaskOutputDocument } from '../../outputs/service.js';
+import { modelIdentityFromManifest } from '../../quality/history.js';
+import type { AgentNodeExecutionIdentity } from './types.js';
 
 function json(value: unknown) {
   return JSON.stringify(value === undefined ? null : value);
@@ -13,8 +16,17 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
   execution.signal.throwIfAborted();
   const agentId = node.config.agentId;
   if (typeof agentId !== 'string') throw new Error(`Agent node ${node.id} has no agentId`);
-  let task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
-    `SELECT id,status,output,error,trace_id FROM tasks
+  type AgentTask = {
+    id: string;
+    status: string;
+    output: unknown;
+    error: unknown;
+    trace_id: string;
+    agent_id: string;
+    agent_version_id: string | null;
+  };
+  let task = (await query<AgentTask>(
+    `SELECT id,status,output,error,trace_id,agent_id,agent_version_id FROM tasks
      WHERE workflow_run_id=$1 AND workflow_node_id=$2 AND workflow_iteration_key=$3 AND workflow_attempt=$4`,
     [run.id, node.id, iterationKey, cursor.attempt],
   )).rows[0];
@@ -37,7 +49,7 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
       });
     }
     execution.signal.throwIfAborted();
-    const childTask = await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>(
+    const childTask = await query<AgentTask>(
       `INSERT INTO tasks(
          workspace_id,agent_id,agent_version_id,workflow_run_id,workflow_node_id,workflow_iteration_key,
          workflow_attempt,title,input,requested_by,manifest_version,execution_manifest,
@@ -52,7 +64,7 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
              AND owner_id=$16 AND expires_at>now()
          )
        )
-       RETURNING id,status,output,error,trace_id`,
+       RETURNING id,status,output,error,trace_id,agent_id,agent_version_id`,
       [
         run.workspace_id,
         agentId,
@@ -88,12 +100,38 @@ export async function executeAgentNode(context: WorkflowAdapterContext) {
     ? task.output
     : await executeAgentTask(task.id, task.trace_id, execution.signal);
   if (output && typeof output === 'object' && 'awaitingApproval' in output) return { waiting: true, waitingMessage: 'Agent tool confirmation is required', output };
-  if (output === null) {
-    task = (await query<{ id: string; status: string; output: unknown; error: unknown; trace_id: string }>('SELECT id,status,output,error,trace_id FROM tasks WHERE id=$1', [task.id])).rows[0];
+  if (task.status !== 'completed' || output === null) {
+    task = (await query<AgentTask>(
+      'SELECT id,status,output,error,trace_id,agent_id,agent_version_id FROM tasks WHERE id=$1',
+      [task.id],
+    )).rows[0];
     if (task?.status === 'completed') output = task.output as Record<string, unknown>;
     else if (task?.status === 'awaiting_approval') return { waiting: true, waitingMessage: 'Agent tool confirmation is required', output: null };
     else throw new Error(`Agent node ${node.id} did not produce an output`);
   }
+  let agentExecutionIdentity: AgentNodeExecutionIdentity | undefined;
+  if (task.agent_version_id && run.execution_manifest) {
+    try {
+      const document = await initializeTaskOutputDocument({
+        workspaceId: run.workspace_id,
+        taskId: task.id,
+        actorId: run.created_by,
+      });
+      agentExecutionIdentity = {
+        taskId: task.id,
+        agentVersionId: task.agent_version_id,
+        outputDocumentVersionId: document.currentVersion.id,
+        modelIdentity: modelIdentityFromManifest(
+          run.execution_manifest,
+          task.agent_id,
+          task.agent_version_id,
+        ),
+        output,
+      };
+    } catch (error) {
+      if (!(error instanceof Error && error.message === 'OUTPUT_SOURCE_EMPTY')) throw error;
+    }
+  }
   setNodeOutput(output);
-  return { output, result: output };
+  return { output, result: output, ...(agentExecutionIdentity ? { agentExecutionIdentity } : {}) };
 }

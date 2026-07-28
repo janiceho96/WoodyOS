@@ -407,6 +407,15 @@ export async function executeWorkflowStep(
       await waitNode(run, node, cursor, execution.waitingMessage ?? 'Human confirmation is required', nodeTrace, lease);
       return { waiting: true };
     }
+    if (execution.agentExecutionIdentity) {
+      const identities = run.state.agentExecutionIdentities
+        && typeof run.state.agentExecutionIdentities === 'object'
+        && !Array.isArray(run.state.agentExecutionIdentities)
+        ? run.state.agentExecutionIdentities as Record<string, unknown>
+        : {};
+      identities[node.id] = execution.agentExecutionIdentity;
+      run.state.agentExecutionIdentities = identities;
+    }
     await completeNode(run, node, cursor, execution.output, nodeTrace, lease);
     if (run.test_target_node_id === node.id) {
       const testOutput = execution.output ?? run.state[node.id] ?? null;

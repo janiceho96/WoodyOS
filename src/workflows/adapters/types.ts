@@ -42,9 +42,18 @@ export type AgentTaskExecutor = (
   signal?: AbortSignal,
 ) => Promise<AgentTaskResult>;
 
+export type AgentNodeExecutionIdentity = {
+  taskId: string;
+  agentVersionId: string;
+  outputDocumentVersionId: string;
+  modelIdentity: string;
+  output: unknown;
+};
+
 export type WorkflowAdapterExecution = {
   output: unknown;
   result?: unknown;
+  agentExecutionIdentity?: AgentNodeExecutionIdentity;
   waiting?: boolean;
   waitingMessage?: string;
   finished?: boolean;
