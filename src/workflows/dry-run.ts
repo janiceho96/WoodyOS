@@ -4,12 +4,12 @@ import { contractCompatible, resolveBinding, type ContractBinding } from './cont
 import { workflowNodeDefinition } from './registry.js';
 
 type AgentResource = { id: string; versionId: string | null; version: number | null; snapshotHash?: string };
-type ToolResource = { id: string; kind: string; risk: string; permissions: string[]; connectionId?: string; agentIds?: string[]; schema?: unknown; permissionHash?: string; schemaHash?: string; policyVersion?: string };
+type ToolResource = { id: string; kind: string; risk: string; permissions: string[]; requiresApproval?: boolean; connectionId?: string; agentIds?: string[]; schema?: unknown; permissionHash?: string; schemaHash?: string; policyVersion?: string };
 export type DryRunResources = { agents: Map<string, AgentResource>; tools: Map<string, ToolResource>; mcpTools: Map<string, ToolResource>; policyVersion?: string; runtimeVersion?: string };
 export type DryRunIssue = { code: string; message: string; nodeId?: string; guidance: string };
 export type DryRunResult = {
   valid: boolean; executionPath: string[]; bindings: ReturnType<typeof resolveBinding>[]; errors: DryRunIssue[]; warnings: DryRunIssue[];
-  externalActions: Array<{ nodeId: string; adapter: 'api' | 'mcp' | 'legacy_tool' | 'browser'; resourceId: string; risk: string; requiresConfirmation: boolean }>;
+  externalActions: Array<{ nodeId: string; adapter: 'api' | 'mcp' | 'legacy_tool' | 'browser'; resourceId: string; risk: string; permissions: string[]; requiresConfirmation: boolean }>;
   requiredApprovals: Array<{ nodeId: string; reason: string; prompt?: string }>;
   missingResources: Array<{ nodeId: string; resourceId: string; kind: string }>;
   pinnedAgents: Array<{ nodeId: string; agentId: string; versionId: string; version: number }>;
@@ -36,7 +36,7 @@ function graph(definition: WorkflowDefinition, input: Record<string, unknown>, e
     while (queue.length) { const id = queue.shift()!; path.push(id); const node = nodes.get(id); for (const edge of definition.edges) {
       if (edge.source !== id || reachable.has(edge.target)) continue;
       if (node?.type === 'condition') {
-        const selected = evaluateCondition(node.config, { input });
+        const selected = evaluateCondition(node.config, { ...input, input });
         if (edge.condition !== String(selected)) continue;
       }
       reachable.add(edge.target); queue.push(edge.target);
@@ -62,6 +62,10 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
     if (result.binding?.legacy) warnings.push(issue('LEGACY_PORT_DEFAULT', `${edge.source} → ${edge.target} uses legacy output-to-input ports`, edge.target, 'Save the workflow with explicit ports to remove this compatibility warning.'));
     if (result.binding && !contractCompatible(result.binding)) errors.push(issue('NODE_SCHEMA_INCOMPATIBLE', `Binding ${edge.source}.${result.binding.sourcePort} is incompatible with ${edge.target}.${result.binding.targetPort}`, edge.target, 'Use matching schema types or add an explicit registered transformation.'));
   }
+  for (const node of input.definition.nodes) {
+    const required = workflowNodeDefinition(node.type)?.inputPorts.filter((port) => port.required) ?? [];
+    for (const port of required) if (!bindings.some((result) => result.binding?.target === node.id && result.binding.targetPort === port.id)) errors.push(issue('REQUIRED_PORT_UNBOUND', `Required port ${node.id}.${port.id} has no binding`, node.id, 'Connect a compatible value to every required input port.'));
+  }
   const externalActions: DryRunResult['externalActions'] = []; const requiredApprovals: DryRunResult['requiredApprovals'] = []; const missingResources: DryRunResult['missingResources'] = []; const pinnedAgents: DryRunResult['pinnedAgents'] = [];
   let maxLoopIterations = 0; let loopMultiplier = 1;
   for (const node of input.definition.nodes) {
@@ -80,13 +84,15 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
       if (!resource) { missingResources.push({ nodeId: node.id, resourceId, kind: adapter }); errors.push(issue('RESOURCE_NOT_FOUND', `${adapter} resource ${resourceId || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an enabled resource owned by this workspace.')); }
       else {
         if (node.type === 'mcp_action' && resource.agentIds && !resource.agentIds.includes(String(config.agentId))) errors.push(issue('MCP_ACCESS_DENIED', `MCP tool ${resourceId} is not allowlisted for agent ${String(config.agentId)}`, node.id, 'Enable this tool for the selected agent or choose an allowed action.'));
-        const requiresConfirmation = resource.risk !== 'read'; externalActions.push({ nodeId: node.id, adapter, resourceId, risk: resource.risk, requiresConfirmation }); if (requiresConfirmation) requiredApprovals.push({ nodeId: node.id, reason: 'External write requires confirmation' });
+        const requiresConfirmation = node.type === 'action' ? resource.requiresApproval !== false : resource.risk !== 'read'; externalActions.push({ nodeId: node.id, adapter, resourceId, risk: resource.risk, permissions: [...resource.permissions].sort(), requiresConfirmation }); if (requiresConfirmation) requiredApprovals.push({ nodeId: node.id, reason: 'External write requires confirmation' });
       }
     }
     if (node.type === 'approval') requiredApprovals.push({ nodeId: node.id, reason: 'Human approval node', prompt: typeof config.prompt === 'string' ? config.prompt : undefined });
     if (!workflowNodeDefinition(node.type)?.available) errors.push(issue('NODE_UNAVAILABLE', `Node ${node.id} has no available runtime adapter`, node.id, 'Replace the unavailable node before execution.'));
   }
-  const estimatedBudgets = { agentCalls: input.definition.nodes.filter((node) => node.type === 'agent').length * loopMultiplier, maxLoopIterations, externalActions: externalActions.length * loopMultiplier, maxNodeExecutions: input.definition.nodes.length * loopMultiplier };
+  const loopAncestors = (nodeId: string) => { const found = new Set<string>(); const pending = input.definition.edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source); while (pending.length) { const id = pending.pop()!; if (found.has(id)) continue; found.add(id); for (const edge of input.definition.edges.filter((candidate) => candidate.target === id)) pending.push(edge.source); } return found; };
+  const multiplierFor = (nodeId: string) => [...loopAncestors(nodeId)].reduce((total, id) => { const loop = input.definition.nodes.find((node) => node.id === id && node.type === 'loop'); return loop && path.includes(id) && typeof loop.config.maxIterations === 'number' ? total * loop.config.maxIterations : total; }, 1);
+  const estimatedBudgets = { agentCalls: input.definition.nodes.filter((node) => node.type === 'agent' && path.includes(node.id)).reduce((total, node) => total + multiplierFor(node.id), 0), maxLoopIterations, externalActions: externalActions.filter((action) => path.includes(action.nodeId)).reduce((total, action) => total + multiplierFor(action.nodeId), 0), maxNodeExecutions: path.reduce((total, nodeId) => total + multiplierFor(nodeId), 0) };
   const definitionHash = canonicalJsonHash(input.definition); const inputHash = canonicalJsonHash(input.input);
   const sorted = <T extends { id: string }>(items: Iterable<T>) => [...items].sort((left, right) => left.id.localeCompare(right.id));
   const dependencies = { agents: sorted(input.resources.agents.values()), tools: sorted(input.resources.tools.values()), mcpTools: sorted(input.resources.mcpTools.values()).map((tool) => ({ ...tool, agentIds: [...(tool.agentIds ?? [])].sort(), permissions: [...tool.permissions].sort() })), policyVersion: input.resources.policyVersion ?? 'default', runtimeVersion: input.resources.runtimeVersion ?? process.env.RUNTIME_VERSION ?? '0.1.0' };

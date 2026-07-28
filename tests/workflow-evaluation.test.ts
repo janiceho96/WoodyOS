@@ -39,7 +39,7 @@ describe('workflow dry run', () => {
 
     expect(adapterSpy).not.toHaveBeenCalled();
     expect(result).toMatchObject({ valid: true, executionPath: ['start', 'writer', 'send', 'finish'] });
-    expect(result.externalActions).toEqual([{ nodeId: 'send', adapter: 'api', resourceId: toolId, risk: 'write', requiresConfirmation: true }]);
+    expect(result.externalActions).toEqual([{ nodeId: 'send', adapter: 'api', resourceId: toolId, risk: 'write', permissions: ['contacts:write'], requiresConfirmation: true }]);
     expect(result.requiredApprovals).toEqual([expect.objectContaining({ nodeId: 'send', reason: 'External write requires confirmation' })]);
     expect(result.pinnedAgents).toEqual([{ nodeId: 'writer', agentId, versionId: '00000000-0000-4000-8000-000000000013', version: 3 }]);
     expect(result.manifest.definitionHash).toMatch(/^[a-f0-9]{64}$/);

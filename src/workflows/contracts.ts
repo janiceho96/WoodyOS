@@ -47,14 +47,15 @@ export function contractCompatible(binding: ResolvedBinding): boolean {
   if (binding.transformId) return false;
   if (!source || !target || source === 'any' || target === 'any') return true;
   if (source !== target) return false;
-  if (binding.required && (binding.nullable || binding.sourceSchema.nullable) && !binding.targetSchema.nullable) return false;
+  if ((binding.nullable || binding.sourceSchema.nullable) && !binding.targetSchema.nullable) return false;
+  if (source === 'array' && binding.targetSchema.items && !binding.sourceSchema.items) return false;
   if (source === 'array' && binding.sourceSchema.items && binding.targetSchema.items) {
     return contractCompatible({ ...binding, sourceSchema: binding.sourceSchema.items, targetSchema: binding.targetSchema.items });
   }
   if (source === 'object' && binding.targetSchema.properties) {
     for (const [key, targetProperty] of Object.entries(binding.targetSchema.properties)) {
       const sourceProperty = binding.sourceSchema.properties?.[key];
-      if (!sourceProperty && binding.targetSchema.required?.includes(key)) return false;
+      if ((!sourceProperty || !binding.sourceSchema.required?.includes(key)) && binding.targetSchema.required?.includes(key)) return false;
       if (sourceProperty && !contractCompatible({ ...binding, sourceSchema: sourceProperty, targetSchema: targetProperty })) return false;
     }
   }

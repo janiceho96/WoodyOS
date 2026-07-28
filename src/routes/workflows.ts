@@ -9,7 +9,7 @@ import { workflowDefinitionErrors, workflowDefinitionSchema, type WorkflowDefini
 import { requestWorkflowArtifacts } from '../artifacts/service.js';
 import { artifactFormatSchema } from '../artifacts/types.js';
 import { retryPolicy } from '../workflows/definition.js';
-import { toolRequiresApproval, type ToolRecord } from '../tools/runtime.js';
+import { toolRequiresApproval, toolRiskLevel, type ToolRecord } from '../tools/runtime.js';
 import { workflowLayoutErrors, workflowLayoutInputSchema } from '../workflows/layout.js';
 import {
   buildWorkflowManifest,
@@ -27,7 +27,6 @@ import { dryRunWorkflow, type DryRunResources } from '../workflows/dry-run.js';
 import { decryptJson } from '../lib/crypto.js';
 import { canonicalJsonHash } from '../runtime/manifest.js';
 import type { StoredConfig } from '../tools/runtime.js';
-import { toolRiskLevel } from '../tools/runtime.js';
 
 const workflowInput = z.object({ name: z.string().min(2).max(120), description: z.string().max(2000).default(''), definition: workflowDefinitionSchema, enabled: z.boolean().default(false) });
 const runInputSchema = z.object({ input: z.record(z.unknown()).default({}) });
@@ -67,12 +66,13 @@ async function dryRunResources(workspaceId: string, definition: WorkflowDefiniti
   const mcpById = new Map<string, { id: string; kind: string; risk: string; permissions: string[]; connectionId: string; agentIds: string[]; schema: unknown; schemaHash: string; permissionHash: string }>();
   for (const row of mcpTools.rows) {
     const current = mcpById.get(row.id);
-    if (current) current.agentIds.push(row.agent_id);
-    else mcpById.set(row.id, { id: row.id, kind: 'mcp', risk: row.risk_level, permissions: [row.connection_permission, row.tool_permission], connectionId: row.connection_id, agentIds: [row.agent_id], schema: row.input_schema, schemaHash: canonicalJsonHash(row.input_schema), permissionHash: canonicalJsonHash({ connection: row.connection_permission, tool: row.tool_permission }) });
+    if (current) { current.agentIds.push(row.agent_id); current.permissions.push(`${row.agent_id}:${row.connection_permission}:${row.tool_permission}`); }
+    else mcpById.set(row.id, { id: row.id, kind: 'mcp', risk: row.risk_level, permissions: [`${row.agent_id}:${row.connection_permission}:${row.tool_permission}`], connectionId: row.connection_id, agentIds: [row.agent_id], schema: row.input_schema, schemaHash: canonicalJsonHash(row.input_schema), permissionHash: '' });
   }
+  for (const value of mcpById.values()) { value.agentIds.sort(); value.permissions.sort(); value.permissionHash = canonicalJsonHash(value.permissions); }
   return {
     agents: new Map(agents.rows.map((row) => [row.id, { id: row.id, versionId: row.version_id, version: row.version, snapshotHash: canonicalJsonHash(row.snapshot) }])),
-    tools: new Map(tools.rows.map((row) => { const config = decryptJson(row.config) as Record<string, unknown>; const schema = config.inputSchema ?? { type: 'object', properties: {} }; const record = { id: row.id, name: '', kind: row.kind as 'api' | 'mcp' | 'plugin' | 'internal', config: row.config, permissions: row.permissions ?? [] }; const risk = toolRiskLevel(record); return [row.id, { id: row.id, kind: row.kind, risk, permissions: row.permissions ?? [], schema, schemaHash: canonicalJsonHash(schema), permissionHash: canonicalJsonHash({ kind: row.kind, permissions: row.permissions ?? [], risk }) }]; })),
+    tools: new Map(tools.rows.map((row) => { const config = decryptJson(row.config) as Record<string, unknown>; const schema = config.inputSchema ?? { type: 'object', properties: {} }; const record = { id: row.id, name: '', kind: row.kind as 'api' | 'mcp' | 'plugin' | 'internal', config: row.config, permissions: row.permissions ?? [] }; const risk = toolRiskLevel(record); return [row.id, { id: row.id, kind: row.kind, risk, permissions: [...(row.permissions ?? [])].sort(), requiresApproval: toolRequiresApproval(record), schema, schemaHash: canonicalJsonHash({ schema, endpoint: config.endpoint ?? null, method: config.method ?? null, readOnly: config.readOnly === true }), permissionHash: canonicalJsonHash({ kind: row.kind, permissions: row.permissions ?? [], risk }) }]; })),
     mcpTools: mcpById,
   };
 }

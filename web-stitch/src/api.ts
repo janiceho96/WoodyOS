@@ -505,11 +505,11 @@ export type WorkflowRun = {
 export type WorkflowDryRun = {
   valid: boolean;
   executionPath: string[];
-  externalActions: Array<{ nodeId: string; adapter: string; resourceId: string; risk: string; requiresConfirmation: boolean }>;
+  externalActions: Array<{ nodeId: string; adapter: string; resourceId: string; risk: string; permissions: string[]; requiresConfirmation: boolean }>;
   requiredApprovals: Array<{ nodeId: string; reason: string; prompt?: string }>;
   missingResources: Array<{ nodeId: string; resourceId: string; kind: string }>;
   pinnedAgents: Array<{ nodeId: string; agentId: string; versionId: string; version: number }>;
-  estimatedBudgets: { agentCalls: number; maxLoopIterations: number; externalActions: number };
+  estimatedBudgets: { agentCalls: number; maxLoopIterations: number; externalActions: number; maxNodeExecutions: number };
   errors: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
   warnings: Array<{ code: string; message: string; nodeId?: string; guidance: string }>;
   manifest: { definitionHash: string; inputHash: string; previewHash: string };
