@@ -63,6 +63,8 @@ export type CreateMemoryInput = {
   confidence?: number;
   verificationStatus?: VerificationStatus;
   expiresAt?: Date | string | null;
+  semanticSearch?: boolean;
+  embedding?: number[] | null;
   actor?: { type: MemoryActorType; id?: string };
 };
 

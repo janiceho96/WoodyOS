@@ -10,6 +10,7 @@ import type {
   VerificationStatus,
 } from './types.js';
 import { isEligibleMemoryCandidate, rankMemoryCandidate } from './ranking.js';
+import { embeddingFor } from '../lib/embeddings.js';
 
 type Queryable = {
   query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<T>>;
@@ -100,7 +101,7 @@ function resolvedCreate(input: CreateMemoryInput) {
     // The actor is authenticated at the route/worker boundary; caller-supplied
     // source labels are provenance detail, not an authority claim.
     sourceType: input.actor?.type ?? 'system',
-    sourceId: input.source?.id ?? input.actor?.id ?? null,
+    sourceId: input.actor?.id ?? null,
   };
 }
 
@@ -109,14 +110,17 @@ async function insertMemory(input: CreateMemoryInput, executor: Queryable): Prom
   const result = await executor.query<MemoryRow>(
     `INSERT INTO memories(
       workspace_id,agent_id,user_id,kind,content,importance,metadata,memory_type,scope,
-      source_type,source_id,confidence,verification_status,expires_at
-    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      source_type,source_id,confidence,verification_status,expires_at,embedding
+    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::vector)
     RETURNING ${memoryColumns}`,
     [
       input.workspaceId, input.agentId ?? null, input.userId ?? null, resolved.kind, input.content,
-      input.importance ?? 0.5, JSON.stringify(input.metadata ?? {}), resolved.type, resolved.scope,
+      input.importance ?? 0.5, JSON.stringify({
+        ...(input.metadata ?? {}),
+        ...(input.source ? { provenance: { type: input.source.type, id: input.source.id ?? null } } : {}),
+      }), resolved.type, resolved.scope,
       resolved.sourceType, resolved.sourceId, input.confidence ?? 0.5, resolved.verificationStatus,
-      input.expiresAt ?? null,
+      input.expiresAt ?? null, input.embedding?.length ? `[${input.embedding.join(',')}]` : null,
     ],
   );
   return mapMemory(result.rows[0]);
@@ -130,7 +134,8 @@ async function ensureAgentInWorkspace(input: CreateMemoryInput, executor: Querya
 
 export async function createMemory(input: CreateMemoryInput): Promise<MemoryRecord> {
   await ensureAgentInWorkspace(input, { query });
-  return insertMemory(input, { query });
+  const embedding = input.semanticSearch ? await embeddingFor(input.content).catch(() => null) : null;
+  return insertMemory({ ...input, embedding }, { query });
 }
 
 async function updateLifecycle(
@@ -342,15 +347,19 @@ export async function retrieveAgentMemories(input: RetrieveAgentMemoriesInput): 
     : ',NULL::real semantic_relevance';
   const rows: Array<MemoryRow & { semantic_relevance: number | null }> = [];
   const pageSize = 100;
-  for (let offset = 0; ; offset += pageSize) {
-    const pageValues = [...values, pageSize, offset];
-    const result = await query<MemoryRow & { semantic_relevance: number | null }>(
-      `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}
-        ORDER BY id ASC LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
+  const maxCandidates = 1_000;
+  let lastId: string | null = null;
+  while (rows.length < maxCandidates) {
+    const pageValues: unknown[] = lastId ? [...values, lastId, pageSize] : [...values, pageSize];
+    const keyset: string = lastId ? ` AND id > $${pageValues.length - 1}` : '';
+    const result: QueryResult<MemoryRow & { semantic_relevance: number | null }> = await query<MemoryRow & { semantic_relevance: number | null }>(
+      `SELECT ${memoryColumns}${similarityColumn} FROM memories WHERE ${conditions.join(' AND ')}${keyset}
+        ORDER BY id ASC LIMIT $${pageValues.length}`,
       pageValues,
     );
     rows.push(...result.rows);
     if (result.rows.length < pageSize) break;
+    lastId = result.rows[result.rows.length - 1].id;
   }
   const rankingContext = { ...input, now };
   const selected = rows
@@ -399,7 +408,13 @@ export async function claimAgentMemoriesForPrompt(input: {
   const selectedById = new Map(input.selected.map((memory) => [memory.id, memory]));
   return claimed.rows
     .map(mapMemory)
-    .map((memory) => selectedById.get(memory.id))
+    .map((memory) => {
+      const selected = selectedById.get(memory.id);
+      return selected ? {
+        id: memory.id, content: memory.content, memoryType: memory.memoryType, scope: memory.scope,
+        verificationStatus: memory.verificationStatus, score: selected.score,
+      } : null;
+    })
     .filter((memory): memory is AgentPromptMemory => Boolean(memory))
     .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
 }

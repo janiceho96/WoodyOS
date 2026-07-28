@@ -24,7 +24,7 @@ import { embeddingFor } from './lib/embeddings.js';
 import { assertConfiguredAiProvider, configuredAiProviderForWorkspace } from './lib/ai-provider.js';
 import { assertWorkspaceAiBudgetAvailable, estimatedWorkspaceAiCost, recordAiUsage } from './lib/ai-usage.js';
 import { isPublicIp } from './lib/network.js';
-import { agentRuntimeSourceFromSnapshot, resolveAgentRuntimePolicy, retrieveAgentKnowledge, retrieveAgentMemoryContext } from './lib/agent-runtime.js';
+import { agentRuntimeSourceFromSnapshot, claimAgentMemoryContext, resolveAgentRuntimePolicy, retrieveAgentKnowledge, retrieveAgentMemoryCandidates } from './lib/agent-runtime.js';
 import {
   anthropicMcpDefinition,
   authorizedMcpTools,
@@ -463,12 +463,12 @@ export async function executeAgentTask(
     let finalText = checkpoint?.state.finalText ?? '';
     let toolCallCount = checkpoint?.state.toolCallCount ?? 0;
     const requestText = `${task.title}\n${JSON.stringify(task.input)}`;
-    const [knowledge, memoryContext, attachments, requestedArtifacts] = await Promise.all([
+    const [knowledge, memoryCandidates, attachments, requestedArtifacts] = await Promise.all([
       runtimePolicy.knowledgeEnabled
         ? retrieveAgentKnowledge(task.workspace_id, requestText, 4, childTraceContext(taskTrace), signal)
         : Promise.resolve(''),
       !checkpoint && runtimePolicy.memoryEnabled
-        ? (async () => retrieveAgentMemoryContext({
+        ? (async () => retrieveAgentMemoryCandidates({
           workspaceId: task.workspace_id,
           agentId: task.agent_id,
           userId: task.requested_by,
@@ -481,6 +481,13 @@ export async function executeAgentTask(
       retrieveTaskAttachmentContext(task.id, requestText, signal),
       query<{ format: string }>('SELECT format FROM artifacts WHERE task_id=$1 OR ($2::uuid IS NOT NULL AND workflow_run_id=$2) ORDER BY format', [task.id, task.workflow_run_id]),
     ]);
+    signal.throwIfAborted();
+    const memoryContext = typeof memoryCandidates === 'string' ? '' : await claimAgentMemoryContext({
+      workspaceId: task.workspace_id,
+      agentId: task.agent_id,
+      userId: task.requested_by,
+      selected: memoryCandidates,
+    });
     const artifactInstruction = requestedArtifacts.rows.length
       ? `The server will convert your canonical Markdown result into: ${requestedArtifacts.rows.map((item) => item.format.toUpperCase()).join(', ')}. Do not emit base64 or pretend to create files. Use clear headings and concise sections; use Markdown tables for spreadsheet-ready data and slide-sized sections for presentation-ready content.`
       : '';

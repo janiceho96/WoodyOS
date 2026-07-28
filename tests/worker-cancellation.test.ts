@@ -38,6 +38,8 @@ const state = vi.hoisted(() => ({
   takeoverOnTaskTerminal: false,
   memoryEnabled: true,
   memoryContext: '',
+  memoryClaimCalls: 0,
+  artifactFailure: false,
 }));
 
 const manifest = {
@@ -190,7 +192,10 @@ vi.mock('../src/db/client.js', () => ({
         }],
       };
     }
-    if (sql.includes('FROM artifacts WHERE task_id=')) return { rowCount: 0, rows: [] };
+    if (sql.includes('FROM artifacts WHERE task_id=')) {
+      if (state.artifactFailure) throw new Error('artifact lookup failed');
+      return { rowCount: 0, rows: [] };
+    }
     return { rowCount: 1, rows: [] };
   }),
 }));
@@ -335,7 +340,11 @@ vi.mock('../src/lib/ai-usage.js', () => ({
 vi.mock('../src/lib/agent-runtime.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/lib/agent-runtime.js')>(),
   retrieveAgentKnowledge: vi.fn(async () => ''),
-  retrieveAgentMemoryContext: vi.fn(async () => state.memoryContext),
+  retrieveAgentMemoryCandidates: vi.fn(async () => []),
+  claimAgentMemoryContext: vi.fn(async () => {
+    state.memoryClaimCalls += 1;
+    return state.memoryContext;
+  }),
 }));
 vi.mock('../src/files/context.js', () => ({
   retrieveTaskAttachmentContext: vi.fn(async () => ({ text: '', citations: [] })),
@@ -410,6 +419,8 @@ describe('task worker cancellation', () => {
     state.takeoverOnTaskTerminal = false;
     state.memoryEnabled = true;
     state.memoryContext = '';
+    state.memoryClaimCalls = 0;
+    state.artifactFailure = false;
   });
 
   it('finalizes queued cancellation without starting the provider', async () => {
@@ -443,6 +454,15 @@ describe('task worker cancellation', () => {
     state.memoryContext = '<UNTRUSTED_MEMORY_CONTEXT>\nMust not appear\n</UNTRUSTED_MEMORY_CONTEXT>';
     await executeAgentTask(ids.task, ids.trace);
     expect(state.providerInputs[1]?.system).not.toContain('Must not appear');
+  });
+
+  it('does not claim memory when a sibling context retrieval fails', async () => {
+    state.memoryContext = '<UNTRUSTED_MEMORY_CONTEXT>\nMemory fact\n</UNTRUSTED_MEMORY_CONTEXT>';
+    state.artifactFailure = true;
+
+    await expect(executeAgentTask(ids.task, ids.trace)).resolves.toBeNull();
+    expect(state.providerInputs).toEqual([]);
+    expect(state.memoryClaimCalls).toBe(0);
   });
 
   it('finalizes when cancellation wins before a task failure write observes the poll signal', async () => {

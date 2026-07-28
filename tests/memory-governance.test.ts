@@ -427,6 +427,19 @@ describe('governed memories', () => {
     expect(values[0]).toEqual([selected[0].id]);
   });
 
+  it('returns fresh content from the atomic claim rather than stale selected content', async () => {
+    const selected = [{
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', content: 'Stale content', memoryType: 'preference' as const,
+      scope: 'workspace' as const, verificationStatus: 'user_confirmed' as const, score: 0.9,
+    }];
+    state.query.mockResolvedValueOnce({ rowCount: 1, rows: [memoryRow({
+      id: selected[0].id, content: 'Fresh content', scope: 'workspace', verification_status: 'user_confirmed',
+    })] });
+
+    await expect(claimAgentMemoriesForPrompt({ workspaceId, agentId, userId, selected }))
+      .resolves.toMatchObject([{ content: 'Fresh content' }]);
+  });
+
   it('paginates eligible candidates so an older high-trust memory can beat the first 100', async () => {
     const firstPage = Array.from({ length: 100 }, (_, index) => memoryRow({
       id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
@@ -445,6 +458,7 @@ describe('governed memories', () => {
 
     expect(results.map((item) => item.id)).toEqual([olderWinner.id]);
     expect(state.query).toHaveBeenCalledTimes(2);
+    expect(state.query.mock.calls[1][0]).toContain('id >');
   });
 
   it('uses a database scalar similarity when a query embedding is supplied without selecting vectors', async () => {
@@ -465,5 +479,7 @@ describe('governed memories', () => {
     });
 
     expect(memory.sourceType).toBe('agent');
+    expect(memory.sourceId).toBe(agentId);
+    expect(memory.metadata).toMatchObject({ provenance: { type: 'user', id: userId } });
   });
 });

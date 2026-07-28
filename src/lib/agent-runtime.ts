@@ -182,7 +182,20 @@ export async function retrieveAgentMemoryContext(input: {
   confirmedOnly?: boolean;
   queryEmbedding?: number[];
 }) {
-  const selected = await retrieveAgentMemories({
+  const selected = await retrieveAgentMemoryCandidates(input);
+  return claimAgentMemoryContext({ ...input, selected });
+}
+
+export async function retrieveAgentMemoryCandidates(input: {
+  workspaceId: string;
+  agentId: string;
+  userId: string;
+  requestText: string;
+  limit?: number;
+  confirmedOnly?: boolean;
+  queryEmbedding?: number[];
+}) {
+  return retrieveAgentMemories({
     workspaceId: input.workspaceId,
     agentId: input.agentId,
     userId: input.userId,
@@ -191,11 +204,20 @@ export async function retrieveAgentMemoryContext(input: {
     confirmedOnly: input.confirmedOnly,
     queryEmbedding: input.queryEmbedding,
   });
+}
+
+export async function claimAgentMemoryContext(input: {
+  workspaceId: string;
+  agentId: string;
+  userId: string;
+  selected: AgentPromptMemory[];
+  confirmedOnly?: boolean;
+}) {
   const memories = await claimAgentMemoriesForPrompt({
     workspaceId: input.workspaceId,
     agentId: input.agentId,
     userId: input.userId,
-    selected,
+    selected: input.selected,
     confirmedOnly: input.confirmedOnly,
   });
   return formatAgentMemoryContext(memories);
