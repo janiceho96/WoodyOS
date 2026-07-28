@@ -129,6 +129,29 @@ describe('governed memories', () => {
     })).rejects.toMatchObject({ message: 'USER_CONFIRMATION_REQUIRED', statusCode: 403 });
   });
 
+  it.each(['disputed', 'superseded'] as const)('rejects terminal %s status at the public creation boundary', async (verificationStatus) => {
+    const app = await routeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/',
+      payload: { agentId, type: 'fact', content: 'Terminal lifecycle bypass', verificationStatus },
+    });
+    await app.close();
+
+    expect(response.statusCode, response.body).toBe(400);
+    expect(response.json()).toMatchObject({ error: 'VALIDATION_ERROR' });
+  });
+
+  it.each(['disputed', 'superseded'] as const)('rejects terminal %s status when service callers bypass the route', async (verificationStatus) => {
+    await expect(createMemory({
+      workspaceId,
+      type: 'fact',
+      content: 'Terminal lifecycle bypass',
+      verificationStatus,
+      actor: { type: 'user', id: userId },
+    })).rejects.toMatchObject({ message: 'TERMINAL_VERIFICATION_STATUS', statusCode: 400 });
+  });
+
   it('guards confirmation and disputes by workspace and authenticated actor', async () => {
     state.query.mockResolvedValueOnce({ rowCount: 1, rows: [memoryRow({ verification_status: 'user_confirmed' })] });
     const confirmed = await confirmMemory({ workspaceId, memoryId: memoryRow().id, actorId: userId });
@@ -172,8 +195,8 @@ describe('governed memories', () => {
       query: vi.fn(async (sql: string) => {
         statements.push(sql);
         if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
-        if (sql.startsWith('SELECT') && sql.includes("verification_status <> 'superseded'")) return { rowCount: 1, rows: [memoryRow()] };
-        if (sql.startsWith('SELECT')) return { rowCount: 1, rows: [memoryRow({ id: replacementId })] };
+        if (sql.includes('id=ANY')) return { rowCount: 2, rows: [memoryRow(), memoryRow({ id: replacementId })] };
+        if (sql.includes('WITH RECURSIVE')) return { rowCount: 1, rows: [{ cycle: false }] };
         return { rowCount: 1, rows: [memoryRow({ verification_status: 'superseded', superseded_by: replacementId })] };
       }),
       release: vi.fn(),
@@ -185,9 +208,76 @@ describe('governed memories', () => {
     expect(result.memory.verificationStatus).toBe('superseded');
     expect(result.memory.supersededBy).toBe(replacementId);
     expect(statements).toEqual(expect.arrayContaining(['BEGIN', 'COMMIT']));
-    expect(statements.filter((statement) => statement.includes('FOR UPDATE'))).toHaveLength(2);
+    expect(statements.filter((statement) => statement.includes('FOR UPDATE'))).toHaveLength(1);
     expect(statements.indexOf('COMMIT')).toBeGreaterThan(statements.findIndex((statement) => statement.startsWith('UPDATE')));
     expect(client.release).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['disputed', null],
+    ['superseded', null],
+    ['agent_inferred', new Date('2026-07-25T00:00:00.000Z')],
+  ] as const)('rejects a %s existing replacement that is not eligible', async (verificationStatus, expiresAt) => {
+    const replacementId = '66666666-6666-4666-8666-666666666666';
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
+        if (sql.includes('id=ANY')) return { rowCount: 2, rows: [memoryRow(), memoryRow({ id: replacementId, verification_status: verificationStatus, expires_at: expiresAt })] };
+        if (sql.startsWith('SELECT') && sql.includes("verification_status <> 'superseded'")) return { rowCount: 1, rows: [memoryRow()] };
+        if (sql.startsWith('SELECT')) return { rowCount: 1, rows: [memoryRow({ id: replacementId, verification_status: verificationStatus, expires_at: expiresAt })] };
+        return { rowCount: 1, rows: [memoryRow({ verification_status: 'superseded', superseded_by: replacementId })] };
+      }),
+      release: vi.fn(),
+    };
+    state.connect.mockResolvedValueOnce(client);
+
+    await expect(supersedeMemory({ workspaceId, memoryId: memoryRow().id, replacementMemoryId: replacementId }))
+      .rejects.toMatchObject({ message: 'REPLACEMENT_NOT_ELIGIBLE', statusCode: 409 });
+    expect(client.query).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it('rejects an existing replacement whose supersession ancestry reaches the source', async () => {
+    const sourceId = memoryRow().id;
+    const replacementId = '66666666-6666-4666-8666-666666666666';
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
+        if (sql.includes('WITH RECURSIVE')) return { rowCount: 1, rows: [{ cycle: true }] };
+        if (sql.includes('id=ANY')) return { rowCount: 2, rows: [memoryRow(), memoryRow({ id: replacementId, superseded_by: sourceId })] };
+        if (sql.startsWith('SELECT') && sql.includes("verification_status <> 'superseded'")) return { rowCount: 1, rows: [memoryRow()] };
+        if (sql.startsWith('SELECT')) return { rowCount: 1, rows: [memoryRow({ id: replacementId, superseded_by: sourceId })] };
+        return { rowCount: 1, rows: [memoryRow({ verification_status: 'superseded', superseded_by: replacementId })] };
+      }),
+      release: vi.fn(),
+    };
+    state.connect.mockResolvedValueOnce(client);
+
+    await expect(supersedeMemory({ workspaceId, memoryId: sourceId, replacementMemoryId: replacementId }))
+      .rejects.toMatchObject({ message: 'MEMORY_SUPERSESSION_CYCLE', statusCode: 409 });
+    expect(client.query).toHaveBeenCalledWith('ROLLBACK');
+  });
+
+  it('locks existing source and replacement IDs once in deterministic order', async () => {
+    const lowId = memoryRow().id;
+    const highId = '66666666-6666-4666-8666-666666666666';
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rowCount: null, rows: [] };
+        if (sql.includes('id=ANY')) return { rowCount: 2, rows: [memoryRow(), memoryRow({ id: highId })] };
+        if (sql.includes('WITH RECURSIVE')) return { rowCount: 1, rows: [{ cycle: false }] };
+        return { rowCount: 1, rows: [memoryRow({ id: highId, verification_status: 'superseded', superseded_by: lowId })] };
+      }),
+      release: vi.fn(),
+    };
+    state.connect.mockResolvedValueOnce(client);
+
+    await supersedeMemory({ workspaceId, memoryId: highId, replacementMemoryId: lowId });
+
+    const lockCall = client.query.mock.calls.find(([sql]) => String(sql).includes('id=ANY'));
+    expect(lockCall).toBeDefined();
+    expect(lockCall?.[0]).toContain('ORDER BY id FOR UPDATE');
+    expect(lockCall?.[1]).toEqual([workspaceId, [lowId, highId]]);
+    expect(client.query.mock.calls.filter(([sql]) => String(sql).includes('FOR UPDATE'))).toHaveLength(1);
   });
 
   it('rejects a replacement that targets an agent outside the workspace', async () => {

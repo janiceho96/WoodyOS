@@ -15,7 +15,7 @@ import {
 
 const memoryTypes = ['preference', 'fact', 'decision', 'project_context', 'workflow_result', 'error_resolution', 'summary', 'hypothesis'] as const;
 const scopes = ['workspace', 'agent', 'user'] as const;
-const verificationStatuses = ['user_confirmed', 'agent_inferred', 'system_generated', 'unverified', 'disputed', 'superseded'] as const;
+const verificationStatuses = ['user_confirmed', 'agent_inferred', 'system_generated', 'unverified'] as const;
 const legacyKinds = ['conversation', 'knowledge', 'user'] as const;
 
 const sourceInput = z.object({ type: z.string().min(1).max(100), id: z.string().max(200).nullable().optional() });

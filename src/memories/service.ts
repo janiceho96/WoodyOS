@@ -85,6 +85,9 @@ function resolvedCreate(input: CreateMemoryInput) {
   const type = input.type ?? defaults.type;
   const verificationStatus = input.verificationStatus
     ?? (input.actor?.type === 'user' && kind === 'user' ? 'user_confirmed' : defaults.verificationStatus);
+  if (verificationStatus === 'disputed' || verificationStatus === 'superseded') {
+    throw new MemoryServiceError('TERMINAL_VERIFICATION_STATUS', 400);
+  }
   if (verificationStatus === 'user_confirmed' && input.actor?.type !== 'user') {
     throw new MemoryServiceError('USER_CONFIRMATION_REQUIRED', 403);
   }
@@ -204,28 +207,52 @@ export async function supersedeMemory(input: {
   replacement?: Omit<CreateMemoryInput, 'workspaceId'>;
 }): Promise<{ memory: MemoryRecord; replacement: MemoryRecord }> {
   if (!input.replacementMemoryId && !input.replacement) throw new MemoryServiceError('REPLACEMENT_REQUIRED', 400);
+  if (input.replacementMemoryId === input.memoryId) throw new MemoryServiceError('INVALID_REPLACEMENT', 400);
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const previousResult = await client.query<MemoryRow>(
-      `SELECT ${memoryColumns} FROM memories
-        WHERE id=$1 AND workspace_id=$2 AND verification_status <> 'superseded'
-        FOR UPDATE`,
-      [input.memoryId, input.workspaceId],
-    );
-    const previous = previousResult.rows[0];
-    if (!previous) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
-
     let replacement: MemoryRecord;
     if (input.replacementMemoryId) {
-      if (input.replacementMemoryId === input.memoryId) throw new MemoryServiceError('INVALID_REPLACEMENT', 400);
-      const replacementResult = await client.query<MemoryRow>(
-        `SELECT ${memoryColumns} FROM memories WHERE id=$1 AND workspace_id=$2 FOR UPDATE`,
-        [input.replacementMemoryId, input.workspaceId],
+      const locked = await client.query<MemoryRow>(
+        `SELECT ${memoryColumns} FROM memories
+          WHERE workspace_id=$1 AND id=ANY($2::uuid[])
+          ORDER BY id FOR UPDATE`,
+        [input.workspaceId, [input.memoryId, input.replacementMemoryId].sort()],
       );
-      if (!replacementResult.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
-      replacement = mapMemory(replacementResult.rows[0]);
+      const byId = new Map(locked.rows.map((row) => [row.id, row]));
+      const previous = byId.get(input.memoryId);
+      const replacementRow = byId.get(input.replacementMemoryId);
+      if (!previous || !replacementRow) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
+      if (previous.verification_status === 'superseded') throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
+      const now = new Date();
+      if (
+        replacementRow.verification_status === 'disputed'
+        || replacementRow.verification_status === 'superseded'
+        || (replacementRow.expires_at !== null && replacementRow.expires_at <= now)
+      ) throw new MemoryServiceError('REPLACEMENT_NOT_ELIGIBLE', 409);
+      const ancestry = await client.query<{ cycle: boolean }>(
+        `WITH RECURSIVE ancestry(id,superseded_by,path,cycle) AS (
+          SELECT id,superseded_by,ARRAY[id],false
+            FROM memories WHERE workspace_id=$1 AND id=$2
+          UNION ALL
+          SELECT next.id,next.superseded_by,ancestry.path || next.id,next.id=ANY(ancestry.path)
+            FROM memories next JOIN ancestry ON next.id=ancestry.superseded_by
+           WHERE next.workspace_id=$1 AND NOT ancestry.cycle
+        )
+        SELECT COALESCE(bool_or(cycle OR id=$3),false) cycle FROM ancestry`,
+        [input.workspaceId, input.replacementMemoryId, input.memoryId],
+      );
+      if (ancestry.rows[0]?.cycle) throw new MemoryServiceError('MEMORY_SUPERSESSION_CYCLE', 409);
+      replacement = mapMemory(replacementRow);
     } else {
+      const previousResult = await client.query<MemoryRow>(
+        `SELECT ${memoryColumns} FROM memories
+          WHERE id=$1 AND workspace_id=$2 AND verification_status <> 'superseded'
+          FOR UPDATE`,
+        [input.memoryId, input.workspaceId],
+      );
+      const previous = previousResult.rows[0];
+      if (!previous) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
       await ensureAgentInWorkspace({ ...input.replacement!, workspaceId: input.workspaceId }, client);
       replacement = await insertMemory({ ...input.replacement!, workspaceId: input.workspaceId }, client);
     }
