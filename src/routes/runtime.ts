@@ -32,9 +32,13 @@ function environmentBaseUrl(provider: AiProviderName) {
   catch { return null; }
 }
 
-async function publicRuntimeConfig(workspaceId: string) {
-  const stored = await workspaceAiProviderConfig(workspaceId);
-  if (stored) return {
+type PublicWorkspaceAiProviderConfig = Pick<WorkspaceAiProviderConfig,
+  'provider' | 'base_url' | 'default_model' | 'api_key_hint' | 'status' |
+  'last_tested_at' | 'last_error_code' | 'last_error_message' | 'updated_at'
+>;
+
+function publicWorkspaceRuntimeConfig(stored: PublicWorkspaceAiProviderConfig) {
+  return {
     provider: stored.provider,
     defaultModel: stored.default_model,
     source: 'workspace' as const,
@@ -47,6 +51,11 @@ async function publicRuntimeConfig(workspaceId: string) {
     lastErrorMessage: stored.last_error_message,
     updatedAt: stored.updated_at,
   };
+}
+
+async function publicRuntimeConfig(workspaceId: string) {
+  const stored = await workspaceAiProviderConfig(workspaceId);
+  if (stored) return publicWorkspaceRuntimeConfig(stored);
   const runtime = configuredAiProvider();
   const environmentKey = runtime.provider === 'anthropic' ? process.env.ANTHROPIC_API_KEY : process.env.LLM_API_KEY;
   return {
@@ -90,6 +99,7 @@ export async function runtimeRoutes(app: FastifyInstance) {
     const apiKey = input.apiKey;
     const baseUrl = input.provider === 'openai-compatible' ? normalizeCompatibleBaseUrl(input.baseUrl ?? '') : null;
     const modelEnforcement = { agentsUpdated: 0, versionsPublished: 0 };
+    let savedConfig: ReturnType<typeof publicWorkspaceRuntimeConfig> | null = null;
     const client = await db.connect();
     try {
       await client.query('BEGIN');
@@ -111,7 +121,7 @@ export async function runtimeRoutes(app: FastifyInstance) {
       const hint = apiKey ? keyHint(apiKey) : existing.api_key_hint;
       const changed = !existing || providerChanged || existing.base_url !== baseUrl || existing.default_model !== input.defaultModel || Boolean(apiKey);
       const providerOrModelChanged = !existing || providerChanged || existing.default_model !== input.defaultModel;
-      await client.query(
+      const saved = (await client.query<PublicWorkspaceAiProviderConfig>(
         `INSERT INTO workspace_ai_provider_configs(
            workspace_id,provider,base_url,default_model,encrypted_api_key,api_key_hint,status,created_by,updated_by
          ) VALUES($1,$2,$3,$4,$5,$6,'untested',$7,$7)
@@ -122,9 +132,12 @@ export async function runtimeRoutes(app: FastifyInstance) {
            last_tested_at=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_tested_at END,
            last_error_code=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_error_code END,
            last_error_message=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_error_message END,
-           updated_by=EXCLUDED.updated_by,updated_at=now()`,
+           updated_by=EXCLUDED.updated_by,updated_at=now()
+         RETURNING provider,base_url,default_model,api_key_hint,status,last_tested_at,last_error_code,last_error_message,updated_at`,
         [request.user.workspaceId, input.provider, baseUrl, input.defaultModel, JSON.stringify(encrypted), hint, request.user.sub, changed],
-      );
+      )).rows[0];
+      if (!saved) throw new Error('AI_PROVIDER_CONFIG_SAVE_FAILED');
+      savedConfig = publicWorkspaceRuntimeConfig(saved);
       if (providerOrModelChanged) {
         Object.assign(modelEnforcement, await enforceWorkspaceAgentModel(client, {
           workspaceId: request.user.workspaceId,
@@ -146,7 +159,7 @@ export async function runtimeRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
-    return { ...await publicRuntimeConfig(request.user.workspaceId), modelEnforcement };
+    return { ...savedConfig!, modelEnforcement };
   }));
 
   app.post('/config/test', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
