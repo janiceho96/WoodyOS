@@ -57,6 +57,11 @@ type AgentDraftRow = {
   avatar_config: unknown;
 };
 
+type WorkspaceAgentRow = {
+  id: string;
+  published_version_id: string | null;
+};
+
 function objectValue(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -145,6 +150,38 @@ export async function publishAgent(input: {
   } finally {
     client.release();
   }
+}
+
+export async function enforceWorkspaceAgentModel(
+  client: PoolClient,
+  input: { workspaceId: string; actorId: string; model: string },
+): Promise<{ agentsUpdated: number; versionsPublished: number }> {
+  const agents = (await client.query<WorkspaceAgentRow>(
+    `SELECT agent.id,agent.published_version_id
+       FROM agents agent
+       JOIN workspace_memberships membership
+         ON membership.workspace_id=agent.workspace_id AND membership.user_id=$2
+      WHERE agent.workspace_id=$1 AND agent.status <> 'archived'
+      ORDER BY agent.id
+      FOR UPDATE OF agent`,
+    [input.workspaceId, input.actorId],
+  )).rows;
+
+  if (agents.length > 0) {
+    await client.query(
+      'UPDATE agents SET model=$1,updated_at=now() WHERE workspace_id=$2 AND id=ANY($3::uuid[])',
+      [input.model, input.workspaceId, agents.map((agent) => agent.id)],
+    );
+  }
+
+  let versionsPublished = 0;
+  for (const agent of agents) {
+    if (!agent.published_version_id) continue;
+    await publishWithClient(client, { workspaceId: input.workspaceId, agentId: agent.id, actorId: input.actorId });
+    versionsPublished += 1;
+  }
+
+  return { agentsUpdated: agents.length, versionsPublished };
 }
 
 export async function getAgentVersion(workspaceId: string, versionId: string): Promise<AgentVersion> {
