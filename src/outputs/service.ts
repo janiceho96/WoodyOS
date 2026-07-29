@@ -123,15 +123,15 @@ export async function initializeTaskOutputDocument(input: {
   }
 }
 
-async function insertNextVersion(input: {
-  client: PoolClient;
+export async function saveOutputVersionWithClient(client: PoolClient, input: {
   workspaceId: string;
   documentId: string;
   actorId: string;
   content: string;
   baseVersionNumber: number;
 }) {
-  const document = (await input.client.query<OutputDocumentRecord>(
+  const content = validatedContent(input.content);
+  const document = (await client.query<OutputDocumentRecord>(
     `SELECT id,workspace_id,task_id,current_version_number,created_by,created_at,updated_at
        FROM output_documents WHERE id=$1 AND workspace_id=$2 FOR UPDATE`,
     [input.documentId, input.workspaceId],
@@ -141,7 +141,7 @@ async function insertNextVersion(input: {
     throw outputError('OUTPUT_VERSION_CONFLICT', 409);
   }
   const nextVersionNumber = document.current_version_number + 1;
-  await input.client.query(
+  await client.query(
     `INSERT INTO output_document_versions(
        workspace_id,document_id,version_number,content,content_hash,created_by
      ) VALUES($1,$2,$3,$4,$5,$6)`,
@@ -149,18 +149,18 @@ async function insertNextVersion(input: {
       input.workspaceId,
       input.documentId,
       nextVersionNumber,
-      input.content,
-      createOutputContentHash(input.content),
+      content,
+      createOutputContentHash(content),
       input.actorId,
     ],
   );
-  const updated = (await input.client.query<OutputDocumentRecord>(
+  const updated = (await client.query<OutputDocumentRecord>(
     `UPDATE output_documents SET current_version_number=$1,updated_at=now()
       WHERE id=$2 AND workspace_id=$3
       RETURNING id,workspace_id,task_id,current_version_number,created_by,created_at,updated_at`,
     [nextVersionNumber, input.documentId, input.workspaceId],
   )).rows[0];
-  return detailForDocument(updated, input.client);
+  return detailForDocument(updated, client);
 }
 
 export async function saveOutputVersion(input: {
@@ -170,11 +170,10 @@ export async function saveOutputVersion(input: {
   content: string;
   baseVersionNumber: number;
 }) {
-  const content = validatedContent(input.content);
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const detail = await insertNextVersion({ ...input, content, client });
+    const detail = await saveOutputVersionWithClient(client, input);
     await client.query('COMMIT');
     return detail;
   } catch (cause) {
@@ -201,7 +200,7 @@ export async function revertOutputVersion(input: {
       [input.versionId, input.documentId, input.workspaceId],
     )).rows[0];
     if (!version) throw outputError('OUTPUT_VERSION_NOT_FOUND', 404);
-    const detail = await insertNextVersion({ ...input, content: version.content, client });
+    const detail = await saveOutputVersionWithClient(client, { ...input, content: version.content });
     await client.query('COMMIT');
     return detail;
   } catch (cause) {

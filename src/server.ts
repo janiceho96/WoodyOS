@@ -26,6 +26,7 @@ import { starterSolutionRoutes } from './routes/starter-solutions.js';
 import { agentSolutionRoutes } from './routes/agent-solutions.js';
 import { usageRoutes } from './routes/usage.js';
 import { copilotRoutes } from './routes/copilot.js';
+import { copilotProposalRoutes } from './routes/copilot-proposals.js';
 import { artifactRoutes } from './routes/artifacts.js';
 import { presentationThemeRoutes } from './routes/presentation-themes.js';
 import { workflowNodeRoutes } from './routes/workflow-nodes.js';
@@ -75,6 +76,7 @@ export async function buildApp() {
   await app.register(agentSolutionRoutes, { prefix: '/v1/agent-solutions' });
   await app.register(usageRoutes, { prefix: '/v1/usage' });
   await app.register(copilotRoutes, { prefix: '/v1/copilot' });
+  await app.register(copilotProposalRoutes, { prefix: '/v1/copilot' });
   await app.register(artifactRoutes, { prefix: '/v1/artifacts' });
   await app.register(presentationThemeRoutes, { prefix: '/v1/presentation-themes' });
   await app.register(workflowNodeRoutes, { prefix: '/v1/workflow-nodes' });

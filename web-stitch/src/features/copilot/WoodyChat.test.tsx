@@ -131,7 +131,9 @@ describe('Woody contextual conversation state', () => {
     vi.spyOn(api, 'outputDocumentForTask').mockResolvedValue({ document });
     wrapper(<><EditableOutput task={task} refreshTask={vi.fn()}/><WoodyChat displayName="Test User"/></>);
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Refine with Woody' }));
+    const refine = await screen.findByRole('button', { name: 'Refine with Woody' });
+    await waitFor(() => expect((refine as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(refine);
 
     expect(await screen.findByRole('dialog', { name: 'Chat with Woody' })).toBeTruthy();
     await waitFor(() => expect(api.attachCopilotContext).toHaveBeenCalledWith(threadId, {
@@ -139,7 +141,25 @@ describe('Woody contextual conversation state', () => {
       outputDocumentId: documentId,
       workflowRunId,
     }));
+    expect(api.attachCopilotContext).toHaveBeenCalledTimes(1);
     expect(screen.getByText('Current output context')).toBeTruthy();
+  });
+
+  it('initializes an original output before opening Copilot', async () => {
+    vi.spyOn(api, 'outputDocumentForTask').mockResolvedValue({ document: null });
+    const initialize = vi.spyOn(api, 'initializeOutputDocument').mockResolvedValue(document);
+    wrapper(<><EditableOutput task={task} refreshTask={vi.fn()}/><WoodyChat displayName="Test User"/></>);
+
+    const refine = await screen.findByRole('button', { name: 'Refine with Woody' });
+    await waitFor(() => expect((refine as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(refine);
+
+    await waitFor(() => expect(initialize).toHaveBeenCalledWith(taskId));
+    await waitFor(() => expect(api.attachCopilotContext).toHaveBeenCalledWith(threadId, {
+      taskId,
+      outputDocumentId: documentId,
+      workflowRunId,
+    }));
   });
 
   it('restores clarification cards and keeps the next turn in the same thread', async () => {

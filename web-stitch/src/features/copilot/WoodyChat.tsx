@@ -80,6 +80,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const dragRef = useRef<DragState | null>(null);
   const suppressClickRef = useRef(false);
   const attachedContextRef = useRef('');
+  const contextViewRef = useRef<CopilotContextView | null>(null);
   const creatingThreadRef = useRef<Promise<string> | null>(null);
   const approvalKeysRef = useRef(new Map<string, string>());
 
@@ -154,15 +155,22 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const attachContext = async (activeThread: string) => {
     if (!copilot.context) return null;
     const key = `${activeThread}:${JSON.stringify(copilot.context)}`;
-    if (attachedContextRef.current === key && contextView) return contextView;
-    const attached = await api.attachCopilotContext(activeThread, copilot.context);
+    if (attachedContextRef.current === key) return contextViewRef.current;
     attachedContextRef.current = key;
-    setContextView(attached);
-    return attached;
+    try {
+      const attached = await api.attachCopilotContext(activeThread, copilot.context);
+      contextViewRef.current = attached;
+      setContextView(attached);
+      return attached;
+    } catch (cause) {
+      if (attachedContextRef.current === key) attachedContextRef.current = '';
+      throw cause;
+    }
   };
 
   useEffect(() => {
     attachedContextRef.current = '';
+    contextViewRef.current = null;
     setContextView(null);
   }, [copilot.context]);
 
@@ -232,6 +240,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
       }]);
       if (receipt.operation === 'output.version_created' && receipt.status === 'succeeded') {
         attachedContextRef.current = '';
+        contextViewRef.current = null;
         setContextView(null);
       }
       approvalKeysRef.current.delete(proposalId);
@@ -262,6 +271,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const clear = async () => {
     if (threadId) await api.deleteChatThread(threadId).catch(() => undefined);
     attachedContextRef.current = '';
+    contextViewRef.current = null;
     setContextView(null); setThreadId(null); setMessages([welcome(displayName)]); setAttachments([]); setError(''); setDraft('');
   };
   const startDrag = (event: ReactPointerEvent<HTMLElement>) => {

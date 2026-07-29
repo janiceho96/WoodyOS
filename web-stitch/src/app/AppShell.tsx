@@ -10,6 +10,7 @@ import { TextDocumentDialogBody } from '../features/knowledge/KnowledgePage';
 import { OnboardingFlow } from '../features/onboarding/Onboarding';
 import { ToolDialogBody } from '../features/tools/ToolsPage';
 import { WoodyChat } from '../features/copilot/WoodyChat';
+import { CopilotContextProvider } from '../features/copilot/CopilotContext';
 import { AgentWorkspaceNav } from '../features/agents/AgentWorkspaceNav';
 import type { Theme } from './theme';
 import { primaryNavigation } from './navigation';
@@ -100,7 +101,7 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
     width: `${100 / (workspaceZoom / 100)}%`,
   } as CSSProperties;
 
-  return <WorkspaceContext.Provider value={value}>
+  return <WorkspaceContext.Provider value={value}><CopilotContextProvider>
     <div className="app-shell">
       <aside id="primary-navigation" className={`side-rail ${mobileOpen ? 'open' : ''}`}>
         <div className="brand-block">
@@ -127,7 +128,7 @@ export function AppShell({ session, setSession, theme, setTheme, toggleTheme }: 
     {dialog === 'search' && <WorkspaceSearch close={() => setDialog(null)} go={(path) => { setDialog(null); go(path); }} data={data}/>}
     {showOnboarding && !onboarding.completed && <OnboardingFlow state={onboarding} storageKey={`nexus_onboarding_${session.user.id}_v${onboarding.version}`} agents={data.agents} tasks={data.tasks} onPause={() => setShowOnboarding(false)} onCreateAgent={() => { setShowOnboarding(false); go('/agents/new'); }} onUpdate={(next) => { setOnboarding(next); setSession({ ...session, user: { ...session.user, onboarding: next } }); if (next.completed) setShowOnboarding(false); }} onPage={go}/>} 
     <WoodyChat displayName={session.user.displayName}/>
-  </WorkspaceContext.Provider>;
+  </CopilotContextProvider></WorkspaceContext.Provider>;
 }
 
 function WorkspaceSearch({ data, close, go }: { data: ReturnType<typeof useWorkspaceData>['data'] extends infer T ? NonNullable<T> : never; close: () => void; go: (path: string) => void }) {

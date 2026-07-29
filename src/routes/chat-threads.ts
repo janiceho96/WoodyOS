@@ -1,5 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { getExecutionReceipt } from '../copilot/apply.js';
+import { contextView, resolveCopilotContext } from '../copilot/context.js';
+import { orchestrateCopilotTurn } from '../copilot/orchestrator.js';
+import { getProposalView } from '../copilot/repository.js';
+import type { CopilotEvent, ExecutionReceipt } from '../copilot/types.js';
 import { db, query } from '../db/client.js';
 import { retrieveChatAttachmentContext } from '../files/context.js';
 import { audit } from '../lib/audit.js';
@@ -11,6 +16,17 @@ const messageInput = z.object({
   content: z.string().trim().min(1).max(8_000),
   attachmentIds: z.array(z.string().uuid()).max(10).default([]),
 });
+const contextInput = z.object({
+  workflowId: z.string().uuid().optional(),
+  workflowRunId: z.string().uuid().optional(),
+  taskId: z.string().uuid(),
+  outputDocumentId: z.string().uuid(),
+}).strict();
+
+function receiptView(receipt: ExecutionReceipt) {
+  const { workspaceId: _workspaceId, actorId: _actorId, ...view } = receipt;
+  return view;
+}
 
 export async function chatThreadRoutes(app: FastifyInstance) {
   app.get('/threads', { preHandler: app.authenticate }, asyncRoute(async (request) => {
@@ -59,7 +75,27 @@ export async function chatThreadRoutes(app: FastifyInstance) {
        ORDER BY message.created_at,message.id`,
       [threadId, request.user.workspaceId],
     );
-    return { ...thread, messages: messages.rows };
+    const hydratedMessages = await Promise.all(messages.rows.map(async (raw) => {
+      const message = raw as Record<string, unknown> & {
+        metadata?: { event?: CopilotEvent };
+        proposal_id?: string | null;
+        execution_receipt_id?: string | null;
+      };
+      let event = message.metadata?.event;
+      if (message.proposal_id && (event?.type === 'refinement_preview' || event?.type === 'agent_proposal')) {
+        const proposal = await getProposalView(request.user.workspaceId, message.proposal_id);
+        if (proposal) event = { ...event, proposal };
+      }
+      if (message.execution_receipt_id) {
+        const receipt = await getExecutionReceipt(request.user.workspaceId, message.execution_receipt_id);
+        if (receipt) event = { type: 'execution_receipt', receipt: receiptView(receipt) };
+      }
+      return {
+        ...message,
+        ...(event ? { event, metadata: { ...message.metadata, event } } : {}),
+      };
+    }));
+    return { ...thread, messages: hydratedMessages };
   }));
 
   app.post('/threads/:id/messages', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
@@ -111,27 +147,88 @@ export async function chatThreadRoutes(app: FastifyInstance) {
     );
     const messages = history.rows.reverse() as WoodyChatMessage[];
     const attachmentContext = await retrieveChatAttachmentContext(request.user.workspaceId, thread.id, input.content);
-    const answer = await answerWoody(request.user.workspaceId, messages, attachmentContext.text);
+    const activeContext = (await query<{ id: string }>(
+      `SELECT id FROM copilot_context_snapshots
+        WHERE thread_id=$1 AND workspace_id=$2 AND actor_id=$3
+        ORDER BY captured_at DESC,id DESC LIMIT 1`,
+      [thread.id, request.user.workspaceId, request.user.sub],
+    )).rows[0];
+    const contextualMessages = attachmentContext.text
+      ? messages.map((message, index) => index === messages.length - 1
+        ? {
+          ...message,
+          content: `${message.content}\n\n<untrusted_attachment_extracts>\n${attachmentContext.text}\n</untrusted_attachment_extracts>`,
+        }
+        : message)
+      : messages;
+    const orchestration = activeContext
+      ? await orchestrateCopilotTurn({
+        workspaceId: request.user.workspaceId,
+        actorId: request.user.sub,
+        threadId: thread.id,
+        messages: contextualMessages,
+      })
+      : null;
+    const answer = orchestration
+      ? {
+        message: orchestration.content,
+        provider: null,
+        model: null,
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      }
+      : await answerWoody(request.user.workspaceId, messages, attachmentContext.text);
+    const metadata = {
+      citations: attachmentContext.citations.map(({ content: _content, ...citation }) => citation),
+      ...(orchestration ? { event: orchestration.event } : {}),
+    };
     const assistant = (await query(
       `INSERT INTO chat_messages(
-        workspace_id,thread_id,role,content,provider,model,token_input,token_output,estimated_cost_usd,metadata
-      ) VALUES($1,$2,'assistant',$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        workspace_id,thread_id,role,content,provider,model,token_input,token_output,estimated_cost_usd,metadata,
+        context_snapshot_id,proposal_id
+      ) VALUES($1,$2,'assistant',$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [
         request.user.workspaceId, thread.id, answer.message, answer.provider, answer.model,
         answer.usage.inputTokens, answer.usage.outputTokens, answer.usage.estimatedCostUsd,
-        JSON.stringify({ citations: attachmentContext.citations.map(({ content: _content, ...citation }) => citation) }),
+        JSON.stringify(metadata),
+        orchestration?.contextSnapshotId ?? null,
+        orchestration?.proposalId ?? null,
       ],
     )).rows[0];
     await query('UPDATE chat_threads SET updated_at=now() WHERE id=$1', [thread.id]);
     await audit(request.user.workspaceId, request.user.sub, 'chat.message_created', 'chat_thread', thread.id, {
       attachmentIds,
       citationCount: attachmentContext.citations.length,
+      contextSnapshotId: orchestration?.contextSnapshotId ?? null,
+      proposalId: orchestration?.proposalId ?? null,
     });
+    request.log.info({
+      requestId: request.id,
+      threadId: thread.id,
+      contextSnapshotId: orchestration?.contextSnapshotId,
+      proposalId: orchestration?.proposalId,
+    }, 'Copilot message persisted');
     return reply.code(201).send({
       user: { ...userMessage, attachments: attachmentIds },
-      assistant,
+      assistant: { ...assistant, ...(orchestration ? { event: orchestration.event } : {}) },
       citations: attachmentContext.citations.map(({ content: _content, ...citation }) => citation),
     });
+  }));
+
+  app.post('/threads/:id/context', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
+    const input = parse(contextInput, request.body, reply); if (!input) return;
+    const threadId = (request.params as { id: string }).id;
+    const context = await resolveCopilotContext({
+      workspaceId: request.user.workspaceId,
+      actorId: request.user.sub,
+      threadId,
+      request: input,
+    });
+    request.log.info({
+      requestId: request.id,
+      threadId,
+      contextSnapshotId: context.id,
+    }, 'Copilot context attached');
+    return reply.code(201).send(contextView(context));
   }));
 
   app.delete('/threads/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {

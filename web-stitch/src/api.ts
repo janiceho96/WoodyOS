@@ -1,4 +1,11 @@
 import type { BrandIconKey } from './components/BrandIcon';
+import type {
+  CopilotContextRequest,
+  CopilotContextView,
+  CopilotEvent,
+  CopilotProposalView,
+  ExecutionReceiptView,
+} from './contracts/copilot';
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
 
@@ -453,7 +460,9 @@ export type ChatThreadMessage = {
   attachments?: FileAsset[];
   metadata?: {
     citations?: Array<{ fileId: string; filename: string; locator: string; score: number }>;
+    event?: CopilotEvent;
   };
+  event?: CopilotEvent;
   created_at: string;
 };
 export type TaskDetail = Task & { input?: Record<string, unknown>; events: TaskEvent[]; artifacts: Artifact[]; attachments: FileAsset[]; actionAuthorizations?: ActionAuthorization[] };
@@ -1146,6 +1155,20 @@ export const api = {
       body: JSON.stringify({ content, attachmentIds }),
     }),
   deleteChatThread: (id: string) => request<void>(`/v1/copilot/threads/${id}`, { method: 'DELETE' }),
+  attachCopilotContext: (threadId: string, context: CopilotContextRequest) =>
+    request<CopilotContextView>(`/v1/copilot/threads/${threadId}/context`, {
+      method: 'POST',
+      body: JSON.stringify(context),
+    }),
+  rejectCopilotProposal: (proposalId: string) =>
+    request<CopilotProposalView>(`/v1/copilot/proposals/${proposalId}/reject`, { method: 'POST' }),
+  approveCopilotProposal: (proposalId: string, idempotencyKey: string) =>
+    request<ExecutionReceiptView>(`/v1/copilot/proposals/${proposalId}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ idempotencyKey }),
+    }),
+  copilotReceipt: (receiptId: string) =>
+    request<ExecutionReceiptView>(`/v1/copilot/receipts/${receiptId}`),
 
   artifactTemplates: () => request<{ data: HtmlArtifactTemplate[] }>('/v1/artifact-templates'),
   createArtifactTemplate: (body: { name: string; format: 'html'; designMarkdown: string; isDefault?: boolean }) =>

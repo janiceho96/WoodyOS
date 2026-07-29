@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Check, Clock3, Copy, Edit3, Eye, FileText, History, LoaderCircle, RotateCcw, Save, X } from 'lucide-react';
+import { AlertTriangle, Check, Clock3, Copy, Edit3, Eye, FileText, History, LoaderCircle, RotateCcw, Save, Sparkles, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api, type OutputDocumentDetail, type OutputVersion, type TaskDetail } from '../../api';
 import { useWorkspace } from '../../app/workspace';
+import { useCopilotContext } from '../../features/copilot/CopilotContext';
 import { OutputViewer } from '../OutputViewer';
 
 type EditorMode = 'view' | 'edit' | 'history';
@@ -20,6 +21,7 @@ function isVersionConflict(cause: unknown) {
 export function EditableOutput({ task, refreshTask }: { task: TaskDetail; refreshTask: () => void }) {
   const queryClient = useQueryClient();
   const { report, reportError } = useWorkspace();
+  const { openCopilot } = useCopilotContext();
   const queryKey = ['output-document', task.id] as const;
   const documentQuery = useQuery({
     queryKey,
@@ -70,6 +72,19 @@ export function EditableOutput({ task, refreshTask }: { task: TaskDetail; refres
       setTab('source');
     },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not prepare this output for editing'),
+  });
+
+  const launchCopilot = useMutation({
+    mutationFn: () => document ? Promise.resolve(document) : api.initializeOutputDocument(task.id),
+    onSuccess: (next) => {
+      if (!document) updateDocument(next);
+      openCopilot({
+        taskId: task.id,
+        outputDocumentId: next.id,
+        ...(task.workflow_run_id ? { workflowRunId: task.workflow_run_id } : {}),
+      });
+    },
+    onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not prepare this output for refinement'),
   });
 
   const save = useMutation({
@@ -162,6 +177,9 @@ export function EditableOutput({ task, refreshTask }: { task: TaskDetail; refres
         <small>{document ? `Version ${document.current_version_number} · original run preserved` : 'Original agent output · not edited'}</small>
       </div>
       <div>
+        <button className="button" type="button" disabled={launchCopilot.isPending || documentQuery.isLoading} onClick={() => launchCopilot.mutate()}>
+          {launchCopilot.isPending ? <LoaderCircle className="spin" size={14}/> : <Sparkles size={14}/>}Refine with Woody
+        </button>
         {document && <button className="button" type="button" onClick={() => { setSelectedVersionId(document.currentVersion.id); setMode('history'); }}><History size={14}/>History</button>}
         {mode === 'view' && <button className="button primary" type="button" disabled={initialize.isPending || documentQuery.isLoading} onClick={startEditing}>{initialize.isPending ? <LoaderCircle className="spin" size={14}/> : <Edit3 size={14}/>}Edit output</button>}
       </div>
