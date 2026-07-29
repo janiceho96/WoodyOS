@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { audit } from '../lib/audit.js';
+import { audit, auditWithClient } from '../lib/audit.js';
 import {
   aiProviderCredentialContext,
   configuredAiProvider,
   configuredAiProviderForWorkspace,
   workspaceAiProviderConfig,
   type AiProviderName,
+  type WorkspaceAiProviderConfig,
 } from '../lib/ai-provider.js';
 import { encryptJsonWithContext } from '../lib/crypto.js';
 import { asyncRoute, parse } from '../lib/http.js';
@@ -86,21 +87,30 @@ export async function runtimeRoutes(app: FastifyInstance) {
 
   app.put('/config', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(providerInput, request.body, reply); if (!input) return;
-    const existing = await workspaceAiProviderConfig(request.user.workspaceId);
-    const providerChanged = existing?.provider !== input.provider;
     const apiKey = input.apiKey;
-    if (!apiKey && (!existing || providerChanged)) return reply.code(400).send({ error: 'AI_PROVIDER_API_KEY_REQUIRED', message: 'Enter the API key for the selected provider.' });
     const baseUrl = input.provider === 'openai-compatible' ? normalizeCompatibleBaseUrl(input.baseUrl ?? '') : null;
-    const encrypted = apiKey
-      ? encryptJsonWithContext({ apiKey }, aiProviderCredentialContext(request.user.workspaceId))
-      : existing!.encrypted_api_key;
-    const hint = apiKey ? keyHint(apiKey) : existing!.api_key_hint;
-    const changed = !existing || providerChanged || existing.base_url !== baseUrl || existing.default_model !== input.defaultModel || Boolean(apiKey);
-    const providerOrModelChanged = !existing || providerChanged || existing.default_model !== input.defaultModel;
     const modelEnforcement = { agentsUpdated: 0, versionsPublished: 0 };
     const client = await db.connect();
     try {
       await client.query('BEGIN');
+      await client.query('SELECT id FROM workspaces WHERE id=$1 FOR UPDATE', [request.user.workspaceId]);
+      const existing = (await client.query<WorkspaceAiProviderConfig>(
+        `SELECT workspace_id,provider,base_url,default_model,encrypted_api_key,api_key_hint,status,
+         last_tested_at,last_error_code,last_error_message,updated_at
+         FROM workspace_ai_provider_configs WHERE workspace_id=$1 FOR UPDATE`,
+        [request.user.workspaceId],
+      )).rows[0] ?? null;
+      const providerChanged = existing?.provider !== input.provider;
+      if (!apiKey && (!existing || providerChanged)) {
+        await client.query('ROLLBACK');
+        return reply.code(400).send({ error: 'AI_PROVIDER_API_KEY_REQUIRED', message: 'Enter the API key for the selected provider.' });
+      }
+      const encrypted = apiKey
+        ? encryptJsonWithContext({ apiKey }, aiProviderCredentialContext(request.user.workspaceId))
+        : existing.encrypted_api_key;
+      const hint = apiKey ? keyHint(apiKey) : existing.api_key_hint;
+      const changed = !existing || providerChanged || existing.base_url !== baseUrl || existing.default_model !== input.defaultModel || Boolean(apiKey);
+      const providerOrModelChanged = !existing || providerChanged || existing.default_model !== input.defaultModel;
       await client.query(
         `INSERT INTO workspace_ai_provider_configs(
            workspace_id,provider,base_url,default_model,encrypted_api_key,api_key_hint,status,created_by,updated_by
@@ -122,6 +132,13 @@ export async function runtimeRoutes(app: FastifyInstance) {
           model: input.defaultModel,
         }));
       }
+      await auditWithClient(client, request.user.workspaceId, request.user.sub, 'runtime.provider.updated', 'workspace', request.user.workspaceId, {
+        provider: input.provider,
+        model: input.defaultModel,
+        baseUrl,
+        credentialChanged: Boolean(apiKey),
+        modelEnforcement,
+      });
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -129,13 +146,6 @@ export async function runtimeRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
-    await audit(request.user.workspaceId, request.user.sub, 'runtime.provider.updated', 'workspace', request.user.workspaceId, {
-      provider: input.provider,
-      model: input.defaultModel,
-      baseUrl,
-      credentialChanged: Boolean(apiKey),
-      modelEnforcement,
-    });
     return { ...await publicRuntimeConfig(request.user.workspaceId), modelEnforcement };
   }));
 

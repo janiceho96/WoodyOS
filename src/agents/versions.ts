@@ -133,6 +133,35 @@ async function publishWithClient(
   return mapVersion(inserted);
 }
 
+async function publishModelReplacementWithClient(
+  client: PoolClient,
+  input: { workspaceId: string; agentId: string; actorId: string; model: string; publishedVersionId: string },
+) {
+  const published = (await client.query<AgentVersionRow>(
+    `SELECT id,workspace_id,agent_id,version,snapshot,published_by,created_at
+       FROM agent_versions
+      WHERE id=$1 AND agent_id=$2 AND workspace_id=$3
+      FOR UPDATE`,
+    [input.publishedVersionId, input.agentId, input.workspaceId],
+  )).rows[0];
+  if (!published) throw versionError('AGENT_VERSION_NOT_FOUND', 404);
+  const nextVersion = (await client.query<{ version: number }>(
+    'SELECT COALESCE(MAX(version),0)+1 AS version FROM agent_versions WHERE agent_id=$1 AND workspace_id=$2',
+    [input.agentId, input.workspaceId],
+  )).rows[0].version;
+  const inserted = (await client.query<AgentVersionRow>(
+    `INSERT INTO agent_versions(workspace_id,agent_id,version,snapshot,published_by)
+     VALUES($1,$2,$3,$4,$5)
+     RETURNING id,workspace_id,agent_id,version,snapshot,published_by,created_at`,
+    [input.workspaceId, input.agentId, nextVersion, JSON.stringify({ ...published.snapshot, model: input.model }), input.actorId],
+  )).rows[0];
+  await client.query(
+    'UPDATE agents SET published_version_id=$1,updated_at=now() WHERE id=$2 AND workspace_id=$3',
+    [inserted.id, input.agentId, input.workspaceId],
+  );
+  return mapVersion(inserted);
+}
+
 export async function publishAgent(input: {
   workspaceId: string;
   agentId: string;
@@ -177,7 +206,13 @@ export async function enforceWorkspaceAgentModel(
   let versionsPublished = 0;
   for (const agent of agents) {
     if (!agent.published_version_id) continue;
-    await publishWithClient(client, { workspaceId: input.workspaceId, agentId: agent.id, actorId: input.actorId });
+    await publishModelReplacementWithClient(client, {
+      workspaceId: input.workspaceId,
+      agentId: agent.id,
+      actorId: input.actorId,
+      model: input.model,
+      publishedVersionId: agent.published_version_id,
+    });
     versionsPublished += 1;
   }
 

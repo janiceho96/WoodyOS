@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { publishAgent } from '../src/agents/versions.js';
-import { query } from '../src/db/client.js';
+import { db, query } from '../src/db/client.js';
 
 const enabled = process.env.RUN_INTEGRATION === 'true';
 
@@ -73,6 +73,23 @@ describe.runIf(enabled)('runtime provider model enforcement', () => {
       userId,
       workspaceId,
     };
+  }
+
+  async function waitForProviderConfigLockWaiter() {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const waiting = (await query<{ waiting: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1
+             FROM pg_stat_activity
+            WHERE datname=current_database()
+              AND wait_event_type='Lock'
+              AND query ILIKE '%workspace_ai_provider_configs%'
+         ) AS waiting`,
+      )).rows[0]?.waiting;
+      if (waiting) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error('Timed out waiting for a provider configuration lock waiter');
   }
 
   it('updates provider configuration and workspace agents atomically without exposing credentials', async () => {
@@ -191,6 +208,126 @@ describe.runIf(enabled)('runtime provider model enforcement', () => {
       )).rows).toEqual([{ version: 1 }, { version: 2 }]);
     } finally {
       await query(`DROP TRIGGER IF EXISTS ${triggerName} ON agent_versions`);
+      await query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+    }
+  });
+
+  it('serializes provider saves so the final configured model is enforced', async () => {
+    const fixture = await createFixture('model-race-baseline');
+    const baseline = await app.inject({
+      method: 'PUT',
+      url: '/v1/runtime/config',
+      headers: fixture.headers,
+      payload: {
+        provider: 'openai-compatible',
+        defaultModel: 'model-race-baseline',
+        baseUrl: 'https://example.com/v1',
+        apiKey: 'test-compatible-key',
+      },
+    });
+    expect(baseline.statusCode, baseline.body).toBe(200);
+
+    const lockClient = await db.connect();
+    let lockOpen = false;
+    try {
+      await lockClient.query('BEGIN');
+      lockOpen = true;
+      await lockClient.query(
+        'SELECT workspace_id FROM workspace_ai_provider_configs WHERE workspace_id=$1 FOR UPDATE',
+        [fixture.workspaceId],
+      );
+      const firstSave = app.inject({
+        method: 'PUT',
+        url: '/v1/runtime/config',
+        headers: fixture.headers,
+        payload: {
+          provider: 'openai-compatible',
+          defaultModel: 'model-race-first',
+          baseUrl: 'https://example.com/v1',
+        },
+      });
+      await waitForProviderConfigLockWaiter();
+      const secondSave = app.inject({
+        method: 'PUT',
+        url: '/v1/runtime/config',
+        headers: fixture.headers,
+        payload: {
+          provider: 'openai-compatible',
+          defaultModel: 'model-race-baseline',
+          baseUrl: 'https://example.com/v2',
+        },
+      });
+      await lockClient.query('COMMIT');
+      lockOpen = false;
+
+      const [firstResponse, secondResponse] = await Promise.all([firstSave, secondSave]);
+      expect(firstResponse.statusCode, firstResponse.body).toBe(200);
+      expect(secondResponse.statusCode, secondResponse.body).toBe(200);
+      expect(secondResponse.json().modelEnforcement).toEqual({ agentsUpdated: 2, versionsPublished: 1 });
+      expect((await query<{ default_model: string }>(
+        'SELECT default_model FROM workspace_ai_provider_configs WHERE workspace_id=$1',
+        [fixture.workspaceId],
+      )).rows).toEqual([{ default_model: 'model-race-baseline' }]);
+      expect((await query<{ model: string }>(
+        'SELECT model FROM agents WHERE id=ANY($1::uuid[]) ORDER BY id',
+        [[fixture.activeAgentId, fixture.draftAgentId]],
+      )).rows).toEqual([{ model: 'model-race-baseline' }, { model: 'model-race-baseline' }]);
+    } finally {
+      if (lockOpen) await lockClient.query('ROLLBACK');
+      lockClient.release();
+    }
+  });
+
+  it('rolls back the provider update when its audit event cannot be recorded', async () => {
+    const fixture = await createFixture('model-before-audit-failure');
+    const suffix = fixture.workspaceId.replaceAll('-', '');
+    const functionName = `runtime_audit_failure_${suffix}`;
+    const triggerName = `runtime_audit_failure_trigger_${suffix}`;
+    await query(
+      `CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN
+         IF NEW.workspace_id = '${fixture.workspaceId}'::uuid THEN
+           RAISE EXCEPTION 'audit failure';
+         END IF;
+         RETURN NEW;
+       END;
+       $$`,
+    );
+    await query(
+      `CREATE TRIGGER ${triggerName}
+       BEFORE INSERT ON audit_events
+       FOR EACH ROW EXECUTE FUNCTION ${functionName}()`,
+    );
+
+    try {
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/v1/runtime/config',
+        headers: fixture.headers,
+        payload: {
+          provider: 'openai-compatible',
+          defaultModel: 'model-after-audit-failure',
+          baseUrl: 'https://example.com/v1',
+          apiKey: 'test-compatible-key',
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(500);
+      expect(response.json()).toMatchObject({ error: 'INTERNAL_ERROR' });
+      expect((await query<{ default_model: string }>(
+        'SELECT default_model FROM workspace_ai_provider_configs WHERE workspace_id=$1',
+        [fixture.workspaceId],
+      )).rows).toEqual([]);
+      expect((await query<{ model: string }>(
+        'SELECT model FROM agents WHERE id=ANY($1::uuid[]) ORDER BY id',
+        [[fixture.activeAgentId, fixture.draftAgentId]],
+      )).rows).toEqual([{ model: 'model-before-audit-failure' }, { model: 'model-before-audit-failure' }]);
+      expect((await query<{ version: number }>(
+        'SELECT version FROM agent_versions WHERE agent_id=$1 ORDER BY version',
+        [fixture.activeAgentId],
+      )).rows).toEqual([{ version: 1 }]);
+    } finally {
+      await query(`DROP TRIGGER IF EXISTS ${triggerName} ON audit_events`);
       await query(`DROP FUNCTION IF EXISTS ${functionName}()`);
     }
   });

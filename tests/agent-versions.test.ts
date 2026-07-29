@@ -91,6 +91,14 @@ describe.runIf(enabled)('immutable agent versions', () => {
     const activeModelBId = await createAgent('Active model B agent', 'active', 'model-b');
     const previousModelA = await publishAgent({ workspaceId: enforcementWorkspaceId, agentId: activeModelAId, actorId });
     const previousModelB = await publishAgent({ workspaceId: enforcementWorkspaceId, agentId: activeModelBId, actorId });
+    await query(
+      `UPDATE agents
+          SET instructions='Pending instruction edit',
+              tool_ids='["11111111-1111-4111-8111-111111111111"]',
+              capabilities='{"webBrowser":true,"codeInterpreter":true,"knowledgeBase":false}'
+        WHERE id=$1 AND workspace_id=$2`,
+      [activeModelAId, enforcementWorkspaceId],
+    );
     const client = await db.connect();
 
     try {
@@ -107,6 +115,11 @@ describe.runIf(enabled)('immutable agent versions', () => {
       expect((await getAgentVersion(enforcementWorkspaceId, previousModelB.id)).snapshot.model).toBe('model-b');
       expect((await resolvePublishedAgentVersion(enforcementWorkspaceId, activeModelAId)).snapshot.model).toBe('model-c');
       expect((await resolvePublishedAgentVersion(enforcementWorkspaceId, activeModelBId)).snapshot.model).toBe('model-c');
+      expect((await resolvePublishedAgentVersion(enforcementWorkspaceId, activeModelAId)).snapshot).toMatchObject({
+        instructions: 'Original',
+        apiToolIds: [],
+        capabilities: { webBrowser: false, codeInterpreter: false, knowledgeBase: true },
+      });
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
