@@ -11,7 +11,8 @@ import {
 import { encryptJsonWithContext } from '../lib/crypto.js';
 import { asyncRoute, parse } from '../lib/http.js';
 import { normalizeCompatibleBaseUrl } from '../lib/safe-provider-fetch.js';
-import { query } from '../db/client.js';
+import { enforceWorkspaceAgentModel } from '../agents/versions.js';
+import { db, query } from '../db/client.js';
 
 const providerInput = z.object({
   provider: z.enum(['anthropic', 'openai-compatible']),
@@ -95,27 +96,47 @@ export async function runtimeRoutes(app: FastifyInstance) {
       : existing!.encrypted_api_key;
     const hint = apiKey ? keyHint(apiKey) : existing!.api_key_hint;
     const changed = !existing || providerChanged || existing.base_url !== baseUrl || existing.default_model !== input.defaultModel || Boolean(apiKey);
-    await query(
-      `INSERT INTO workspace_ai_provider_configs(
-         workspace_id,provider,base_url,default_model,encrypted_api_key,api_key_hint,status,created_by,updated_by
-       ) VALUES($1,$2,$3,$4,$5,$6,'untested',$7,$7)
-       ON CONFLICT(workspace_id) DO UPDATE SET
-         provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,default_model=EXCLUDED.default_model,
-         encrypted_api_key=EXCLUDED.encrypted_api_key,api_key_hint=EXCLUDED.api_key_hint,
-         status=CASE WHEN $8 THEN 'untested' ELSE workspace_ai_provider_configs.status END,
-         last_tested_at=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_tested_at END,
-         last_error_code=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_error_code END,
-         last_error_message=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_error_message END,
-         updated_by=EXCLUDED.updated_by,updated_at=now()`,
-      [request.user.workspaceId, input.provider, baseUrl, input.defaultModel, JSON.stringify(encrypted), hint, request.user.sub, changed],
-    );
+    const providerOrModelChanged = !existing || providerChanged || existing.default_model !== input.defaultModel;
+    const modelEnforcement = { agentsUpdated: 0, versionsPublished: 0 };
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO workspace_ai_provider_configs(
+           workspace_id,provider,base_url,default_model,encrypted_api_key,api_key_hint,status,created_by,updated_by
+         ) VALUES($1,$2,$3,$4,$5,$6,'untested',$7,$7)
+         ON CONFLICT(workspace_id) DO UPDATE SET
+           provider=EXCLUDED.provider,base_url=EXCLUDED.base_url,default_model=EXCLUDED.default_model,
+           encrypted_api_key=EXCLUDED.encrypted_api_key,api_key_hint=EXCLUDED.api_key_hint,
+           status=CASE WHEN $8 THEN 'untested' ELSE workspace_ai_provider_configs.status END,
+           last_tested_at=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_tested_at END,
+           last_error_code=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_error_code END,
+           last_error_message=CASE WHEN $8 THEN NULL ELSE workspace_ai_provider_configs.last_error_message END,
+           updated_by=EXCLUDED.updated_by,updated_at=now()`,
+        [request.user.workspaceId, input.provider, baseUrl, input.defaultModel, JSON.stringify(encrypted), hint, request.user.sub, changed],
+      );
+      if (providerOrModelChanged) {
+        Object.assign(modelEnforcement, await enforceWorkspaceAgentModel(client, {
+          workspaceId: request.user.workspaceId,
+          actorId: request.user.sub,
+          model: input.defaultModel,
+        }));
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     await audit(request.user.workspaceId, request.user.sub, 'runtime.provider.updated', 'workspace', request.user.workspaceId, {
       provider: input.provider,
       model: input.defaultModel,
       baseUrl,
       credentialChanged: Boolean(apiKey),
+      modelEnforcement,
     });
-    return publicRuntimeConfig(request.user.workspaceId);
+    return { ...await publicRuntimeConfig(request.user.workspaceId), modelEnforcement };
   }));
 
   app.post('/config/test', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
