@@ -8,6 +8,16 @@ export type FileCitation = {
   score: number;
 };
 
+export function deduplicateDisplayCitations(citations: FileCitation[]) {
+  const displayCitations = new Map<string, FileCitation>();
+  for (const citation of citations) {
+    const key = `${citation.fileId}\u0000${citation.locator}`;
+    const existing = displayCitations.get(key);
+    if (!existing || citation.score > existing.score) displayCitations.set(key, citation);
+  }
+  return [...displayCitations.values()];
+}
+
 function boundedEnvironmentNumber(name: string, fallback: number, minimum: number, maximum: number) {
   const configured = Number(process.env[name]);
   return Number.isFinite(configured) ? Math.min(maximum, Math.max(minimum, Math.floor(configured))) : fallback;
@@ -84,7 +94,7 @@ function contextText(citations: FileCitation[]) {
 
 export async function retrieveExplicitFileContext(workspaceId: string, fileIds: string[], requestText: string) {
   const citations = await searchFiles(workspaceId, [...new Set(fileIds)], requestText);
-  return { text: contextText(citations), citations };
+  return { text: contextText(citations), citations: deduplicateDisplayCitations(citations) };
 }
 
 export async function retrieveTaskAttachmentContext(
@@ -104,7 +114,7 @@ export async function retrieveTaskAttachmentContext(
     undefined,
     signal,
   );
-  return { text: contextText(citations), citations };
+  return { text: contextText(citations), citations: deduplicateDisplayCitations(citations) };
 }
 
 export async function retrieveChatAttachmentContext(workspaceId: string, threadId: string, requestText: string) {
@@ -116,5 +126,5 @@ export async function retrieveChatAttachmentContext(workspaceId: string, threadI
     [threadId, workspaceId],
   );
   const citations = await searchFiles(workspaceId, files.rows.map((row) => row.file_id), requestText);
-  return { text: contextText(citations), citations };
+  return { text: contextText(citations), citations: deduplicateDisplayCitations(citations) };
 }
