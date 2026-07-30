@@ -25,6 +25,7 @@ export type LoadedCopilotTurn = {
   context: CopilotContextSnapshotRecord;
   outputContent: string;
   clarificationRound: number;
+  outstandingProposalKind?: CopilotProposalKind | null;
 };
 
 export type CopilotGraphInput = {
