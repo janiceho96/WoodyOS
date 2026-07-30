@@ -43,6 +43,30 @@ describe('deterministic Copilot intent routing', () => {
     )).toMatchObject({ intent: 'refine_output', proposalKind: 'output_refinement' });
   });
 
+  it('prioritizes unsupported requests over an outstanding clarification', () => {
+    expect(detectDeterministicIntent(
+      [{ role: 'user', content: 'publish this agent' }],
+      'draft_agent',
+    )).toMatchObject({ intent: 'unsupported', confidence: 'deterministic' });
+  });
+
+  it.each([
+    'create a department for this agent',
+    'create departments for these agents',
+    'connect to the API',
+    'grant API access',
+    'give MCP permission',
+  ])('routes risky request %s to unsupported', (content) => {
+    expect(detectDeterministicIntent([{ role: 'user', content }], null).intent).toBe('unsupported');
+  });
+
+  it('keeps ordinary API questions answerable', () => {
+    expect(detectDeterministicIntent(
+      [{ role: 'user', content: 'what is the API response format?' }],
+      null,
+    ).intent).toBe('answer_question');
+  });
+
   it('marks genuinely ambiguous requests for classification', () => {
     expect(detectDeterministicIntent(
       [{ role: 'user', content: 'make it better' }],
