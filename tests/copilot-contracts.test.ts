@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   assertProposalTransition,
+  clarificationSchema,
   clarificationQuestionsSchema,
+  copilotIntentClassificationSchema,
   copilotGeneratedTurnSchema,
+  draftAgentCandidateSchema,
+  normalMessageSchema,
+  refinementCandidateSchema,
   normalizeDraftAgentPayload,
   outputRefinementPayloadSchema,
   proposalPayloadHash,
@@ -80,6 +85,42 @@ describe('Copilot contracts', () => {
       questions: [{ id: 'goal', question: 'What should improve?' }],
     }).success).toBe(true);
     expect(copilotGeneratedTurnSchema.safeParse({ type: 'publish_workflow' }).success).toBe(false);
+  });
+
+  it('keeps generated intent and refinement contracts strict and free of immutable output fields', () => {
+    expect(copilotIntentClassificationSchema.safeParse({ intent: 'answer_question' }).success).toBe(true);
+    expect(copilotIntentClassificationSchema.safeParse({ intent: 'publish_agent' }).success).toBe(false);
+    expect(refinementCandidateSchema.safeParse({
+      type: 'refinement_candidate',
+      proposedContent: '# Refined',
+      changeSummary: ['Clearer conclusion'],
+    }).success).toBe(true);
+    expect(refinementCandidateSchema.safeParse({
+      type: 'refinement_candidate',
+      proposedContent: '# Refined',
+      changeSummary: ['Clearer conclusion'],
+      documentId: 'application-owned',
+    }).success).toBe(false);
+  });
+
+  it('exports strict generated-turn schemas for every model response shape', () => {
+    expect(clarificationSchema.safeParse({
+      type: 'clarification',
+      proposalKind: 'draft_agent',
+      questions: [{ id: 'goal', question: 'What should this agent do?' }],
+      outputContent: 'application-owned context',
+    }).success).toBe(false);
+    expect(draftAgentCandidateSchema.safeParse({
+      type: 'draft_agent_candidate',
+      candidate: { name: 'Researcher' },
+      dependsOnOutputVersion: false,
+      status: 'draft',
+    }).success).toBe(false);
+    expect(normalMessageSchema.safeParse({
+      type: 'message',
+      content: 'Here is the requested explanation.',
+      proposal: {},
+    }).success).toBe(false);
   });
 
   it('reduces failures to stable safe receipt codes', () => {

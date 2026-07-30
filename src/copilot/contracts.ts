@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { outputContentSchema } from '../outputs/types.js';
+import { copilotIntentSchema } from './graph/state.js';
 import type {
   CopilotGeneratedTurn,
   CopilotProposalStatus,
@@ -29,6 +30,27 @@ export const clarificationQuestionSchema = z.object({
 }).strict();
 export const clarificationQuestionsSchema = z.array(clarificationQuestionSchema).min(1).max(3);
 
+export const copilotIntentClassificationSchema = z.object({
+  intent: copilotIntentSchema,
+}).strict();
+
+export const clarificationSchema = z.object({
+  type: z.literal('clarification'),
+  proposalKind: copilotProposalKindSchema,
+  questions: clarificationQuestionsSchema,
+}).strict();
+
+export const refinementCandidateSchema = z.object({
+  type: z.literal('refinement_candidate'),
+  proposedContent: outputContentSchema,
+  changeSummary: z.array(z.string().trim().min(1).max(500)).min(1).max(20),
+}).strict();
+
+export const normalMessageSchema = z.object({
+  type: z.literal('message'),
+  content: z.string().trim().min(1).max(8_000),
+}).strict();
+
 const modelConfigSchema = z.object({
   temperature: z.number().min(0).max(2),
   maxTokens: z.number().int().min(128).max(128_000),
@@ -47,7 +69,7 @@ const memoryConfigSchema = z.object({
   knowledgeBase: z.boolean(),
 }).strict();
 
-const draftAgentCandidateSchema = z.object({
+const draftAgentNormalizationCandidateSchema = z.object({
   name: z.string().trim().min(2).max(120),
   role: z.string().trim().min(2).max(240),
   goal: z.string().trim().min(2).max(5_000),
@@ -60,6 +82,12 @@ const draftAgentCandidateSchema = z.object({
   status: z.unknown().optional(),
   toolIds: z.unknown().optional(),
 }).passthrough();
+
+export const draftAgentCandidateSchema = z.object({
+  type: z.literal('draft_agent_candidate'),
+  candidate: z.record(z.unknown()),
+  dependsOnOutputVersion: z.boolean(),
+}).strict();
 
 export const draftAgentPayloadSchema = z.object({
   name: z.string().trim().min(2).max(120),
@@ -90,22 +118,10 @@ export const outputRefinementPayloadSchema = z.object({
 }).strict();
 
 export const copilotGeneratedTurnSchema: z.ZodType<CopilotGeneratedTurn> = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('clarification'),
-    proposalKind: copilotProposalKindSchema,
-    questions: clarificationQuestionsSchema,
-  }).strict(),
-  z.object({
-    type: z.literal('refinement_candidate'),
-    proposedContent: outputContentSchema,
-    changeSummary: z.array(z.string().trim().min(1).max(500)).min(1).max(20),
-  }).strict(),
-  z.object({
-    type: z.literal('draft_agent_candidate'),
-    candidate: z.record(z.unknown()),
-    dependsOnOutputVersion: z.boolean(),
-  }).strict(),
-  z.object({ type: z.literal('message'), content: z.string().trim().min(1).max(8_000) }).strict(),
+  clarificationSchema,
+  refinementCandidateSchema,
+  draftAgentCandidateSchema,
+  normalMessageSchema,
   z.object({ type: z.literal('unsupported'), content: z.string().trim().min(1).max(2_000) }).strict(),
 ]);
 
@@ -133,7 +149,7 @@ function stableJson(value: unknown): string {
 }
 
 export function normalizeDraftAgentPayload(candidate: unknown): DraftAgentPayload {
-  const parsed = draftAgentCandidateSchema.parse(candidate);
+  const parsed = draftAgentNormalizationCandidateSchema.parse(candidate);
   return draftAgentPayloadSchema.parse({
     name: parsed.name,
     role: parsed.role,
