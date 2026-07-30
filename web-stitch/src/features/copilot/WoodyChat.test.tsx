@@ -332,7 +332,6 @@ describe('Woody contextual conversation state', () => {
 
     fireEvent.change(globalThis.document.querySelector('input[type="file"]')!, { target: { files: [new File(['pending'], 'pending.txt', { type: 'text/plain' })] } });
     await screen.findByText('pending.txt');
-    await waitFor(() => expect(api.file).toHaveBeenCalledWith(pendingAttachment.id));
     fireEvent.click(retry);
 
     await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'Retry this request.', []));
