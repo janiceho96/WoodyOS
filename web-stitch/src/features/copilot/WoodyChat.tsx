@@ -20,7 +20,8 @@ type UiMessage = WoodyChatMessage & {
 };
 type Position = { x: number; y: number };
 type DragState = { pointerX: number; pointerY: number; position: Position; bounds: DOMRect };
-type SendOptions = { skipContextAttach?: boolean };
+type RetryPayload = { content: string; attachmentIds: string[] };
+type SendOptions = { skipContextAttach?: boolean; retryPayload?: RetryPayload };
 
 const positionStorageKey = 'woody_chat_position_v1';
 
@@ -84,7 +85,8 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const contextViewRef = useRef<CopilotContextView | null>(null);
   const creatingThreadRef = useRef<Promise<string> | null>(null);
   const approvalKeysRef = useRef(new Map<string, string>());
-  const userIntentByAssistantIdRef = useRef(new Map<string, string>());
+  const retryPayloadByAssistantIdRef = useRef(new Map<string, RetryPayload>());
+  const sendingRef = useRef(false);
 
   const expression = useMemo<MascotExpression>(() => {
     if (pending) return 'processing';
@@ -109,11 +111,12 @@ export function WoodyChat({ displayName }: { displayName: string }) {
         if (cancelled) return;
         setThreadId(thread.id);
         if (thread.messages?.length) {
-          let precedingUserIntent: string | null = null;
+          const unmatchedUserIntents: RetryPayload[] = [];
           const restoredMessages = thread.messages.map((message) => {
-            if (message.role === 'user') precedingUserIntent = message.content;
-            if (message.role === 'assistant' && precedingUserIntent) {
-              userIntentByAssistantIdRef.current.set(message.id, precedingUserIntent);
+            if (message.role === 'user') unmatchedUserIntents.push({ content: message.content, attachmentIds: [] });
+            if (message.role === 'assistant') {
+              const retryPayload = unmatchedUserIntents.shift();
+              if (retryPayload) retryPayloadByAssistantIdRef.current.set(message.id, retryPayload);
             }
             return {
               id: message.id,
@@ -204,18 +207,21 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [copilot.context, copilot.open, historyLoaded, threadId]);
 
-  const send = async (content: string, { skipContextAttach = false }: SendOptions = {}) => {
+  const send = async (content: string, { skipContextAttach = false, retryPayload }: SendOptions = {}) => {
     const clean = content.trim();
-    if (!clean || pending || attachments.some((file) => file.status !== 'ready')) return;
-    const selectedAttachments = attachments;
+    if (!clean || sendingRef.current || (!retryPayload && attachments.some((file) => file.status !== 'ready'))) return;
+    sendingRef.current = true;
+    const selectedAttachments = retryPayload ? [] : attachments;
+    const attachmentIds = retryPayload?.attachmentIds ?? selectedAttachments.map((file) => file.id);
     const userMessage: UiMessage = { id: messageId(), role: 'user', content: clean, attachments: selectedAttachments };
-    const next = [...messages, userMessage];
-    setMessages(next); setDraft(''); setAttachments([]); setPending(true); setError('');
+    setMessages((current) => [...current, userMessage]);
+    if (!retryPayload) { setDraft(''); setAttachments([]); }
+    setPending(true); setError('');
     try {
       const activeThread = await ensureThread();
       if (!skipContextAttach) await attachContext(activeThread);
-      const result = await api.sendChatThreadMessage(activeThread, clean, selectedAttachments.map((file) => file.id));
-      userIntentByAssistantIdRef.current.set(result.assistant.id, clean);
+      const result = await api.sendChatThreadMessage(activeThread, clean, attachmentIds);
+      retryPayloadByAssistantIdRef.current.set(result.assistant.id, { content: clean, attachmentIds });
       setMessages((current) => [...current, {
         id: result.assistant.id,
         role: 'assistant',
@@ -226,12 +232,12 @@ export function WoodyChat({ displayName }: { displayName: string }) {
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : 'Woody could not answer right now.';
       setError(detail === 'AI_NOT_CONFIGURED' ? 'Connect an AI provider in Settings before chatting with Woody.' : detail);
-    } finally { setPending(false); }
+    } finally { sendingRef.current = false; setPending(false); }
   };
 
   const retryProposal = (assistantResponseId: string) => {
-    const failedIntent = userIntentByAssistantIdRef.current.get(assistantResponseId);
-    if (failedIntent) void send(failedIntent, { skipContextAttach: true });
+    const retryPayload = retryPayloadByAssistantIdRef.current.get(assistantResponseId);
+    if (retryPayload) void send(retryPayload.content, { skipContextAttach: true, retryPayload });
   };
 
   const updateProposalStatus = (proposalId: string, status: CopilotProposalStatus) => {
@@ -290,7 +296,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
     if (threadId) await api.deleteChatThread(threadId).catch(() => undefined);
     attachedContextRef.current = '';
     contextViewRef.current = null;
-    userIntentByAssistantIdRef.current.clear();
+    retryPayloadByAssistantIdRef.current.clear();
     setContextView(null); setThreadId(null); setMessages([welcome(displayName)]); setAttachments([]); setError(''); setDraft('');
   };
   const startDrag = (event: ReactPointerEvent<HTMLElement>) => {

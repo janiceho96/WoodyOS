@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   api,
   type ChatThread,
+  type FileAsset,
   type OutputDocumentDetail,
   type TaskDetail,
 } from '../../api';
@@ -98,6 +99,33 @@ function thread(messages: NonNullable<ChatThread['messages']> = []): ChatThread 
     created_at: '2026-07-29T10:00:00.000Z',
     updated_at: '2026-07-29T10:00:00.000Z',
     messages,
+  };
+}
+
+function fileAsset(id: string, originalName: string, status: FileAsset['status'] = 'ready'): FileAsset {
+  return {
+    id,
+    original_name: originalName,
+    extension: 'txt',
+    mime_type: 'text/plain',
+    size_bytes: 12,
+    status,
+    scan_status: status === 'ready' ? 'clean' : 'pending',
+    scope: 'conversation',
+    retention_policy: 'delete_after_conversation',
+    version_group_id: `${id}-group`,
+    version_number: 1,
+    created_at: '2026-07-29T10:00:00.000Z',
+  };
+}
+
+function proposalError(requestId: string): Extract<CopilotEvent, { type: 'proposal_error' }> {
+  return {
+    type: 'proposal_error',
+    code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
+    message: 'I could not create a safe proposal. Please try again.',
+    requestId,
+    retryable: true,
   };
 }
 
@@ -204,13 +232,7 @@ describe('Woody contextual conversation state', () => {
   });
 
   it('retries the user intent that produced a retryable proposal failure without reattaching context', async () => {
-    const event: CopilotEvent = {
-      type: 'proposal_error',
-      code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
-      message: 'I could not create a safe proposal. Please try again.',
-      requestId: 'trace-1',
-      retryable: true,
-    };
+    const event = proposalError('trace-1');
     vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
     vi.mocked(api.chatThread).mockResolvedValue(thread([
       {
@@ -246,6 +268,119 @@ describe('Woody contextual conversation state', () => {
 
     await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'Rewrite this output for executives.', []));
     expect(api.attachCopilotContext).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a live failed intent with its original attachments instead of composer attachments', async () => {
+    const originalAttachment = fileAsset('0a5e7297-4be3-4c8a-a5e6-7e7f26e969dd', 'original.txt');
+    const unrelatedAttachment = fileAsset('eb7f6539-90b5-4d8c-b1b8-a4bb0f7c7094', 'unrelated.txt');
+    const event = proposalError('trace-live');
+    vi.spyOn(api, 'files').mockResolvedValue({ data: [] });
+    vi.spyOn(api, 'uploadFile')
+      .mockResolvedValueOnce(originalAttachment)
+      .mockResolvedValueOnce(unrelatedAttachment);
+    vi.spyOn(api, 'sendChatThreadMessage')
+      .mockResolvedValueOnce({
+        user: { id: 'original-user-message', role: 'user', content: 'Rewrite this output for executives.', created_at: '2026-07-29T10:00:00.000Z' },
+        assistant: { id: 'failed-assistant-message', role: 'assistant', content: event.message, event, created_at: '2026-07-29T10:00:01.000Z' },
+        citations: [],
+      })
+      .mockResolvedValueOnce({
+        user: { id: 'retry-user-message', role: 'user', content: 'Rewrite this output for executives.', created_at: '2026-07-29T10:00:02.000Z' },
+        assistant: { id: 'retry-assistant-message', role: 'assistant', content: 'Here is a safe proposal.', created_at: '2026-07-29T10:00:03.000Z' },
+        citations: [],
+      });
+    wrapper(<WoodyChat displayName="Test User"/>);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat with Woody' }));
+
+    fireEvent.change(globalThis.document.querySelector('input[type="file"]')!, { target: { files: [new File(['original'], 'original.txt', { type: 'text/plain' })] } });
+    await screen.findByText('original.txt');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message Woody' }), { target: { value: 'Rewrite this output for executives.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    const retry = await screen.findByRole('button', { name: 'Try again' });
+
+    fireEvent.change(globalThis.document.querySelector('input[type="file"]')!, { target: { files: [new File(['unrelated'], 'unrelated.txt', { type: 'text/plain' })] } });
+    await screen.findByText('unrelated.txt');
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenNthCalledWith(
+      2,
+      threadId,
+      'Rewrite this output for executives.',
+      [originalAttachment.id],
+    ));
+  });
+
+  it('retries restored failures despite an unrelated pending composer upload', async () => {
+    const event = proposalError('trace-pending');
+    const pendingAttachment = fileAsset('0a1a934b-dfd4-4695-8e1c-26b9c31dca30', 'pending.txt', 'scanning');
+    vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
+    vi.mocked(api.chatThread).mockResolvedValue(thread([
+      { id: 'failed-user-message', role: 'user', content: 'Retry this request.', created_at: '2026-07-29T10:00:00.000Z' },
+      { id: 'failed-assistant-message', role: 'assistant', content: event.message, event, metadata: { event }, created_at: '2026-07-29T10:00:01.000Z' },
+    ]));
+    vi.spyOn(api, 'files').mockResolvedValue({ data: [] });
+    vi.spyOn(api, 'uploadFile').mockResolvedValue(pendingAttachment);
+    vi.spyOn(api, 'file').mockImplementation(() => new Promise<FileAsset>(() => undefined));
+    vi.spyOn(api, 'sendChatThreadMessage').mockResolvedValue({
+      user: { id: 'retry-user-message', role: 'user', content: 'Retry this request.', created_at: '2026-07-29T10:00:02.000Z' },
+      assistant: { id: 'retry-assistant-message', role: 'assistant', content: 'Here is a safe proposal.', created_at: '2026-07-29T10:00:03.000Z' },
+      citations: [],
+    });
+    wrapper(<WoodyChat displayName="Test User"/>);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat with Woody' }));
+    const retry = await screen.findByRole('button', { name: 'Try again' });
+
+    fireEvent.change(globalThis.document.querySelector('input[type="file"]')!, { target: { files: [new File(['pending'], 'pending.txt', { type: 'text/plain' })] } });
+    await screen.findByText('pending.txt');
+    await waitFor(() => expect(api.file).toHaveBeenCalledWith(pendingAttachment.id));
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'Retry this request.', []));
+  });
+
+  it('pairs interleaved restored proposal failures with user intents in FIFO order', async () => {
+    const firstEvent = proposalError('trace-first');
+    const secondEvent = proposalError('trace-second');
+    vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
+    vi.mocked(api.chatThread).mockResolvedValue(thread([
+      { id: 'first-user-message', role: 'user', content: 'First request.', created_at: '2026-07-29T10:00:00.000Z' },
+      { id: 'second-user-message', role: 'user', content: 'Second request.', created_at: '2026-07-29T10:00:01.000Z' },
+      { id: 'first-assistant-message', role: 'assistant', content: firstEvent.message, event: firstEvent, metadata: { event: firstEvent }, created_at: '2026-07-29T10:00:02.000Z' },
+      { id: 'second-assistant-message', role: 'assistant', content: secondEvent.message, event: secondEvent, metadata: { event: secondEvent }, created_at: '2026-07-29T10:00:03.000Z' },
+    ]));
+    vi.spyOn(api, 'sendChatThreadMessage').mockResolvedValue({
+      user: { id: 'retry-user-message', role: 'user', content: 'Retry response.', created_at: '2026-07-29T10:00:04.000Z' },
+      assistant: { id: 'retry-assistant-message', role: 'assistant', content: 'Here is a safe proposal.', created_at: '2026-07-29T10:00:05.000Z' },
+      citations: [],
+    });
+    wrapper(<WoodyChat displayName="Test User"/>);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat with Woody' }));
+
+    const retries = await screen.findAllByRole('button', { name: 'Try again' });
+    fireEvent.click(retries[0]);
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'First request.', []));
+    fireEvent.click(retries[1]);
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenNthCalledWith(2, threadId, 'Second request.', []));
+  });
+
+  it('prevents overlapping sends before pending state rerenders', async () => {
+    let resolveResponse: ((value: Awaited<ReturnType<typeof api.sendChatThreadMessage>>) => void) | null = null;
+    vi.spyOn(api, 'sendChatThreadMessage').mockImplementation(() => new Promise((resolve) => { resolveResponse = resolve; }));
+    wrapper(<WoodyChat displayName="Test User"/>);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat with Woody' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message Woody' }), { target: { value: 'Only send once.' } });
+    const send = screen.getByRole('button', { name: 'Send message' });
+
+    act(() => { send.click(); send.click(); });
+
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      resolveResponse?.({
+        user: { id: 'single-user-message', role: 'user', content: 'Only send once.', created_at: '2026-07-29T10:00:00.000Z' },
+        assistant: { id: 'single-assistant-message', role: 'assistant', content: 'Received once.', created_at: '2026-07-29T10:00:01.000Z' },
+        citations: [],
+      });
+    });
   });
 
   it('reuses one approval idempotency key after a transport failure', async () => {
