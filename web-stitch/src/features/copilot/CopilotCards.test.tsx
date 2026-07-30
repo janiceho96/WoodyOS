@@ -153,6 +153,29 @@ describe('Copilot cards', () => {
     expect(screen.getByText('What tone should it use?')).toBeTruthy();
   });
 
+  it('renders a safe retry action for retryable proposal failures', () => {
+    const retry = vi.fn();
+    render(<CopilotEventCard
+      event={{
+        type: 'proposal_error',
+        code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
+        message: 'The proposal response was invalid.',
+        requestId: 'trace-1',
+        retryable: true,
+      }}
+      onApprove={vi.fn()}
+      onReject={vi.fn()}
+      onRegenerate={vi.fn()}
+      onRetry={retry}
+    />);
+
+    expect(screen.getByText('The proposal response was invalid.')).toBeTruthy();
+    expect(screen.getByText('COPILOT_PROPOSAL_SCHEMA_INVALID')).toBeTruthy();
+    expect(screen.getByText('Request ID: trace-1')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
   it('links a successful receipt to the exact created resource', () => {
     const receipt: ExecutionReceiptView = {
       id: 'b75bad72-e0fd-41cf-bb83-86e0cb059147',

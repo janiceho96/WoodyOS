@@ -20,6 +20,7 @@ type UiMessage = WoodyChatMessage & {
 };
 type Position = { x: number; y: number };
 type DragState = { pointerX: number; pointerY: number; position: Position; bounds: DOMRect };
+type SendOptions = { skipContextAttach?: boolean };
 
 const positionStorageKey = 'woody_chat_position_v1';
 
@@ -83,6 +84,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const contextViewRef = useRef<CopilotContextView | null>(null);
   const creatingThreadRef = useRef<Promise<string> | null>(null);
   const approvalKeysRef = useRef(new Map<string, string>());
+  const userIntentByAssistantIdRef = useRef(new Map<string, string>());
 
   const expression = useMemo<MascotExpression>(() => {
     if (pending) return 'processing';
@@ -106,14 +108,24 @@ export function WoodyChat({ displayName }: { displayName: string }) {
         const thread = await api.chatThread(threads.data[0].id);
         if (cancelled) return;
         setThreadId(thread.id);
-        if (thread.messages?.length) setMessages(thread.messages.map((message) => ({
-          id: message.id,
-          role: message.role,
-          content: message.content,
-          attachments: message.attachments,
-          citations: message.metadata?.citations,
-          event: message.event ?? message.metadata?.event,
-        })));
+        if (thread.messages?.length) {
+          let precedingUserIntent: string | null = null;
+          const restoredMessages = thread.messages.map((message) => {
+            if (message.role === 'user') precedingUserIntent = message.content;
+            if (message.role === 'assistant' && precedingUserIntent) {
+              userIntentByAssistantIdRef.current.set(message.id, precedingUserIntent);
+            }
+            return {
+              id: message.id,
+              role: message.role,
+              content: message.content,
+              attachments: message.attachments,
+              citations: message.metadata?.citations,
+              event: message.event ?? message.metadata?.event,
+            };
+          });
+          setMessages(restoredMessages);
+        }
       } catch {
         // Keep the fresh welcome if older history is temporarily unavailable.
       } finally {
@@ -192,7 +204,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [copilot.context, copilot.open, historyLoaded, threadId]);
 
-  const send = async (content: string) => {
+  const send = async (content: string, { skipContextAttach = false }: SendOptions = {}) => {
     const clean = content.trim();
     if (!clean || pending || attachments.some((file) => file.status !== 'ready')) return;
     const selectedAttachments = attachments;
@@ -201,8 +213,9 @@ export function WoodyChat({ displayName }: { displayName: string }) {
     setMessages(next); setDraft(''); setAttachments([]); setPending(true); setError('');
     try {
       const activeThread = await ensureThread();
-      await attachContext(activeThread);
+      if (!skipContextAttach) await attachContext(activeThread);
       const result = await api.sendChatThreadMessage(activeThread, clean, selectedAttachments.map((file) => file.id));
+      userIntentByAssistantIdRef.current.set(result.assistant.id, clean);
       setMessages((current) => [...current, {
         id: result.assistant.id,
         role: 'assistant',
@@ -214,6 +227,11 @@ export function WoodyChat({ displayName }: { displayName: string }) {
       const detail = cause instanceof Error ? cause.message : 'Woody could not answer right now.';
       setError(detail === 'AI_NOT_CONFIGURED' ? 'Connect an AI provider in Settings before chatting with Woody.' : detail);
     } finally { setPending(false); }
+  };
+
+  const retryProposal = (assistantResponseId: string) => {
+    const failedIntent = userIntentByAssistantIdRef.current.get(assistantResponseId);
+    if (failedIntent) void send(failedIntent, { skipContextAttach: true });
   };
 
   const updateProposalStatus = (proposalId: string, status: CopilotProposalStatus) => {
@@ -272,6 +290,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
     if (threadId) await api.deleteChatThread(threadId).catch(() => undefined);
     attachedContextRef.current = '';
     contextViewRef.current = null;
+    userIntentByAssistantIdRef.current.clear();
     setContextView(null); setThreadId(null); setMessages([welcome(displayName)]); setAttachments([]); setError(''); setDraft('');
   };
   const startDrag = (event: ReactPointerEvent<HTMLElement>) => {
@@ -325,7 +344,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
         {contextView && <CopilotContextCard context={contextView} currentOutputVersionId={contextView.output.versionId}/>}
         {messages.map((message) => <article className={message.role} key={message.id}>
           {message.role === 'assistant' && <span className="woody-message-avatar"><Mascot expression="happy" size={34} floating={false} blink={false} decorative/></span>}
-          <div><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>{message.event && <CopilotEventCard event={message.event} applying={'proposal' in message.event && applyingProposalId === message.event.proposal.id} onApprove={(proposalId) => void approveProposal(proposalId)} onReject={(proposalId) => void rejectProposal(proposalId)} onRegenerate={() => void send('Generate a new proposal for the selected output context.')}/>} {message.attachments?.length ? <div className="woody-message-attachments">{message.attachments.map((file) => <AttachmentChip key={file.id} file={file}/>)}</div> : null}{message.citations?.length ? <div className="woody-message-citations"><strong>Sources used</strong>{message.citations.map((citation, index) => <span key={`${citation.fileId}-${citation.locator}-${index}`}>{citation.filename} · {citation.locator}</span>)}</div> : null}</div>
+          <div><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>{message.event && <CopilotEventCard event={message.event} applying={'proposal' in message.event && applyingProposalId === message.event.proposal.id} onApprove={(proposalId) => void approveProposal(proposalId)} onReject={(proposalId) => void rejectProposal(proposalId)} onRegenerate={() => void send('Generate a new proposal for the selected output context.')} onRetry={() => retryProposal(message.id)}/>} {message.attachments?.length ? <div className="woody-message-attachments">{message.attachments.map((file) => <AttachmentChip key={file.id} file={file}/>)}</div> : null}{message.citations?.length ? <div className="woody-message-citations"><strong>Sources used</strong>{message.citations.map((citation, index) => <span key={`${citation.fileId}-${citation.locator}-${index}`}>{citation.filename} · {citation.locator}</span>)}</div> : null}</div>
         </article>)}
         {messages.length === 1 && <div className="woody-chat-suggestions">{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => void send(suggestion)}>{suggestion}</button>)}</div>}
         {pending && <div className="woody-typing"><LoaderCircle className="spin" size={14}/><span>Woody is thinking carefully…</span></div>}

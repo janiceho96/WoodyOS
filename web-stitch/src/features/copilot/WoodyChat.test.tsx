@@ -203,6 +203,51 @@ describe('Woody contextual conversation state', () => {
     expect(await screen.findByText('Should the tone be formal?')).toBeTruthy();
   });
 
+  it('retries the user intent that produced a retryable proposal failure without reattaching context', async () => {
+    const event: CopilotEvent = {
+      type: 'proposal_error',
+      code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
+      message: 'I could not create a safe proposal. Please try again.',
+      requestId: 'trace-1',
+      retryable: true,
+    };
+    vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
+    vi.mocked(api.chatThread).mockResolvedValue(thread([
+      {
+        id: 'failed-user-message',
+        role: 'user',
+        content: 'Rewrite this output for executives.',
+        created_at: '2026-07-29T10:00:00.000Z',
+      },
+      {
+        id: 'failed-assistant-message',
+        role: 'assistant',
+        content: event.message,
+        event,
+        metadata: { event },
+        created_at: '2026-07-29T10:00:01.000Z',
+      },
+    ]));
+    vi.spyOn(api, 'outputDocumentForTask').mockResolvedValue({ document });
+    vi.spyOn(api, 'sendChatThreadMessage').mockResolvedValue({
+      user: { id: 'retry-user-message', role: 'user', content: 'Rewrite this output for executives.', created_at: '2026-07-29T10:00:02.000Z' },
+      assistant: { id: 'retry-assistant-message', role: 'assistant', content: 'Here is a safe proposal.', created_at: '2026-07-29T10:00:03.000Z' },
+      citations: [],
+    });
+    wrapper(<><EditableOutput task={task} refreshTask={vi.fn()}/><WoodyChat displayName="Test User"/></>);
+
+    const refine = await screen.findByRole('button', { name: 'Refine with Woody' });
+    await waitFor(() => expect((refine as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(refine);
+
+    const retry = await screen.findByRole('button', { name: 'Try again' });
+    await waitFor(() => expect(api.attachCopilotContext).toHaveBeenCalledTimes(1));
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'Rewrite this output for executives.', []));
+    expect(api.attachCopilotContext).toHaveBeenCalledTimes(1);
+  });
+
   it('reuses one approval idempotency key after a transport failure', async () => {
     const proposal: CopilotProposalView = {
       id: '6688bb45-a4f8-4261-8e71-ee8bd43dfe81',

@@ -96,4 +96,14 @@ export type CopilotEvent =
   | { type: 'refinement_preview'; proposal: CopilotProposalView }
   | { type: 'agent_proposal'; proposal: CopilotProposalView }
   | { type: 'execution_receipt'; receipt: ExecutionReceiptView }
+  | {
+    type: 'proposal_error';
+    code:
+      | 'COPILOT_INTENT_CLASSIFICATION_FAILED'
+      | 'COPILOT_PROPOSAL_SCHEMA_INVALID'
+      | 'COPILOT_PROVIDER_FAILED';
+    message: string;
+    requestId: string;
+    retryable: boolean;
+  }
   | { type: 'message'; content: string };
