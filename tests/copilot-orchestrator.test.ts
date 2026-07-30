@@ -32,7 +32,11 @@ const context: CopilotContextSnapshotRecord = {
   },
 };
 
-function dependencies(turn: unknown, clarificationRound = 0) {
+function dependencies(
+  turn: unknown,
+  clarificationRound = 0,
+  outstandingProposalKind: 'output_refinement' | 'draft_agent' | null = null,
+) {
   const createProposal = vi.fn(async (input: { kind: 'output_refinement' | 'draft_agent' }) => ({
     id: '6688bb45-a4f8-4261-8e71-ee8bd43dfe81',
     kind: input.kind,
@@ -70,7 +74,12 @@ function dependencies(turn: unknown, clarificationRound = 0) {
   }));
   const generator = vi.fn(async () => turn as CopilotGeneratedTurn);
   const deps: CopilotOrchestratorDependencies = {
-    loadTurnContext: vi.fn(async () => ({ context, outputContent: '# Original', clarificationRound })),
+    loadTurnContext: vi.fn(async () => ({
+      context,
+      outputContent: '# Original',
+      clarificationRound,
+      outstandingProposalKind,
+    })),
     createProposal: createProposal as never,
     generator,
   };
@@ -92,7 +101,10 @@ describe('Copilot turn orchestration', () => {
       questions: [{ id: 'audience', question: 'Who is the audience?' }],
     });
 
-    const result = await orchestrateCopilotTurn(input, deps);
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'Make it better.' }],
+    }, deps);
 
     expect(result).toMatchObject({
       contextSnapshotId,
@@ -145,7 +157,10 @@ describe('Copilot turn orchestration', () => {
       dependsOnOutputVersion: true,
     });
 
-    const result = await orchestrateCopilotTurn(input, deps);
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'Create a new writing agent.' }],
+    }, deps);
 
     expect(result.event.type).toBe('agent_proposal');
     expect(createProposal).toHaveBeenCalledWith(expect.objectContaining({
@@ -164,9 +179,10 @@ describe('Copilot turn orchestration', () => {
 
     const result = await orchestrateCopilotTurn(input, deps);
 
-    expect(result.event).toEqual({
-      type: 'message',
-      content: 'I could not create a safe proposal. Please try again.',
+    expect(result.event).toMatchObject({
+      type: 'proposal_error',
+      code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
+      retryable: true,
     });
     expect(createProposal).not.toHaveBeenCalled();
   });
@@ -177,14 +193,17 @@ describe('Copilot turn orchestration', () => {
       candidate: { name: 'Missing required fields' },
       dependsOnOutputVersion: false,
     });
-    createProposal.mockRejectedValueOnce(new (await import('zod')).z.ZodError([]) as never);
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'Create a new writing agent.' }],
+    }, deps);
 
-    const result = await orchestrateCopilotTurn(input, deps);
-
-    expect(result.event).toEqual({
-      type: 'message',
-      content: 'I could not create a safe proposal. Please try again.',
+    expect(result.event).toMatchObject({
+      type: 'proposal_error',
+      code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
+      retryable: true,
     });
+    expect(createProposal).not.toHaveBeenCalled();
   });
 
   it('fails closed for unsupported operations', async () => {
@@ -193,35 +212,102 @@ describe('Copilot turn orchestration', () => {
       content: 'I cannot change workflow graphs from this conversation.',
     });
 
-    const result = await orchestrateCopilotTurn(input, deps);
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'Publish this agent.' }],
+    }, deps);
 
     expect(result.event).toEqual({
       type: 'message',
-      content: 'COPILOT_OPERATION_UNSUPPORTED: I cannot change workflow graphs from this conversation.',
+      content: 'COPILOT_OPERATION_UNSUPPORTED: This operation is not supported by the Copilot graph.',
     });
     expect(createProposal).not.toHaveBeenCalled();
   });
 
-  it('stops after three clarification rounds without invoking the model', async () => {
+  it('answers a question while output context is attached', async () => {
+    const { deps, createProposal } = dependencies({
+      type: 'message',
+      content: 'No error was found in the selected output.',
+    });
+
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'is there any error?' }],
+    }, deps);
+
+    expect(result.event).toEqual({
+      type: 'message',
+      content: 'No error was found in the selected output.',
+    });
+    expect(result).toMatchObject({
+      path: ['load_intent', 'answer_question', 'finalize_turn'],
+      repairAttempted: false,
+      repairSucceeded: false,
+    });
+    expect(result.traceId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(createProposal).not.toHaveBeenCalled();
+  });
+
+  it('resumes the persisted clarification kind without classifying free text', async () => {
+    const { deps } = dependencies({
+      type: 'draft_agent_candidate',
+      candidate: {
+        name: 'Draft Writer',
+        role: 'Writer',
+        goal: 'Draft a useful response',
+        instructions: 'Use the approved output.',
+        personality: null,
+        model: 'test-model',
+        modelConfig: { temperature: 0.2, maxTokens: 1000, topP: 1 },
+        capabilities: { webBrowser: false, codeInterpreter: false, knowledgeBase: false },
+        memoryConfig: { shortTerm: true, longTerm: false, knowledgeBase: false },
+      },
+      dependsOnOutputVersion: true,
+    }, 1, 'draft_agent');
+
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'Use senior executives as the audience.' }],
+    }, deps);
+
+    expect(result.event.type).toBe('agent_proposal');
+    expect(result.path).toEqual([
+      'load_intent',
+      'compile_draft_agent',
+      'validate_candidate',
+      'persist_proposal',
+      'finalize_turn',
+    ]);
+  });
+
+  it('stops after three clarification rounds without creating a proposal', async () => {
     const { deps, generator, createProposal } = dependencies({
       type: 'clarification',
       proposalKind: 'draft_agent',
       questions: [{ id: 'goal', question: 'What should it do?' }],
     }, 3);
 
-    const result = await orchestrateCopilotTurn(input, deps);
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content: 'Make it better.' }],
+    }, deps);
 
     expect(result.event).toEqual({
       type: 'message',
       content: 'I still do not have enough information to create a safe proposal.',
     });
-    expect(generator).not.toHaveBeenCalled();
+    expect(generator).toHaveBeenCalledTimes(1);
     expect(createProposal).not.toHaveBeenCalled();
   });
 
   it('passes only the bounded authoritative context to the generator', async () => {
-    const generator: CopilotTurnGenerator = vi.fn(async () => ({ type: 'message', content: 'Ready.' }));
-    const { deps } = dependencies({ type: 'message', content: 'unused' }, 1);
+    const generated = {
+      type: 'refinement_candidate' as const,
+      proposedContent: '# Improved result',
+      changeSummary: ['Clarified the conclusion'],
+    };
+    const generator: CopilotTurnGenerator = vi.fn(async () => generated);
+    const { deps } = dependencies(generated, 1);
     deps.generator = generator;
 
     await orchestrateCopilotTurn(input, deps);

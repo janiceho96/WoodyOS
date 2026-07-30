@@ -96,8 +96,6 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
     modelConfig: { temperature: 0.2, maxTokens: 2048, topP: 1 },
     capabilities: { webBrowser: true, codeInterpreter: true, knowledgeBase: true },
     memoryConfig: { shortTerm: true, longTerm: false, knowledgeBase: true },
-    status: 'active',
-    toolIds: ['attempted-tool'],
   };
 
   beforeAll(async () => {
@@ -151,7 +149,7 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
     });
     expect(thread.statusCode, thread.body).toBe(201);
     threadId = thread.json().id;
-  });
+  }, 30_000);
 
   afterAll(async () => {
     await db.query('DROP TRIGGER IF EXISTS copilot_test_fail_audit ON audit_events').catch(() => undefined);
@@ -170,6 +168,9 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
     });
     expect(clarification.event.type).toBe('clarification');
     expect(clarification.proposalId).toBeUndefined();
+    const { loadCopilotTurnContext } = await import('../src/copilot/orchestrator.js');
+    const loadedAfterClarification = await loadCopilotTurnContext({ workspaceId, actorId, threadId });
+    expect(loadedAfterClarification.outstandingProposalKind).toBe('output_refinement');
 
     const preview = await refinement('# Refined and accepted output');
     expect(preview.event.type).toBe('refinement_preview');

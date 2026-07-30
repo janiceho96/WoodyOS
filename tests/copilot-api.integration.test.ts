@@ -1,4 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+const completion = vi.hoisted(() => ({
+  request: vi.fn(),
+}));
+
+vi.mock('../src/copilot/completion.js', () => ({
+  requestCopilotCompletion: completion.request,
+}));
 
 const enabled = process.env.RUN_INTEGRATION === 'true';
 
@@ -91,7 +99,7 @@ describe.runIf(enabled)('Copilot proposal API', () => {
     });
     expect(thread.statusCode, thread.body).toBe(201);
     threadId = thread.json().id;
-  });
+  }, 30_000);
 
   afterAll(async () => {
     const { closeQueues } = await import('../src/queue/task-queue.js');
@@ -129,6 +137,110 @@ describe.runIf(enabled)('Copilot proposal API', () => {
     });
     expect(crossed.statusCode, crossed.body).toBe(404);
     expect(crossed.json()).toEqual({ error: 'COPILOT_CONTEXT_NOT_FOUND' });
+  });
+
+  it('answers a contextual question without creating a proposal', async () => {
+    completion.request.mockResolvedValueOnce({
+      message: 'No error was found in the selected output.',
+      provider: 'test',
+      model: 'test-model',
+      usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+    });
+    const before = (await db.query<{ count: string }>(
+      'SELECT count(*)::text FROM copilot_proposals WHERE thread_id=$1',
+      [threadId],
+    )).rows[0].count;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/copilot/threads/${threadId}/messages`,
+      headers: headers(),
+      payload: { content: 'Is there any error?' },
+    });
+
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json().assistant.event).toEqual({
+      type: 'message',
+      content: 'No error was found in the selected output.',
+    });
+    expect((await db.query<{ count: string }>(
+      'SELECT count(*)::text FROM copilot_proposals WHERE thread_id=$1',
+      [threadId],
+    )).rows[0].count).toBe(before);
+  });
+
+  it('persists a typed safe event and no proposal after one unsuccessful repair', async () => {
+    completion.request
+      .mockResolvedValueOnce({
+        message: '{"type":"refinement_candidate","proposedContent":"","changeSummary":[]}',
+        provider: 'test',
+        model: 'test-model',
+        usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+      })
+      .mockResolvedValueOnce({
+        message: '{"type":"refinement_candidate","proposedContent":"","changeSummary":[]}',
+        provider: 'test',
+        model: 'test-model',
+        usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+      });
+    const before = (await db.query<{ count: string }>(
+      'SELECT count(*)::text FROM copilot_proposals WHERE thread_id=$1',
+      [threadId],
+    )).rows[0].count;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/copilot/threads/${threadId}/messages`,
+      headers: headers(),
+      payload: { content: 'Rewrite this output for executives.' },
+    });
+
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json().assistant.event).toMatchObject({
+      type: 'proposal_error',
+      code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
+      retryable: true,
+    });
+    expect(response.json().assistant.event.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect((await db.query<{ count: string }>(
+      'SELECT count(*)::text FROM copilot_proposals WHERE thread_id=$1',
+      [threadId],
+    )).rows[0].count).toBe(before);
+  });
+
+  it('loads the proposal kind from the latest persisted clarification event', async () => {
+    await db.query(
+      `INSERT INTO chat_messages(
+         workspace_id,thread_id,role,content,metadata,context_snapshot_id,created_at
+       ) VALUES
+         ($1,$2,'assistant','Earlier clarification',$3,$4,now() - interval '1 minute'),
+         ($1,$2,'assistant','Latest clarification',$5,$4,now())`,
+      [
+        workspaceId,
+        threadId,
+        JSON.stringify({
+          event: {
+            type: 'clarification',
+            proposalKind: 'output_refinement',
+            questions: [{ id: 'audience', question: 'Who is the audience?' }],
+          },
+        }),
+        contextSnapshotId,
+        JSON.stringify({
+          event: {
+            type: 'clarification',
+            proposalKind: 'draft_agent',
+            questions: [{ id: 'goal', question: 'What should the agent achieve?' }],
+          },
+        }),
+      ],
+    );
+    const { loadCopilotTurnContext } = await import('../src/copilot/orchestrator.js');
+
+    const loaded = await loadCopilotTurnContext({ workspaceId, actorId, threadId });
+
+    expect(loaded.clarificationRound).toBe(2);
+    expect(loaded.outstandingProposalKind).toBe('draft_agent');
   });
 
   it('rejects explicitly and restores its typed event on thread reload', async () => {

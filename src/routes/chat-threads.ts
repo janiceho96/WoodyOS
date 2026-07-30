@@ -203,9 +203,14 @@ export async function chatThreadRoutes(app: FastifyInstance) {
     });
     request.log.info({
       requestId: request.id,
+      graphTraceId: orchestration?.traceId,
       threadId: thread.id,
       contextSnapshotId: orchestration?.contextSnapshotId,
       proposalId: orchestration?.proposalId,
+      path: orchestration?.path,
+      eventType: orchestration?.event.type,
+      repairAttempted: orchestration?.repairAttempted,
+      repairSucceeded: orchestration?.repairSucceeded,
     }, 'Copilot message persisted');
     return reply.code(201).send({
       user: { ...userMessage, attachments: attachmentIds },
