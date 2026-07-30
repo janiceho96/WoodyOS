@@ -132,7 +132,9 @@ function generatorModelAdapter(
   return {
     async classify(input) {
       classifiedTurn = await generate(input.messages);
-      return intentForGeneratedTurn(classifiedTurn);
+      return classifiedTurn.type === 'clarification'
+        ? classifiedTurn
+        : intentForGeneratedTurn(classifiedTurn);
     },
     async answer(input) {
       const turn = await next(input.messages);

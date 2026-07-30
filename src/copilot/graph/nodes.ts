@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { createOutputContentHash } from '../../outputs/types.js';
 import {
+  clarificationSchema,
   clarificationQuestionsSchema,
   draftAgentCandidateSchema,
   refinementCandidateSchema,
@@ -53,6 +54,26 @@ function proposalKindForIntent(intent: CopilotGraphState['intent']): CopilotProp
   if (intent === 'refine_output') return 'output_refinement';
   if (intent === 'create_draft_agent') return 'draft_agent';
   return undefined;
+}
+
+function injectedClarificationUpdate(
+  state: CopilotGraphState,
+  event: Extract<CopilotEvent, { type: 'clarification' }>,
+  path: string,
+): CopilotNodeUpdate {
+  if (state.loaded.clarificationRound >= 3) {
+    const content = 'I still do not have enough information to create a safe proposal.';
+    return {
+      event: { type: 'message', content },
+      path: [path],
+    };
+  }
+  return {
+    intent: 'clarify',
+    proposalKind: event.proposalKind,
+    event,
+    path: [path],
+  };
 }
 
 function boundedModelInput(state: CopilotGraphState): ModelTurnInput {
@@ -115,9 +136,12 @@ export function classifyIntentNode(
 ): CopilotNode {
   return async (state) => {
     try {
-      const intent = copilotIntentSchema.parse(
-        await model.classify(boundedModelInput(state)),
-      );
+      const classified = await model.classify(boundedModelInput(state));
+      const clarification = clarificationSchema.safeParse(classified);
+      if (clarification.success) {
+        return injectedClarificationUpdate(state, clarification.data, 'classify_intent');
+      }
+      const intent = copilotIntentSchema.parse(classified);
       const proposalKind = proposalKindForIntent(intent);
       return {
         intent,
@@ -192,6 +216,10 @@ export function compileRefinementNode(
         ...boundedModelInput(state),
         proposalKind: 'output_refinement',
       });
+      const clarification = clarificationSchema.safeParse(candidate);
+      if (clarification.success) {
+        return injectedClarificationUpdate(state, clarification.data, 'compile_refinement');
+      }
       return {
         proposalKind: 'output_refinement',
         candidate,
@@ -224,6 +252,10 @@ export function compileDraftAgentNode(
         ...boundedModelInput(state),
         proposalKind: 'draft_agent',
       });
+      const clarification = clarificationSchema.safeParse(candidate);
+      if (clarification.success) {
+        return injectedClarificationUpdate(state, clarification.data, 'compile_draft_agent');
+      }
       return {
         proposalKind: 'draft_agent',
         candidate,
@@ -319,56 +351,65 @@ export function persistProposalNode(
   createProposal: typeof createCopilotProposal,
 ): CopilotNode {
   return async (state) => {
-    if (state.proposalKind === 'output_refinement') {
-      const parsed = refinementCandidateSchema.safeParse(state.candidate);
+    try {
+      if (state.proposalKind === 'output_refinement') {
+        const parsed = refinementCandidateSchema.safeParse(state.candidate);
+        if (!parsed.success) {
+          return invalidCandidateUpdate(parsed.error);
+        }
+        const output = state.loaded.context.snapshot.output;
+        const proposal = await createProposal({
+          workspaceId: state.workspaceId,
+          actorId: state.actorId,
+          threadId: state.threadId,
+          contextSnapshotId: state.loaded.context.id,
+          kind: 'output_refinement',
+          candidate: {
+            documentId: output.documentId,
+            baseVersionId: output.versionId,
+            baseVersionNumber: output.versionNumber,
+            baseContentHash: output.contentHash,
+            proposedContent: parsed.data.proposedContent,
+            proposedContentHash: createOutputContentHash(parsed.data.proposedContent),
+            changeSummary: parsed.data.changeSummary,
+          },
+          dependsOnOutputVersion: true,
+        });
+        return {
+          proposalId: proposal.id,
+          event: { type: 'refinement_preview', proposal },
+          repairSucceeded: state.repairAttempted,
+          path: ['persist_proposal'],
+        };
+      }
+
+      const parsed = draftAgentCandidateSchema.safeParse(state.candidate);
       if (!parsed.success) {
         return invalidCandidateUpdate(parsed.error);
       }
-      const output = state.loaded.context.snapshot.output;
       const proposal = await createProposal({
         workspaceId: state.workspaceId,
         actorId: state.actorId,
         threadId: state.threadId,
         contextSnapshotId: state.loaded.context.id,
-        kind: 'output_refinement',
-        candidate: {
-          documentId: output.documentId,
-          baseVersionId: output.versionId,
-          baseVersionNumber: output.versionNumber,
-          baseContentHash: output.contentHash,
-          proposedContent: parsed.data.proposedContent,
-          proposedContentHash: createOutputContentHash(parsed.data.proposedContent),
-          changeSummary: parsed.data.changeSummary,
-        },
-        dependsOnOutputVersion: true,
+        kind: 'draft_agent',
+        candidate: parsed.data.candidate,
+        dependsOnOutputVersion: parsed.data.dependsOnOutputVersion,
       });
       return {
         proposalId: proposal.id,
-        event: { type: 'refinement_preview', proposal },
+        event: { type: 'agent_proposal', proposal },
         repairSucceeded: state.repairAttempted,
         path: ['persist_proposal'],
       };
+    } catch (error) {
+      if (!(error instanceof z.ZodError)) throw error;
+      return {
+        event: proposalError(state, 'COPILOT_PROPOSAL_SCHEMA_INVALID', schemaFailureMessage),
+        repairSucceeded: false,
+        path: ['persist_proposal'],
+      };
     }
-
-    const parsed = draftAgentCandidateSchema.safeParse(state.candidate);
-    if (!parsed.success) {
-      return invalidCandidateUpdate(parsed.error);
-    }
-    const proposal = await createProposal({
-      workspaceId: state.workspaceId,
-      actorId: state.actorId,
-      threadId: state.threadId,
-      contextSnapshotId: state.loaded.context.id,
-      kind: 'draft_agent',
-      candidate: parsed.data.candidate,
-      dependsOnOutputVersion: parsed.data.dependsOnOutputVersion,
-    });
-    return {
-      proposalId: proposal.id,
-      event: { type: 'agent_proposal', proposal },
-      repairSucceeded: state.repairAttempted,
-      path: ['persist_proposal'],
-    };
   };
 }
 

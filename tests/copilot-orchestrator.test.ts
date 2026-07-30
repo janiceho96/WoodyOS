@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import type { CopilotContextSnapshotRecord, CopilotGeneratedTurn } from '../src/copilot/types.js';
 import {
   orchestrateCopilotTurn,
@@ -97,8 +98,11 @@ describe('Copilot turn orchestration', () => {
   it('keeps clarification in the same thread without creating a proposal', async () => {
     const { deps, createProposal } = dependencies({
       type: 'clarification',
-      proposalKind: 'output_refinement',
-      questions: [{ id: 'audience', question: 'Who is the audience?' }],
+      proposalKind: 'draft_agent',
+      questions: [
+        { id: 'goal', question: 'What outcome should the Draft agent achieve?' },
+        { id: 'audience', question: 'Who should the Draft agent serve?' },
+      ],
     });
 
     const result = await orchestrateCopilotTurn({
@@ -108,8 +112,44 @@ describe('Copilot turn orchestration', () => {
 
     expect(result).toMatchObject({
       contextSnapshotId,
-      event: { type: 'clarification', proposalKind: 'output_refinement' },
+      content: 'What outcome should the Draft agent achieve?\nWho should the Draft agent serve?',
+      event: {
+        type: 'clarification',
+        proposalKind: 'draft_agent',
+        questions: [
+          { id: 'goal', question: 'What outcome should the Draft agent achieve?' },
+          { id: 'audience', question: 'Who should the Draft agent serve?' },
+        ],
+      },
     });
+    expect(createProposal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { content: 'Please improve this output.', proposalKind: 'output_refinement' as const },
+    { content: 'Create a new writing agent.', proposalKind: 'draft_agent' as const },
+  ])('preserves an exact injected $proposalKind clarification on a deterministic request', async ({
+    content,
+    proposalKind,
+  }) => {
+    const questions = [
+      { id: 'constraint', question: 'Which constraint should I preserve?' },
+      { id: 'tone', question: 'Which tone should I use?' },
+    ];
+    const { deps, createProposal } = dependencies({
+      type: 'clarification',
+      proposalKind,
+      questions,
+    });
+
+    const result = await orchestrateCopilotTurn({
+      ...input,
+      messages: [{ role: 'user', content }],
+    }, deps);
+
+    expect(result.event).toEqual({ type: 'clarification', proposalKind, questions });
+    expect(result.content).toBe('Which constraint should I preserve?\nWhich tone should I use?');
+    expect(result.proposalId).toBeUndefined();
     expect(createProposal).not.toHaveBeenCalled();
   });
 
@@ -190,9 +230,25 @@ describe('Copilot turn orchestration', () => {
   it('fails closed when a draft candidate cannot be normalized', async () => {
     const { deps, createProposal } = dependencies({
       type: 'draft_agent_candidate',
-      candidate: { name: 'Missing required fields' },
-      dependsOnOutputVersion: false,
+      candidate: {
+        name: 'Draft Writer',
+        role: 'Writer',
+        goal: 'Draft a useful response',
+        instructions: 'Use the approved output.',
+        personality: null,
+        model: 'test-model',
+        modelConfig: { temperature: 0.2, maxTokens: 1000, topP: 1 },
+        capabilities: { webBrowser: false, codeInterpreter: false, knowledgeBase: false },
+        memoryConfig: { shortTerm: true, longTerm: false, knowledgeBase: false },
+      },
+      dependsOnOutputVersion: true,
     });
+    createProposal.mockRejectedValueOnce(new z.ZodError([{
+      code: z.ZodIssueCode.custom,
+      path: ['candidate'],
+      message: 'private repository validation detail',
+    }]) as never);
+
     const result = await orchestrateCopilotTurn({
       ...input,
       messages: [{ role: 'user', content: 'Create a new writing agent.' }],
@@ -203,7 +259,20 @@ describe('Copilot turn orchestration', () => {
       code: 'COPILOT_PROPOSAL_SCHEMA_INVALID',
       retryable: true,
     });
-    expect(createProposal).not.toHaveBeenCalled();
+    expect(result.proposalId).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain('private repository validation detail');
+    expect(createProposal).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not hide unexpected proposal repository failures', async () => {
+    const { deps, createProposal } = dependencies({
+      type: 'refinement_candidate',
+      proposedContent: '# Improved result',
+      changeSummary: ['Clarified the conclusion'],
+    });
+    createProposal.mockRejectedValueOnce(new Error('repository unavailable') as never);
+
+    await expect(orchestrateCopilotTurn(input, deps)).rejects.toThrow('repository unavailable');
   });
 
   it('fails closed for unsupported operations', async () => {

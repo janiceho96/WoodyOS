@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { copilotIntentClassificationSchema } from '../contracts.js';
 import { requestCopilotCompletion, type CopilotCompletionMessage } from '../completion.js';
-import type { CopilotProposalKind } from '../types.js';
+import type { CopilotEvent, CopilotProposalKind } from '../types.js';
 import {
   safeValidationIssueSchema,
   type CopilotIntent,
@@ -44,7 +44,9 @@ export type ModelTurnInput = {
 };
 
 export type CopilotModelAdapter = {
-  classify(input: ModelTurnInput): Promise<CopilotIntent>;
+  classify(input: ModelTurnInput): Promise<
+    CopilotIntent | Extract<CopilotEvent, { type: 'clarification' }>
+  >;
   answer(input: ModelTurnInput): Promise<string>;
   generateProposal(input: ModelTurnInput & {
     proposalKind: CopilotProposalKind;
