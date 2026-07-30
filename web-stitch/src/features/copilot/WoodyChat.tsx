@@ -111,11 +111,17 @@ export function WoodyChat({ displayName }: { displayName: string }) {
         if (cancelled) return;
         setThreadId(thread.id);
         if (thread.messages?.length) {
-          const unmatchedUserIntents: RetryPayload[] = [];
+          const retryPayloadByUserId = new Map<string, RetryPayload>();
           const restoredMessages = thread.messages.map((message) => {
-            if (message.role === 'user') unmatchedUserIntents.push({ content: message.content, attachmentIds: [] });
+            if (message.role === 'user') {
+              retryPayloadByUserId.set(message.id, {
+                content: message.content,
+                attachmentIds: message.attachments?.map((attachment) => attachment.id) ?? [],
+              });
+            }
             if (message.role === 'assistant') {
-              const retryPayload = unmatchedUserIntents.shift();
+              const replyId = message.metadata?.inReplyToUserMessageId;
+              const retryPayload = replyId ? retryPayloadByUserId.get(replyId) : undefined;
               if (retryPayload) retryPayloadByAssistantIdRef.current.set(message.id, retryPayload);
             }
             return {
@@ -350,7 +356,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
         {contextView && <CopilotContextCard context={contextView} currentOutputVersionId={contextView.output.versionId}/>}
         {messages.map((message) => <article className={message.role} key={message.id}>
           {message.role === 'assistant' && <span className="woody-message-avatar"><Mascot expression="happy" size={34} floating={false} blink={false} decorative/></span>}
-          <div><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>{message.event && <CopilotEventCard event={message.event} applying={'proposal' in message.event && applyingProposalId === message.event.proposal.id} onApprove={(proposalId) => void approveProposal(proposalId)} onReject={(proposalId) => void rejectProposal(proposalId)} onRegenerate={() => void send('Generate a new proposal for the selected output context.')} onRetry={() => retryProposal(message.id)}/>} {message.attachments?.length ? <div className="woody-message-attachments">{message.attachments.map((file) => <AttachmentChip key={file.id} file={file}/>)}</div> : null}{message.citations?.length ? <div className="woody-message-citations"><strong>Sources used</strong>{message.citations.map((citation, index) => <span key={`${citation.fileId}-${citation.locator}-${index}`}>{citation.filename} · {citation.locator}</span>)}</div> : null}</div>
+          <div><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>{message.event && <CopilotEventCard event={message.event} applying={'proposal' in message.event && applyingProposalId === message.event.proposal.id} onApprove={(proposalId) => void approveProposal(proposalId)} onReject={(proposalId) => void rejectProposal(proposalId)} onRegenerate={() => void send('Generate a new proposal for the selected output context.')} onRetry={retryPayloadByAssistantIdRef.current.has(message.id) ? () => retryProposal(message.id) : undefined}/>} {message.attachments?.length ? <div className="woody-message-attachments">{message.attachments.map((file) => <AttachmentChip key={file.id} file={file}/>)}</div> : null}{message.citations?.length ? <div className="woody-message-citations"><strong>Sources used</strong>{message.citations.map((citation, index) => <span key={`${citation.fileId}-${citation.locator}-${index}`}>{citation.filename} · {citation.locator}</span>)}</div> : null}</div>
         </article>)}
         {messages.length === 1 && <div className="woody-chat-suggestions">{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => void send(suggestion)}>{suggestion}</button>)}</div>}
         {pending && <div className="woody-typing"><LoaderCircle className="spin" size={14}/><span>Woody is thinking carefully…</span></div>}

@@ -33,6 +33,7 @@ export type CopilotGraphInput = {
   actorId: string;
   threadId: string;
   messages: WoodyChatMessage[];
+  attachmentContext?: string;
   loaded: LoadedCopilotTurn;
   traceId: string;
 };

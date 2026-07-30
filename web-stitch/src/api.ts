@@ -461,6 +461,7 @@ export type ChatThreadMessage = {
   metadata?: {
     citations?: Array<{ fileId: string; filename: string; locator: string; score: number }>;
     event?: CopilotEvent;
+    inReplyToUserMessageId?: string;
   };
   event?: CopilotEvent;
   created_at: string;

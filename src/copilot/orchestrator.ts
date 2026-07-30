@@ -63,12 +63,16 @@ export async function loadCopilotTurnContext(input: {
                 AND message.workspace_id=snapshot.workspace_id
                 AND message.context_snapshot_id=snapshot.id
                 AND message.metadata->'event'->>'type'='clarification') clarification_round,
-            (SELECT message.metadata->'event'->>'proposalKind'
+            (SELECT CASE
+                      WHEN message.metadata->'event'->>'type'='clarification'
+                        THEN message.metadata->'event'->>'proposalKind'
+                      ELSE NULL
+                    END
                FROM chat_messages message
               WHERE message.thread_id=snapshot.thread_id
                 AND message.workspace_id=snapshot.workspace_id
                 AND message.context_snapshot_id=snapshot.id
-                AND message.metadata->'event'->>'type'='clarification'
+                AND message.role='assistant'
               ORDER BY message.created_at DESC,message.id DESC
               LIMIT 1) outstanding_proposal_kind
        FROM copilot_context_snapshots snapshot
@@ -162,6 +166,7 @@ export async function orchestrateCopilotTurn(
     actorId: string;
     threadId: string;
     messages: WoodyChatMessage[];
+    attachmentContext?: string;
     generator?: CopilotTurnGenerator;
   },
   dependencies: CopilotOrchestratorDependencies = defaultDependencies,
@@ -176,6 +181,7 @@ export async function orchestrateCopilotTurn(
     actorId: input.actorId,
     threadId: input.threadId,
     messages: input.messages,
+    ...(input.attachmentContext ? { attachmentContext: input.attachmentContext } : {}),
     loaded,
     traceId: randomUUID(),
   }, {

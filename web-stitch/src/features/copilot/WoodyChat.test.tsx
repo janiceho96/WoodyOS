@@ -246,7 +246,7 @@ describe('Woody contextual conversation state', () => {
         role: 'assistant',
         content: event.message,
         event,
-        metadata: { event },
+        metadata: { event, inReplyToUserMessageId: 'failed-user-message' },
         created_at: '2026-07-29T10:00:01.000Z',
       },
     ]));
@@ -316,7 +316,7 @@ describe('Woody contextual conversation state', () => {
     vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
     vi.mocked(api.chatThread).mockResolvedValue(thread([
       { id: 'failed-user-message', role: 'user', content: 'Retry this request.', created_at: '2026-07-29T10:00:00.000Z' },
-      { id: 'failed-assistant-message', role: 'assistant', content: event.message, event, metadata: { event }, created_at: '2026-07-29T10:00:01.000Z' },
+      { id: 'failed-assistant-message', role: 'assistant', content: event.message, event, metadata: { event, inReplyToUserMessageId: 'failed-user-message' }, created_at: '2026-07-29T10:00:01.000Z' },
     ]));
     vi.spyOn(api, 'files').mockResolvedValue({ data: [] });
     vi.spyOn(api, 'uploadFile').mockResolvedValue(pendingAttachment);
@@ -337,29 +337,61 @@ describe('Woody contextual conversation state', () => {
     await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'Retry this request.', []));
   });
 
-  it('pairs interleaved restored proposal failures with user intents in FIFO order', async () => {
+  it('retries out-of-order restored failures by exact reply ID with original attachments', async () => {
     const firstEvent = proposalError('trace-first');
     const secondEvent = proposalError('trace-second');
+    const firstAttachment = fileAsset('0c1dd5af-1ddf-4eb0-a418-570944739f3f', 'first.txt');
+    const secondAttachment = fileAsset('eace4745-a965-4e56-81d5-dd1d08c2e09f', 'second.txt');
     vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
     vi.mocked(api.chatThread).mockResolvedValue(thread([
-      { id: 'first-user-message', role: 'user', content: 'First request.', created_at: '2026-07-29T10:00:00.000Z' },
-      { id: 'second-user-message', role: 'user', content: 'Second request.', created_at: '2026-07-29T10:00:01.000Z' },
-      { id: 'first-assistant-message', role: 'assistant', content: firstEvent.message, event: firstEvent, metadata: { event: firstEvent }, created_at: '2026-07-29T10:00:02.000Z' },
-      { id: 'second-assistant-message', role: 'assistant', content: secondEvent.message, event: secondEvent, metadata: { event: secondEvent }, created_at: '2026-07-29T10:00:03.000Z' },
+      { id: 'first-user-message', role: 'user', content: 'First request.', attachments: [firstAttachment], created_at: '2026-07-29T10:00:00.000Z' },
+      { id: 'second-user-message', role: 'user', content: 'Second request.', attachments: [secondAttachment], created_at: '2026-07-29T10:00:01.000Z' },
+      { id: 'second-assistant-message', role: 'assistant', content: secondEvent.message, event: secondEvent, metadata: { event: secondEvent, inReplyToUserMessageId: 'second-user-message' }, created_at: '2026-07-29T10:00:02.000Z' },
+      { id: 'first-assistant-message', role: 'assistant', content: firstEvent.message, event: firstEvent, metadata: { event: firstEvent, inReplyToUserMessageId: 'first-user-message' }, created_at: '2026-07-29T10:00:03.000Z' },
     ]));
-    vi.spyOn(api, 'sendChatThreadMessage').mockResolvedValue({
-      user: { id: 'retry-user-message', role: 'user', content: 'Retry response.', created_at: '2026-07-29T10:00:04.000Z' },
-      assistant: { id: 'retry-assistant-message', role: 'assistant', content: 'Here is a safe proposal.', created_at: '2026-07-29T10:00:05.000Z' },
-      citations: [],
-    });
+    vi.spyOn(api, 'sendChatThreadMessage')
+      .mockResolvedValueOnce({
+        user: { id: 'retry-user-message-1', role: 'user', content: 'Retry response.', created_at: '2026-07-29T10:00:04.000Z' },
+        assistant: { id: 'retry-assistant-message-1', role: 'assistant', content: 'Here is a safe proposal.', created_at: '2026-07-29T10:00:05.000Z' },
+        citations: [],
+      })
+      .mockResolvedValueOnce({
+        user: { id: 'retry-user-message-2', role: 'user', content: 'Retry response.', created_at: '2026-07-29T10:00:06.000Z' },
+        assistant: { id: 'retry-assistant-message-2', role: 'assistant', content: 'Here is another safe proposal.', created_at: '2026-07-29T10:00:07.000Z' },
+        citations: [],
+      });
     wrapper(<WoodyChat displayName="Test User"/>);
     fireEvent.click(screen.getByRole('button', { name: 'Chat with Woody' }));
 
     const retries = await screen.findAllByRole('button', { name: 'Try again' });
     fireEvent.click(retries[0]);
-    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(threadId, 'First request.', []));
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenCalledWith(
+      threadId,
+      'Second request.',
+      [secondAttachment.id],
+    ));
     fireEvent.click(retries[1]);
-    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenNthCalledWith(2, threadId, 'Second request.', []));
+    await waitFor(() => expect(api.sendChatThreadMessage).toHaveBeenNthCalledWith(
+      2,
+      threadId,
+      'First request.',
+      [firstAttachment.id],
+    ));
+  });
+
+  it('omits retry for legacy history without unambiguous reply correlation', async () => {
+    const event = proposalError('trace-legacy');
+    vi.mocked(api.chatThreads).mockResolvedValue({ data: [thread()] });
+    vi.mocked(api.chatThread).mockResolvedValue(thread([
+      { id: 'legacy-user-one', role: 'user', content: 'First legacy request.', created_at: '2026-07-29T10:00:00.000Z' },
+      { id: 'legacy-user-two', role: 'user', content: 'Second legacy request.', created_at: '2026-07-29T10:00:01.000Z' },
+      { id: 'legacy-assistant', role: 'assistant', content: event.message, event, metadata: { event }, created_at: '2026-07-29T10:00:02.000Z' },
+    ]));
+    wrapper(<WoodyChat displayName="Test User"/>);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat with Woody' }));
+
+    expect(await screen.findByText('Request ID: trace-legacy')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
   });
 
   it('prevents overlapping sends before pending state rerenders', async () => {

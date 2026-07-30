@@ -18,6 +18,7 @@ describe.runIf(enabled)('Copilot proposal API', () => {
   let token = '';
   let otherToken = '';
   let workspaceId = '';
+  let otherWorkspaceId = '';
   let actorId = '';
   let agentId = '';
   let taskId = '';
@@ -54,6 +55,7 @@ describe.runIf(enabled)('Copilot proposal API', () => {
     actorId = owner.user.id;
     const outsider = await register('outsider');
     otherToken = outsider.accessToken;
+    otherWorkspaceId = outsider.workspace.id;
 
     const agent = await app.inject({
       method: 'POST',
@@ -169,6 +171,55 @@ describe.runIf(enabled)('Copilot proposal API', () => {
     )).rows[0].count).toBe(before);
   });
 
+  it('persists exact reply correlation and historical user attachment IDs', async () => {
+    const fileId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO files(
+         id,workspace_id,uploaded_by,original_name,extension,mime_type,size_bytes,sha256,
+         storage_key,status,scan_status,scope,retention_policy,version_group_id,completed_at
+       ) VALUES($1,$2,$3,'reply-context.txt','txt','text/plain',12,$4,$5,'ready','clean',
+                'conversation','delete_after_conversation',$1,now())`,
+      [
+        fileId,
+        workspaceId,
+        actorId,
+        crypto.randomUUID().replaceAll('-', '').repeat(2),
+        `integration/${fileId}.txt`,
+      ],
+    );
+    completion.request.mockResolvedValueOnce({
+      message: 'The attachment is available for this answer.',
+      provider: 'test',
+      model: 'test-model',
+      usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/copilot/threads/${threadId}/messages`,
+      headers: headers(),
+      payload: {
+        content: 'What does the attached context contain?',
+        attachmentIds: [fileId],
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(201);
+    const sent = response.json();
+    expect(sent.assistant.metadata.inReplyToUserMessageId).toBe(sent.user.id);
+
+    const reloaded = await app.inject({
+      method: 'GET',
+      url: `/v1/copilot/threads/${threadId}`,
+      headers: headers(),
+    });
+    expect(reloaded.statusCode, reloaded.body).toBe(200);
+    const user = reloaded.json().messages.find((message: { id: string }) => message.id === sent.user.id);
+    const assistant = reloaded.json().messages.find((message: { id: string }) => message.id === sent.assistant.id);
+    expect(user.attachments.map((attachment: { id: string }) => attachment.id)).toEqual([fileId]);
+    expect(assistant.metadata.inReplyToUserMessageId).toBe(user.id);
+  });
+
   it('persists a typed safe event and no proposal after one unsuccessful repair', async () => {
     completion.request
       .mockResolvedValueOnce({
@@ -209,12 +260,31 @@ describe.runIf(enabled)('Copilot proposal API', () => {
   });
 
   it('loads the proposal kind from the latest persisted clarification event', async () => {
+    const decoyThreadId = (await db.query<{ id: string }>(
+      `INSERT INTO chat_threads(workspace_id,created_by,title)
+       VALUES($1,$2,'Clarification decoy') RETURNING id`,
+      [workspaceId, actorId],
+    )).rows[0].id;
+    const decoyContextId = (await db.query<{ id: string }>(
+      `INSERT INTO copilot_context_snapshots(
+         workspace_id,thread_id,actor_id,schema_version,workflow_id,workflow_run_id,task_id,
+         output_document_id,output_version_id,snapshot,captured_at,created_at
+       )
+       SELECT workspace_id,thread_id,actor_id,schema_version,workflow_id,workflow_run_id,task_id,
+              output_document_id,output_version_id,snapshot,captured_at - interval '1 day',created_at
+         FROM copilot_context_snapshots WHERE id=$1
+       RETURNING id`,
+      [contextSnapshotId],
+    )).rows[0].id;
     await db.query(
       `INSERT INTO chat_messages(
          workspace_id,thread_id,role,content,metadata,context_snapshot_id,created_at
        ) VALUES
          ($1,$2,'assistant','Earlier clarification',$3,$4,now() - interval '1 minute'),
-         ($1,$2,'assistant','Latest clarification',$5,$4,now())`,
+         ($1,$2,'assistant','Latest clarification',$5,$4,now()),
+         ($1,$6,'assistant','Cross-thread decoy',$3,$4,now() + interval '1 minute'),
+         ($7,$2,'assistant','Cross-workspace decoy',$3,$4,now() + interval '2 minutes'),
+         ($1,$2,'assistant','Cross-context decoy',$3,$8,now() + interval '3 minutes')`,
       [
         workspaceId,
         threadId,
@@ -233,6 +303,9 @@ describe.runIf(enabled)('Copilot proposal API', () => {
             questions: [{ id: 'goal', question: 'What should the agent achieve?' }],
           },
         }),
+        decoyThreadId,
+        otherWorkspaceId,
+        decoyContextId,
       ],
     );
     const { loadCopilotTurnContext } = await import('../src/copilot/orchestrator.js');
@@ -241,6 +314,58 @@ describe.runIf(enabled)('Copilot proposal API', () => {
 
     expect(loaded.clarificationRound).toBe(2);
     expect(loaded.outstandingProposalKind).toBe('draft_agent');
+    await db.query(
+      `DELETE FROM chat_messages
+        WHERE content IN ('Cross-thread decoy','Cross-workspace decoy','Cross-context decoy')`,
+    );
+  });
+
+  it('keeps an unanswered clarification on equivalent context reattachment', async () => {
+    const reattached = await app.inject({
+      method: 'POST',
+      url: `/v1/copilot/threads/${threadId}/context`,
+      headers: headers(),
+      payload: { taskId, outputDocumentId: documentId },
+    });
+    expect(reattached.statusCode, reattached.body).toBe(201);
+    expect(reattached.json().id).toBe(contextSnapshotId);
+    const { loadCopilotTurnContext } = await import('../src/copilot/orchestrator.js');
+
+    const loaded = await loadCopilotTurnContext({ workspaceId, actorId, threadId });
+
+    expect(loaded.context.id).toBe(contextSnapshotId);
+    expect(loaded.outstandingProposalKind).toBe('draft_agent');
+  });
+
+  it('clears a pending clarification when a later proposal resolves the assistant state', async () => {
+    await db.query(
+      `INSERT INTO chat_messages(
+         workspace_id,thread_id,role,content,metadata,context_snapshot_id,created_at
+       ) VALUES($1,$2,'assistant','Review the proposal',$3,$4,now() + interval '4 minutes')`,
+      [
+        workspaceId,
+        threadId,
+        JSON.stringify({
+          event: {
+            type: 'refinement_preview',
+            proposal: { id: crypto.randomUUID() },
+          },
+        }),
+        contextSnapshotId,
+      ],
+    );
+    const { loadCopilotTurnContext } = await import('../src/copilot/orchestrator.js');
+
+    const loaded = await loadCopilotTurnContext({ workspaceId, actorId, threadId });
+
+    expect(loaded.clarificationRound).toBe(2);
+    expect(loaded.outstandingProposalKind).toBeNull();
+    await db.query(
+      `DELETE FROM chat_messages
+        WHERE thread_id=$1 AND workspace_id=$2 AND content='Review the proposal'
+          AND context_snapshot_id=$3`,
+      [threadId, workspaceId, contextSnapshotId],
+    );
   });
 
   it('rejects explicitly and restores its typed event on thread reload', async () => {

@@ -76,7 +76,10 @@ function injectedClarificationUpdate(
   };
 }
 
-function boundedModelInput(state: CopilotGraphState): ModelTurnInput {
+function boundedModelInput(
+  state: CopilotGraphState,
+  includeAttachments = false,
+): ModelTurnInput {
   const snapshot = state.loaded.context.snapshot;
   return {
     workspaceId: state.workspaceId,
@@ -90,6 +93,9 @@ function boundedModelInput(state: CopilotGraphState): ModelTurnInput {
       clarificationRound: state.loaded.clarificationRound,
     },
     outputContent: state.loaded.outputContent,
+    ...(includeAttachments && state.attachmentContext
+      ? { attachmentContext: state.attachmentContext }
+      : {}),
   };
 }
 
@@ -166,7 +172,7 @@ export function answerQuestionNode(
 ): CopilotNode {
   return async (state) => {
     try {
-      const content = await model.answer(boundedModelInput(state));
+      const content = await model.answer(boundedModelInput(state, true));
       return {
         answer: content,
         event: { type: 'message', content },
@@ -213,7 +219,7 @@ export function compileRefinementNode(
   return async (state) => {
     try {
       const candidate = await model.generateProposal({
-        ...boundedModelInput(state),
+        ...boundedModelInput(state, true),
         proposalKind: 'output_refinement',
       });
       const clarification = clarificationSchema.safeParse(candidate);
@@ -249,7 +255,7 @@ export function compileDraftAgentNode(
   return async (state) => {
     try {
       const candidate = await model.generateProposal({
-        ...boundedModelInput(state),
+        ...boundedModelInput(state, true),
         proposalKind: 'draft_agent',
       });
       const clarification = clarificationSchema.safeParse(candidate);

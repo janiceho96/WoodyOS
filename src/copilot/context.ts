@@ -83,6 +83,45 @@ export async function resolveCopilotContext(
   )).rows[0];
   if (!row) throw contextError();
 
+  const current = (await runner.query<{
+    id: string;
+    snapshot: CopilotContextSnapshot;
+    captured_at: Date | string;
+  }>(
+    `SELECT id,snapshot,captured_at
+       FROM copilot_context_snapshots
+      WHERE id=(
+        SELECT id
+          FROM copilot_context_snapshots
+         WHERE thread_id=$1 AND workspace_id=$2 AND actor_id=$3
+         ORDER BY captured_at DESC,id DESC LIMIT 1
+      )
+        AND workflow_id IS NOT DISTINCT FROM $4
+        AND workflow_run_id IS NOT DISTINCT FROM $5
+        AND task_id=$6
+        AND output_document_id=$7
+        AND output_version_id=$8`,
+    [
+      input.threadId,
+      input.workspaceId,
+      input.actorId,
+      row.workflow_id,
+      row.workflow_run_id,
+      row.task_id,
+      row.output_document_id,
+      row.output_version_id,
+    ],
+  )).rows[0];
+  if (current) {
+    const capturedAt = iso(current.captured_at);
+    return {
+      id: current.id,
+      threadId: input.threadId,
+      snapshot: { ...current.snapshot, capturedAt },
+      createdAt: capturedAt,
+    };
+  }
+
   const capturedAt = new Date().toISOString();
   const snapshot: CopilotContextSnapshot = {
     schemaVersion: 1,

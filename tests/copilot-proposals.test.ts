@@ -62,6 +62,7 @@ describe('Copilot proposal services', () => {
           workflow_version_id: null,
         }],
       },
+      { rows: [] },
       { rows: [{ id: contextSnapshotId, captured_at: now }] },
     ]);
 

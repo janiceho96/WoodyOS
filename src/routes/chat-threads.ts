@@ -139,6 +139,7 @@ export async function chatThreadRoutes(app: FastifyInstance) {
     } finally {
       client.release();
     }
+    const userMessageId = String(userMessage.id);
 
     const history = await query<{ role: 'user' | 'assistant'; content: string }>(
       `SELECT role,content FROM chat_messages WHERE thread_id=$1 AND workspace_id=$2
@@ -153,20 +154,13 @@ export async function chatThreadRoutes(app: FastifyInstance) {
         ORDER BY captured_at DESC,id DESC LIMIT 1`,
       [thread.id, request.user.workspaceId, request.user.sub],
     )).rows[0];
-    const contextualMessages = attachmentContext.text
-      ? messages.map((message, index) => index === messages.length - 1
-        ? {
-          ...message,
-          content: `${message.content}\n\n<untrusted_attachment_extracts>\n${attachmentContext.text}\n</untrusted_attachment_extracts>`,
-        }
-        : message)
-      : messages;
     const orchestration = activeContext
       ? await orchestrateCopilotTurn({
         workspaceId: request.user.workspaceId,
         actorId: request.user.sub,
         threadId: thread.id,
-        messages: contextualMessages,
+        messages,
+        attachmentContext: attachmentContext.text,
       })
       : null;
     const answer = orchestration
@@ -179,6 +173,7 @@ export async function chatThreadRoutes(app: FastifyInstance) {
       : await answerWoody(request.user.workspaceId, messages, attachmentContext.text);
     const metadata = {
       citations: attachmentContext.citations.map(({ content: _content, ...citation }) => citation),
+      inReplyToUserMessageId: userMessageId,
       ...(orchestration ? { event: orchestration.event } : {}),
     };
     const assistant = (await query(

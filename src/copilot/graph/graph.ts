@@ -4,6 +4,9 @@ import {
   START,
   StateGraph,
 } from '@langchain/langgraph';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
+import { traceable } from 'langsmith/traceable';
 import type { WoodyChatMessage } from '../../routes/copilot.js';
 import type {
   CopilotEvent,
@@ -37,6 +40,7 @@ const CopilotState = Annotation.Root({
   actorId: Annotation<string>,
   threadId: Annotation<string>,
   messages: Annotation<WoodyChatMessage[]>,
+  attachmentContext: Annotation<string | undefined>,
   loaded: Annotation<LoadedCopilotTurn>,
   traceId: Annotation<string>,
   intent: Annotation<CopilotIntent | undefined>,
@@ -68,6 +72,28 @@ const CopilotState = Annotation.Root({
 });
 
 type GraphState = typeof CopilotState.State;
+
+class LangSmithTracingDisabledHandler extends BaseCallbackHandler {
+  name = 'langchain_tracer';
+
+  constructor() {
+    super({
+      ignoreLLM: true,
+      ignoreChain: true,
+      ignoreAgent: true,
+      ignoreRetriever: true,
+      ignoreCustomEvent: true,
+    });
+  }
+
+  copyWithTracingConfig() {
+    return this;
+  }
+
+  getRunTreeWithTracingConfig() {
+    return undefined;
+  }
+}
 
 function routeIntent(state: GraphState) {
   if (state.event) return 'finalize_turn';
@@ -148,6 +174,18 @@ export function createCopilotGraph(dependencies: CopilotGraphDependencies) {
     .compile();
 }
 
+const invokeCopilotGraphWithoutTracing = traceable(
+  async (input: CopilotGraphInput, dependencies: CopilotGraphDependencies) => {
+    const callbacks = new CallbackManager();
+    callbacks.addHandler(new LangSmithTracingDisabledHandler(), true);
+    return createCopilotGraph(dependencies).invoke(input, { callbacks });
+  },
+  {
+    name: 'CopilotGraphLocal',
+    tracingEnabled: false,
+  },
+);
+
 export async function runCopilotGraph(
   input: CopilotGraphInput,
   dependencies: CopilotGraphDependencies,
@@ -157,7 +195,7 @@ export async function runCopilotGraph(
     || input.loaded.context.snapshot.actorId !== input.actorId) {
     throw Object.assign(new Error('COPILOT_CONTEXT_NOT_FOUND'), { statusCode: 404 });
   }
-  const state = await createCopilotGraph(dependencies).invoke(input);
+  const state = await invokeCopilotGraphWithoutTracing(input, dependencies);
   if (!state.event) throw new Error('COPILOT_GRAPH_EVENT_MISSING');
   return {
     content: contentForEvent(state.event),
