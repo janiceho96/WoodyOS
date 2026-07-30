@@ -16,6 +16,38 @@ describe('Copilot graph model adapter', () => {
       .resolves.toBe('answer_question');
   });
 
+  it('states the closed intent and complete Draft-agent contracts in provider prompts', async () => {
+    const complete = vi.fn(async () => ({
+      message: '{"intent":"answer_question"}',
+      provider: 'test',
+      model: 'test',
+      usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+    }));
+    const adapter = createCopilotModelAdapter(complete as never);
+
+    await adapter.classify({ workspaceId: 'workspace', messages: [] });
+    await adapter.generateProposal({ workspaceId: 'workspace', messages: [], proposalKind: 'draft_agent' });
+    await adapter.repairProposal({
+      workspaceId: 'workspace',
+      proposalKind: 'draft_agent',
+      candidate: {},
+      issues: [],
+    });
+
+    const classificationPrompt = complete.mock.calls[0]?.[0]?.system ?? '';
+    for (const intent of ['answer_question', 'refine_output', 'create_draft_agent', 'clarify', 'unsupported']) {
+      expect(classificationPrompt).toContain(intent);
+    }
+    for (const prompt of [complete.mock.calls[1]?.[0]?.system ?? '', complete.mock.calls[2]?.[0]?.system ?? '']) {
+      expect(prompt).toContain('draft_agent_candidate');
+      expect(prompt).toContain('"name":"string (2-120)"');
+      expect(prompt).toContain('"modelConfig"');
+      expect(prompt).toContain('"capabilities"');
+      expect(prompt).toContain('"memoryConfig"');
+      expect(prompt).not.toContain('"candidate":{}');
+    }
+  });
+
   it('returns only safe validation paths and codes', () => {
     const parsed = z.object({ goal: z.string().min(2) }).safeParse({ goal: '' });
     if (parsed.success) throw new Error('expected invalid fixture');

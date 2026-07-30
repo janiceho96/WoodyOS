@@ -8,10 +8,30 @@ import {
   type SafeValidationIssue,
 } from './state.js';
 
-const CLASSIFY_SYSTEM = 'Classify the user request. Respond only with a JSON object containing one supported intent.';
+const CLASSIFY_SYSTEM = 'Classify the user request. Respond only with JSON: {"intent":"answer_question"|"refine_output"|"create_draft_agent"|"clarify"|"unsupported"}.';
 const ANSWER_SYSTEM = 'Answer the user concisely using the supplied context. Return plain text; do not propose or claim changes.';
 const GENERATE_SYSTEM = 'Generate one schema-shaped proposal candidate. Respond only with a JSON object.';
 const REPAIR_SYSTEM = 'Repair the supplied proposal candidate using the safe validation diagnostics. Respond only with a JSON object.';
+
+const draftAgentSchemaHint = {
+  type: 'draft_agent_candidate',
+  candidate: {
+    name: 'string (2-120)',
+    role: 'string (2-240)',
+    goal: 'string (2-5000)',
+    instructions: 'string (max 20000)',
+    personality: 'string|null (max 80)',
+    model: 'string (2-160)',
+    modelConfig: {
+      temperature: 'number (0-2)',
+      maxTokens: 'integer (128-128000)',
+      topP: 'number (0-1)',
+    },
+    capabilities: { webBrowser: 'boolean', codeInterpreter: 'boolean', knowledgeBase: 'boolean' },
+    memoryConfig: { shortTerm: 'boolean', longTerm: 'boolean', knowledgeBase: 'boolean' },
+  },
+  dependsOnOutputVersion: 'boolean',
+};
 
 type CopilotCompletion = typeof requestCopilotCompletion;
 
@@ -57,11 +77,7 @@ function proposalSchemaHint(proposalKind: CopilotProposalKind): string {
       proposedContent: 'string',
       changeSummary: ['string'],
     }
-    : {
-      type: 'draft_agent_candidate',
-      candidate: {},
-      dependsOnOutputVersion: false,
-    });
+    : draftAgentSchemaHint);
 }
 
 export function parseJsonObject(response: string): Record<string, unknown> {

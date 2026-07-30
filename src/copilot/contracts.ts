@@ -85,7 +85,17 @@ const draftAgentNormalizationCandidateSchema = z.object({
 
 export const draftAgentCandidateSchema = z.object({
   type: z.literal('draft_agent_candidate'),
-  candidate: z.record(z.unknown()),
+  candidate: z.object({
+    name: z.string().trim().min(2).max(120),
+    role: z.string().trim().min(2).max(240),
+    goal: z.string().trim().min(2).max(5_000),
+    instructions: z.string().max(20_000),
+    personality: z.string().max(80).nullable(),
+    model: z.string().trim().min(2).max(160),
+    modelConfig: modelConfigSchema,
+    capabilities: candidateCapabilitiesSchema,
+    memoryConfig: memoryConfigSchema,
+  }).strict(),
   dependsOnOutputVersion: z.boolean(),
 }).strict();
 

@@ -28,6 +28,22 @@ const draftCandidate = {
   toolIds: ['0c46a071-6933-4de1-a602-e5310982a947'],
 };
 
+const modelDraftAgentCandidate = {
+  type: 'draft_agent_candidate' as const,
+  candidate: {
+    name: draftCandidate.name,
+    role: draftCandidate.role,
+    goal: draftCandidate.goal,
+    instructions: draftCandidate.instructions,
+    personality: draftCandidate.personality,
+    model: draftCandidate.model,
+    modelConfig: draftCandidate.modelConfig,
+    capabilities: draftCandidate.capabilities,
+    memoryConfig: draftCandidate.memoryConfig,
+  },
+  dependsOnOutputVersion: false,
+};
+
 describe('Copilot contracts', () => {
   it('forces every generated agent into the safe Draft boundary', () => {
     expect(normalizeDraftAgentPayload(draftCandidate)).toEqual({
@@ -110,11 +126,24 @@ describe('Copilot contracts', () => {
       questions: [{ id: 'goal', question: 'What should this agent do?' }],
       outputContent: 'application-owned context',
     }).success).toBe(false);
+    expect(draftAgentCandidateSchema.safeParse(modelDraftAgentCandidate).success).toBe(true);
     expect(draftAgentCandidateSchema.safeParse({
-      type: 'draft_agent_candidate',
-      candidate: { name: 'Researcher' },
-      dependsOnOutputVersion: false,
-      status: 'draft',
+      ...modelDraftAgentCandidate,
+      candidate: { ...modelDraftAgentCandidate.candidate, status: 'draft' },
+    }).success).toBe(false);
+    expect(draftAgentCandidateSchema.safeParse({
+      ...modelDraftAgentCandidate,
+      candidate: {
+        ...modelDraftAgentCandidate.candidate,
+        modelConfig: { ...modelDraftAgentCandidate.candidate.modelConfig, providerSecret: 'application-owned' },
+      },
+    }).success).toBe(false);
+    expect(draftAgentCandidateSchema.safeParse({
+      ...modelDraftAgentCandidate,
+      candidate: {
+        ...modelDraftAgentCandidate.candidate,
+        capabilities: { ...modelDraftAgentCandidate.candidate.capabilities, toolIds: [] },
+      },
     }).success).toBe(false);
     expect(normalMessageSchema.safeParse({
       type: 'message',
