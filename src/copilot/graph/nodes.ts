@@ -17,9 +17,10 @@ import {
   type CopilotModelAdapter,
   type ModelTurnInput,
 } from './model.js';
-import type {
-  CopilotGraphState,
-  SafeValidationIssue,
+import {
+  copilotIntentSchema,
+  type CopilotGraphState,
+  type SafeValidationIssue,
 } from './state.js';
 
 export type CopilotGraphDependencies = {
@@ -114,7 +115,9 @@ export function classifyIntentNode(
 ): CopilotNode {
   return async (state) => {
     try {
-      const intent = await model.classify(boundedModelInput(state));
+      const intent = copilotIntentSchema.parse(
+        await model.classify(boundedModelInput(state)),
+      );
       const proposalKind = proposalKindForIntent(intent);
       return {
         intent,

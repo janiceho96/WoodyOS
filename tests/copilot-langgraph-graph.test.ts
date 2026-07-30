@@ -444,6 +444,26 @@ describe('Copilot LangGraph orchestration', () => {
     expect(result.path).not.toContain('private provider failure');
   });
 
+  it('terminates safely after one malformed intent classification', async () => {
+    const deps = fakeDependencies();
+    deps.model.classify.mockResolvedValue(undefined as never);
+
+    const result = await runCopilotGraph(ambiguousInput, deps);
+
+    expect(result.event).toEqual({
+      type: 'proposal_error',
+      code: 'COPILOT_INTENT_CLASSIFICATION_FAILED',
+      message: 'I could not determine how to handle this request. Please try again.',
+      requestId: ambiguousInput.traceId,
+      retryable: true,
+    });
+    expect(deps.model.classify).toHaveBeenCalledTimes(1);
+    expect(providerCallCount(deps)).toBe(1);
+    expect(deps.model.generateProposal).not.toHaveBeenCalled();
+    expect(deps.createProposal).not.toHaveBeenCalled();
+    expect(result.path).toEqual(['load_intent', 'classify_intent', 'finalize_turn']);
+  });
+
   it('resumes the persisted Draft-agent proposal kind after clarification', async () => {
     const deps = fakeDependencies();
     deps.model.generateProposal.mockResolvedValue({
