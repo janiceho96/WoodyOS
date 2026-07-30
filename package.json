@@ -20,6 +20,8 @@
     "@fastify/oauth2": "^8.0.0",
     "@fastify/swagger": "^9.4.0",
     "@fastify/swagger-ui": "^5.2.0",
+    "@langchain/core": "^1.2.3",
+    "@langchain/langgraph": "^1.4.8",
     "@modelcontextprotocol/sdk": "1.29.0",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.34.0",
@@ -29,7 +31,7 @@
     "openai": "^6.48.0",
     "pg": "^8.13.0",
     "undici": "8.7.0",
-    "zod": "^3.24.0"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
