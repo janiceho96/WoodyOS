@@ -73,6 +73,7 @@ export async function loadCopilotTurnContext(input: {
                 AND message.workspace_id=snapshot.workspace_id
                 AND message.context_snapshot_id=snapshot.id
                 AND message.role='assistant'
+                AND message.metadata->'event'->>'type' IS DISTINCT FROM 'proposal_error'
               ORDER BY message.created_at DESC,message.id DESC
               LIMIT 1) outstanding_proposal_kind
        FROM copilot_context_snapshots snapshot

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { resolveCopilotContext } from '../src/copilot/context.js';
+import type { CopilotContextSnapshot } from '../src/copilot/types.js';
 import {
   createCopilotProposal,
   proposalViewFromRow,
@@ -42,6 +43,68 @@ const refinementPayload = {
   changeSummary: ['Clearer'],
 };
 
+const workflowId = '12c26e9a-da06-4710-a39c-0f426b56bd8b';
+const workflowRunId = '79be9d2d-9563-4a0b-ae1e-8197b62aa048';
+const workflowVersionId = '718972f6-e2bd-42fd-af2e-32ba068a56d1';
+const publishedVersionId = '81a95235-686d-4ca4-8084-3bef1b3bb4ca';
+
+function authoritativeContextRow() {
+  return {
+    thread_id: threadId,
+    task_id: refinementPayload.documentId,
+    task_status: 'completed',
+    output_document_id: refinementPayload.documentId,
+    output_version_id: refinementPayload.baseVersionId,
+    output_version_number: 1,
+    output_content_hash: refinementPayload.baseContentHash,
+    workflow_id: workflowId,
+    workflow_published_version_id: publishedVersionId,
+    workflow_draft_revision: 7,
+    workflow_run_id: workflowRunId,
+    workflow_run_status: 'completed',
+    workflow_version_id: workflowVersionId,
+  };
+}
+
+function authoritativeSnapshot(
+  overrides: {
+    workflow?: CopilotContextSnapshot['workflow'];
+    run?: CopilotContextSnapshot['run'];
+    task?: CopilotContextSnapshot['task'];
+    output?: CopilotContextSnapshot['output'];
+    workspaceId?: string;
+    actorId?: string;
+    capturedAt?: string;
+  } = {},
+): CopilotContextSnapshot {
+  return {
+    schemaVersion: 1,
+    workspaceId: overrides.workspaceId ?? workspaceId,
+    actorId: overrides.actorId ?? actorId,
+    workflow: overrides.workflow ?? {
+      id: workflowId,
+      publishedVersionId,
+      draftRevision: 7,
+    },
+    run: overrides.run ?? {
+      id: workflowRunId,
+      status: 'completed',
+      workflowVersionId,
+    },
+    task: overrides.task ?? {
+      id: refinementPayload.documentId,
+      status: 'completed',
+    },
+    output: overrides.output ?? {
+      documentId: refinementPayload.documentId,
+      versionId: refinementPayload.baseVersionId,
+      versionNumber: 1,
+      contentHash: refinementPayload.baseContentHash,
+    },
+    capturedAt: overrides.capturedAt ?? now,
+  };
+}
+
 describe('Copilot proposal services', () => {
   it('resolves and persists a related authoritative context snapshot', async () => {
     const db = runner([
@@ -78,6 +141,122 @@ describe('Copilot proposal services', () => {
     expect(snapshot.id).toBe(contextSnapshotId);
     expect(snapshot.snapshot.output.versionNumber).toBe(1);
     expect(db.queries[0]).toContain('output_document_versions');
+  });
+
+  it.each([
+    {
+      name: 'workflow publication and draft state',
+      previous: authoritativeSnapshot({
+        workflow: {
+          id: workflowId,
+          publishedVersionId: '2c95a1d5-3765-4707-8088-39fcf55164f7',
+          draftRevision: 6,
+        },
+      }),
+    },
+    {
+      name: 'run status and workflow version',
+      previous: authoritativeSnapshot({
+        run: {
+          id: workflowRunId,
+          status: 'running',
+          workflowVersionId: '230e7479-6e2e-4135-b2da-aa98f84e717d',
+        },
+      }),
+    },
+    {
+      name: 'task status',
+      previous: authoritativeSnapshot({
+        task: {
+          id: refinementPayload.documentId,
+          status: 'running',
+        },
+      }),
+    },
+    {
+      name: 'output version metadata',
+      previous: authoritativeSnapshot({
+        output: {
+          documentId: refinementPayload.documentId,
+          versionId: refinementPayload.baseVersionId,
+          versionNumber: 0,
+          contentHash: 'f'.repeat(64),
+        },
+      }),
+    },
+  ])('creates a fresh snapshot when same-ID $name changes', async ({ previous }) => {
+    const freshSnapshotId = '6355cda3-b5c5-4e3a-a7f1-0cc8b6cc526b';
+    const db = runner([
+      { rows: [authoritativeContextRow()] },
+      { rows: [{ id: contextSnapshotId, snapshot: previous, captured_at: now }] },
+      { rows: [{ id: freshSnapshotId, captured_at: '2026-07-29T10:01:00.000Z' }] },
+    ]);
+
+    const snapshot = await resolveCopilotContext({
+      workspaceId,
+      actorId,
+      threadId,
+      request: {
+        workflowId,
+        workflowRunId,
+        taskId: refinementPayload.documentId,
+        outputDocumentId: refinementPayload.documentId,
+      },
+    }, db.client as never);
+
+    expect(snapshot.id).toBe(freshSnapshotId);
+    expect(snapshot.snapshot).toMatchObject({
+      workflow: {
+        id: workflowId,
+        publishedVersionId,
+        draftRevision: 7,
+      },
+      run: {
+        id: workflowRunId,
+        status: 'completed',
+        workflowVersionId,
+      },
+      task: {
+        id: refinementPayload.documentId,
+        status: 'completed',
+      },
+      output: {
+        documentId: refinementPayload.documentId,
+        versionId: refinementPayload.baseVersionId,
+        versionNumber: 1,
+        contentHash: refinementPayload.baseContentHash,
+      },
+    });
+    expect(db.queries.at(-1)).toContain('INSERT INTO copilot_context_snapshots');
+  });
+
+  it('reuses an unchanged fully authoritative snapshot regardless of capture timestamp', async () => {
+    const db = runner([
+      { rows: [authoritativeContextRow()] },
+      {
+        rows: [{
+          id: contextSnapshotId,
+          snapshot: authoritativeSnapshot({ capturedAt: '2026-07-28T09:00:00.000Z' }),
+          captured_at: now,
+        }],
+      },
+    ]);
+
+    const snapshot = await resolveCopilotContext({
+      workspaceId,
+      actorId,
+      threadId,
+      request: {
+        workflowId,
+        workflowRunId,
+        taskId: refinementPayload.documentId,
+        outputDocumentId: refinementPayload.documentId,
+      },
+    }, db.client as never);
+
+    expect(snapshot.id).toBe(contextSnapshotId);
+    expect(snapshot.snapshot.capturedAt).toBe(now);
+    expect(db.queries).toHaveLength(2);
   });
 
   it('uses one indistinguishable not-found error for absent or mismatched context', async () => {

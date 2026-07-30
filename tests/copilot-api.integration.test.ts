@@ -337,6 +337,40 @@ describe.runIf(enabled)('Copilot proposal API', () => {
     expect(loaded.outstandingProposalKind).toBe('draft_agent');
   });
 
+  it('retains pending clarification through a transient proposal error', async () => {
+    await db.query(
+      `INSERT INTO chat_messages(
+         workspace_id,thread_id,role,content,metadata,context_snapshot_id,created_at
+       ) VALUES($1,$2,'assistant','Proposal generation failed',$3,$4,now() + interval '4 minutes')`,
+      [
+        workspaceId,
+        threadId,
+        JSON.stringify({
+          event: {
+            type: 'proposal_error',
+            code: 'COPILOT_PROVIDER_FAILED',
+            message: 'Please retry.',
+            requestId: crypto.randomUUID(),
+            retryable: true,
+          },
+        }),
+        contextSnapshotId,
+      ],
+    );
+    const { loadCopilotTurnContext } = await import('../src/copilot/orchestrator.js');
+
+    const loaded = await loadCopilotTurnContext({ workspaceId, actorId, threadId });
+
+    await db.query(
+      `DELETE FROM chat_messages
+        WHERE thread_id=$1 AND workspace_id=$2 AND content='Proposal generation failed'
+          AND context_snapshot_id=$3`,
+      [threadId, workspaceId, contextSnapshotId],
+    );
+    expect(loaded.clarificationRound).toBe(2);
+    expect(loaded.outstandingProposalKind).toBe('draft_agent');
+  });
+
   it('clears a pending clarification when a later proposal resolves the assistant state', async () => {
     await db.query(
       `INSERT INTO chat_messages(
