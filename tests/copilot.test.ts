@@ -21,4 +21,22 @@ describe('Woody copilot', () => {
     expect(prompt).toContain('Never ask for or repeat API keys');
     expect(prompt).toContain('/solutions');
   });
+
+  it('uses visible page labels and restricts navigation to registered routes', () => {
+    const prompt = buildWoodySystemPrompt({
+      workspace_name: 'Test workspace',
+      active_agents: '0',
+      total_agents: '0',
+      running_tasks: '0',
+      completed_tasks: '1',
+      workflows: '0',
+      documents: '0',
+      connected_tools: '0',
+      agent_names: [],
+    });
+
+    expect(prompt).toContain('- Outputs (`/executions`): inspect task progress, errors, and output');
+    expect(prompt).toContain('Lead with the visible page name');
+    expect(prompt).toContain('Never invent or recommend a route outside PRODUCT MAP');
+  });
 });
