@@ -1052,19 +1052,31 @@ describe.runIf(enabled)('database-backed API flow', () => {
     expect(prematureRun.json()).toMatchObject({ error: 'WORKFLOW_NOT_PUBLISHED' });
     const nodeTest = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/nodes/finish/test-runs`, headers, payload: { input: { topic: 'agents' } } });
     expect(nodeTest.statusCode, nodeTest.body).toBe(202);
-    const completedNodeTest = await waitFor(
-      () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${nodeTest.json().id}`, headers }),
-      (response) => response.statusCode === 200 && response.json().status === 'completed',
-    );
+    let completedNodeTest;
+    try {
+      completedNodeTest = await waitFor(
+        () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${nodeTest.json().id}`, headers }),
+        (response) => response.statusCode === 200 && response.json().status === 'completed',
+      );
+    } catch (error) {
+      const snapshot = await app.inject({ method: 'GET', url: `/v1/workflows/runs/${nodeTest.json().id}`, headers });
+      throw new Error(`Node test run did not finish: ${snapshot.body}`, { cause: error });
+    }
     expect(completedNodeTest.json()).toMatchObject({ run_mode: 'test', test_target_node_id: 'finish' });
     const nodeTestIsNotPublishGate = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/publish`, headers });
     expect(nodeTestIsNotPublishGate.statusCode, nodeTestIsNotPublishGate.body).toBe(409);
     const draftTest = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/test-runs`, headers, payload: { input: { topic: 'agents' } } });
     expect(draftTest.statusCode, draftTest.body).toBe(202);
-    const completedTest = await waitFor(
-      () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${draftTest.json().id}`, headers }),
-      (response) => response.statusCode === 200 && response.json().status === 'completed' && response.json().artifacts?.every((item: { status: string }) => item.status === 'ready'),
-    );
+    let completedTest;
+    try {
+      completedTest = await waitFor(
+        () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${draftTest.json().id}`, headers }),
+        (response) => response.statusCode === 200 && response.json().status === 'completed' && response.json().artifacts?.every((item: { status: string }) => item.status === 'ready'),
+      );
+    } catch (error) {
+      const snapshot = await app.inject({ method: 'GET', url: `/v1/workflows/runs/${draftTest.json().id}`, headers });
+      throw new Error(`Draft test run did not finish: ${snapshot.body}`, { cause: error });
+    }
     expect(completedTest.json()).toMatchObject({ run_mode: 'test', draft_revision: workflow.json().draft_revision });
     const published = await app.inject({ method: 'POST', url: `/v1/workflows/${workflow.json().id}/publish`, headers });
     expect(published.statusCode, published.body).toBe(200);

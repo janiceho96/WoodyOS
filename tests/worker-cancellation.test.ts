@@ -82,11 +82,18 @@ const task = {
 
 vi.mock('bullmq', () => ({
   Worker: class Worker {
+    name: string;
+
     constructor(
       queue: string,
       processor: (job: { data: Record<string, string> }) => Promise<unknown>,
     ) {
+      this.name = queue;
       state.processors[queue] = processor;
+    }
+
+    on() {
+      return this;
     }
   },
 }));

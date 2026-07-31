@@ -1100,6 +1100,14 @@ const workflowWorker = new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) =
   fileCleanup = setInterval(() => { void purgeExpiredFiles(); }, 60 * 60 * 1_000);
   fileCleanup.unref();
   workers = [taskWorker, artifactWorker, fileWorker, knowledgeWorker, workflowWorker];
+  for (const worker of workers) {
+    worker.on('error', (error) => {
+      console.error('Woody queue worker error', { queue: worker.name, error: serializeRuntimeError(error) });
+    });
+    worker.on('failed', (job, error) => {
+      console.error('Woody queue job failed', { queue: worker.name, jobId: job?.id, error: serializeRuntimeError(error) });
+    });
+  }
   console.log('Woody task, workflow, file, artifact, knowledge, and MCP maintenance workers started');
 }
 
