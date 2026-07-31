@@ -37,6 +37,16 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run db:migrate
+      - run: docker build -t ai-nexus-extractor ./services/extractor
+      - run: |
+          docker run -d --name ai-nexus-extractor -p 8000:8000 ai-nexus-extractor
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:8000/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ai-nexus-extractor
+          exit 1
       - run: npm test
       - run: docker build -t ai-nexus-api .
-      - run: docker build -t ai-nexus-extractor ./services/extractor

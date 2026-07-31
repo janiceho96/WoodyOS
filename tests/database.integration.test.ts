@@ -170,7 +170,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
   }
 
   async function waitFor<T>(action: () => Promise<T>, predicate: (value: T) => boolean) {
-    for (let attempt = 0; attempt < 150; attempt++) {
+    for (let attempt = 0; attempt < 75; attempt++) {
       const value = await action();
       if (predicate(value)) return value;
       await delay(200);
