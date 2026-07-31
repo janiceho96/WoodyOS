@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import type { MessageParam, Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { Worker } from 'bullmq';
@@ -12,6 +13,7 @@ import {
   WORKFLOW_QUEUE,
   KNOWLEDGE_QUEUE,
   FILE_QUEUE,
+  closeQueues,
   enqueueWorkflowRun,
   type ArtifactJobData,
   type FileJobData,
@@ -35,7 +37,7 @@ import {
   type AuthorizedMcpTool,
 } from './mcp/runtime.js';
 import { loadTaskActionCheckpoint, pauseForActionConfirmation, type TaskActionCheckpointState } from './mcp/checkpoints.js';
-import { startMcpMaintenance } from './mcp/maintenance.js';
+import { startMcpMaintenance, stopMcpMaintenance } from './mcp/maintenance.js';
 import { generateArtifact, releaseTaskArtifacts } from './artifacts/service.js';
 import { executeWorkflowStep } from './workflows/runtime.js';
 import { authorizeAction, beginAction, completeAction, failAction } from './policy/action-gateway.js';
@@ -83,8 +85,11 @@ import {
 } from './runtime/leases.js';
 import { startApprovalExpiryScheduler } from './runtime/approval-expiry.js';
 
-const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
 const workerProcessOwner = `${process.pid}:${randomUUID()}`;
+let workerConnection: Redis | undefined;
+let workers: Worker[] = [];
+let approvalExpiryScheduler: ReturnType<typeof startApprovalExpiryScheduler> | undefined;
+let fileCleanup: NodeJS.Timeout | undefined;
 type Agent = {
   name: string;
   role: string;
@@ -925,17 +930,21 @@ export async function executeAgentTask(
   }
 }
 
-new Worker<TaskJobData>(TASK_QUEUE, (job) => executeAgentTask(job.data.taskId, job.data.traceId), { connection, concurrency: 5 });
+export function startWorkers() {
+  if (workerConnection) return;
+  const connection = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
+  workerConnection = connection;
+  const taskWorker = new Worker<TaskJobData>(TASK_QUEUE, (job) => executeAgentTask(job.data.taskId, job.data.traceId), { connection, concurrency: 5 });
 
-new Worker<ArtifactJobData>(ARTIFACT_QUEUE, async (job) => {
+const artifactWorker = new Worker<ArtifactJobData>(ARTIFACT_QUEUE, async (job) => {
   await generateArtifact(job.data.artifactId, job.data.trace);
 }, { connection, concurrency: 2 });
 
-new Worker<FileJobData>(FILE_QUEUE, async (job) => {
+const fileWorker = new Worker<FileJobData>(FILE_QUEUE, async (job) => {
   await processFile(job.data.fileId, job.data.trace);
 }, { connection, concurrency: 2 });
 
-new Worker<KnowledgeJobData>(KNOWLEDGE_QUEUE, async (job) => {
+const knowledgeWorker = new Worker<KnowledgeJobData>(KNOWLEDGE_QUEUE, async (job) => {
   const document = (await query<{ id: string; workspace_id: string; source_type: string; source_uri: string | null; content: string | null }>("SELECT id,workspace_id,source_type,source_uri,content FROM knowledge_documents WHERE id=$1 AND status='queued'", [job.data.documentId])).rows[0];
   if (!document) return;
   await query("UPDATE knowledge_documents SET status='processing',updated_at=now() WHERE id=$1", [document.id]);
@@ -964,7 +973,7 @@ new Worker<KnowledgeJobData>(KNOWLEDGE_QUEUE, async (job) => {
   }
 }, { connection, concurrency: 2 });
 
-new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
+const workflowWorker = new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
   const run = (await query<{
     workspace_id: string;
     workflow_version_id: string | null;
@@ -1086,8 +1095,34 @@ new Worker<WorkflowJobData>(WORKFLOW_QUEUE, async (job) => {
   }
 }, { connection, concurrency: 2 });
 
-startMcpMaintenance();
-startApprovalExpiryScheduler();
-const fileCleanup = setInterval(() => { void purgeExpiredFiles(); }, 60 * 60 * 1_000);
-fileCleanup.unref();
-console.log('Woody task, workflow, file, artifact, knowledge, and MCP maintenance workers started');
+  startMcpMaintenance();
+  approvalExpiryScheduler = startApprovalExpiryScheduler();
+  fileCleanup = setInterval(() => { void purgeExpiredFiles(); }, 60 * 60 * 1_000);
+  fileCleanup.unref();
+  workers = [taskWorker, artifactWorker, fileWorker, knowledgeWorker, workflowWorker];
+  console.log('Woody task, workflow, file, artifact, knowledge, and MCP maintenance workers started');
+}
+
+export async function waitForWorkers() {
+  if (!workerConnection) throw new Error('Workers have not been started');
+  await Promise.all(workers.map((worker) => worker.waitUntilReady()));
+}
+
+export async function closeWorkers(force = false) {
+  const connection = workerConnection;
+  if (!connection) return;
+  workerConnection = undefined;
+  if (fileCleanup) clearInterval(fileCleanup);
+  fileCleanup = undefined;
+  stopMcpMaintenance();
+  approvalExpiryScheduler?.stop();
+  approvalExpiryScheduler = undefined;
+  await Promise.all(workers.map((worker) => worker.close(force)));
+  workers = [];
+  await closeQueues();
+  await connection.quit();
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startWorkers();
+}

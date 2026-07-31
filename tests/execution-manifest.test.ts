@@ -568,7 +568,7 @@ describe.runIf(integrationEnabled)('database-backed execution manifests', () => 
     await expect(assertCurrent()).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
     await query("UPDATE mcp_connection_tools SET risk_level='read' WHERE id=$1", [mcpToolId]);
 
-    await query("UPDATE mcp_agent_tool_access SET permission_level='write' WHERE agent_id=$1 AND mcp_tool_id=$2", [agentId, mcpToolId]);
+    await query("UPDATE mcp_agent_tool_access SET permission_level='read_write' WHERE agent_id=$1 AND mcp_tool_id=$2", [agentId, mcpToolId]);
     await expect(assertCurrent()).rejects.toMatchObject({ code: 'RUN_MANIFEST_INCOMPATIBLE', retryable: false });
     await query("UPDATE mcp_agent_tool_access SET permission_level='read' WHERE agent_id=$1 AND mcp_tool_id=$2", [agentId, mcpToolId]);
 

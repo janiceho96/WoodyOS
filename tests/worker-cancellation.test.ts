@@ -390,7 +390,9 @@ vi.mock('../src/workflows/runtime.js', () => ({
   }),
 }));
 
-import { executeAgentTask } from '../src/worker.js';
+import { executeAgentTask, startWorkers } from '../src/worker.js';
+
+startWorkers();
 
 describe('task worker cancellation', () => {
   beforeEach(() => {

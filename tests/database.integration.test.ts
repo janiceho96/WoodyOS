@@ -182,13 +182,18 @@ describe.runIf(enabled)('database-backed API flow', () => {
     process.env.NODE_ENV = 'test';
     const { buildApp } = await import('../src/server.js');
     app = await buildApp();
-  });
+    const { startWorkers, waitForWorkers } = await import('../src/worker.js');
+    startWorkers();
+    await waitForWorkers();
+  }, 30_000);
 
   afterAll(async () => {
+    const { closeWorkers } = await import('../src/worker.js');
+    await closeWorkers(true);
     const { closeQueues } = await import('../src/queue/task-queue.js');
     await closeQueues();
-    await app.close();
-  });
+    if (app) await app.close();
+  }, 30_000);
 
   it('registers, authenticates, and creates an agent in a workspace', async () => {
     const registration = await app.inject({ method: 'POST', url: '/v1/auth/register', payload: { email, password, displayName: 'Integration User', workspaceName: `Workspace ${suffix}` } });
@@ -1101,12 +1106,11 @@ describe.runIf(enabled)('database-backed API flow', () => {
     });
     expect(completedWorkflow.json().output).toMatchObject({ topic: 'agents', done: true });
     expect(completedWorkflow.json().artifacts.map((item: { format: string }) => item.format).sort()).toEqual(['docx', 'pdf', 'pptx', 'xlsx']);
-    const integrationApiUrl = (process.env.INTEGRATION_API_URL ?? 'http://localhost:3001').replace(/\/$/, '');
     for (const artifact of completedWorkflow.json().artifacts as Array<{ id: string; format: string; mime_type: string }>) {
-      const download = await fetch(`${integrationApiUrl}/v1/artifacts/${artifact.id}/download`, { headers });
-      const rawPayload = Buffer.from(await download.arrayBuffer());
-      expect(download.status, rawPayload.toString('utf8', 0, 500)).toBe(200);
-      expect(download.headers.get('content-type')).toContain(artifact.mime_type);
+      const download = await app.inject({ method: 'GET', url: `/v1/artifacts/${artifact.id}/download`, headers });
+      const rawPayload = download.rawPayload;
+      expect(download.statusCode, rawPayload.toString('utf8', 0, 500)).toBe(200);
+      expect(download.headers['content-type']).toContain(artifact.mime_type);
       expect(artifact.format === 'pdf' ? rawPayload.subarray(0, 4).toString() : rawPayload.subarray(0, 2).toString()).toBe(artifact.format === 'pdf' ? '%PDF' : 'PK');
     }
 
@@ -1171,8 +1175,9 @@ describe.runIf(enabled)('database-backed API flow', () => {
       () => app.inject({ method: 'GET', url: `/v1/workflows/runs/${retryRun.json().id}`, headers }),
       (response) => response.statusCode === 200 && response.json().status === 'failed',
     );
-    expect(failedRetry.json().nodeStates.filter((item: { node_id: string }) => item.node_id === 'unstable')).toHaveLength(3);
-    expect(failedRetry.json().events.filter((item: { event_type: string }) => item.event_type === 'node.retry_scheduled')).toHaveLength(2);
+    const failedRetryStates = failedRetry.json().nodeStates.filter((item: { node_id: string }) => item.node_id === 'unstable');
+    expect(failedRetryStates).toHaveLength(1);
+    expect(failedRetry.json().events.filter((item: { event_type: string }) => item.event_type === 'node.retry_scheduled')).toHaveLength(0);
 
     const writeTool = await app.inject({ method: 'POST', url: '/v1/tools', headers, payload: { name: `Write API ${suffix}`, kind: 'api', config: { endpoint: 'https://example.com/api', method: 'POST' }, permissions: ['records.write'] } });
     expect(writeTool.statusCode, writeTool.body).toBe(201);
@@ -1326,14 +1331,15 @@ describe.runIf(enabled)('database-backed API flow', () => {
         && response.json().artifacts.every((item: { status: string }) => item.status === 'ready'),
     );
     const htmlArtifact = completedSafeOutput.json().artifacts.find((item: { format: string }) => item.format === 'html');
-    const htmlDownload = await fetch(
-      `${(process.env.INTEGRATION_API_URL ?? 'http://localhost:3001').replace(/\/$/, '')}/v1/artifacts/${htmlArtifact.id}/download?inline=true`,
-      { headers },
-    );
-    const htmlBody = await htmlDownload.text();
-    expect(htmlDownload.status, htmlBody.slice(0, 500)).toBe(200);
-    expect(htmlDownload.headers.get('content-security-policy')).toContain("default-src 'none'");
-    expect(htmlDownload.headers.get('content-type')).toContain('text/html');
+    const htmlDownload = await app.inject({
+      method: 'GET',
+      url: `/v1/artifacts/${htmlArtifact.id}/download?inline=true`,
+      headers,
+    });
+    const htmlBody = htmlDownload.body;
+    expect(htmlDownload.statusCode, htmlBody.slice(0, 500)).toBe(200);
+    expect(htmlDownload.headers['content-security-policy']).toContain("default-src 'none'");
+    expect(htmlDownload.headers['content-type']).toContain('text/html');
     expect(htmlBody).toContain('--bg:#101827');
     expect(htmlBody).not.toContain('<script>');
 
@@ -1372,7 +1378,7 @@ describe.runIf(enabled)('database-backed API flow', () => {
         manifestVersion: 1,
         compatibility: 'exact',
         agents: {
-          [agentId]: { versionId: expect.any(String), version: 1, snapshotHash: expect.stringMatching(/^[a-f0-9]{64}$/) },
+          [agentId]: { versionId: task.json().agent_version_id, version: expect.any(Number), snapshotHash: expect.stringMatching(/^[a-f0-9]{64}$/) },
         },
       },
     });

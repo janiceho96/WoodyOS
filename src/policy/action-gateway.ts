@@ -304,14 +304,14 @@ export function authorizeWorkflowAction(input: WorkflowActionRequest) {
 
 export async function beginAction(authorizationId: string, leaseOwnerId?: string) {
   const claimed = await query<{ id: string }>(
-    `UPDATE action_authorizations authorization SET status='executing'
-      WHERE authorization.id=$1 AND authorization.status='approved'
+    `UPDATE action_authorizations auth SET status='executing'
+      WHERE auth.id=$1 AND auth.status='approved'
         AND (
           (
-            authorization.subject_type='task'
+            auth.subject_type='task'
             AND EXISTS(
               SELECT 1 FROM tasks task
-              WHERE task.id=authorization.task_id
+              WHERE task.id=auth.task_id
                 AND task.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
                 AND (
                   $2::text IS NULL
@@ -324,10 +324,10 @@ export async function beginAction(authorizationId: string, leaseOwnerId?: string
             )
           )
           OR (
-            authorization.subject_type='workflow_run'
+            auth.subject_type='workflow_run'
             AND EXISTS(
               SELECT 1 FROM workflow_runs run
-              WHERE run.id=authorization.workflow_run_id
+              WHERE run.id=auth.workflow_run_id
                 AND run.status NOT IN ('cancel_requested','cancelling','cancelled','cancelled_with_side_effects')
                 AND (
                   $2::text IS NULL
@@ -340,7 +340,7 @@ export async function beginAction(authorizationId: string, leaseOwnerId?: string
             )
           )
         )
-      RETURNING authorization.id`,
+      RETURNING auth.id`,
     [authorizationId, leaseOwnerId ?? null],
   );
   return Boolean(claimed.rowCount);
