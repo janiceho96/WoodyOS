@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { db } from '../db/client.js';
 import type { WoodyChatMessage } from '../routes/copilot.js';
-import { copilotGeneratedTurnSchema, copilotProposalKindSchema } from './contracts.js';
+import {
+  copilotContextSnapshotSchema,
+  copilotGeneratedTurnSchema,
+  copilotProposalKindSchema,
+} from './contracts.js';
 import { runCopilotGraph } from './graph/graph.js';
 import {
   createCopilotModelAdapter,
@@ -84,11 +88,17 @@ export async function loadCopilotTurnContext(input: {
     [input.threadId, input.workspaceId, input.actorId],
   )).rows[0];
   if (!row) throw Object.assign(new Error('COPILOT_CONTEXT_NOT_FOUND'), { statusCode: 404 });
+  let snapshot: CopilotContextSnapshot;
+  try {
+    snapshot = copilotContextSnapshotSchema.parse(row.snapshot);
+  } catch {
+    throw Object.assign(new Error('COPILOT_CONTEXT_INVALID'), { statusCode: 409 });
+  }
   return {
     context: {
       id: row.id,
       threadId: row.thread_id,
-      snapshot: row.snapshot,
+      snapshot,
       createdAt: iso(row.captured_at),
     },
     outputContent: row.content,

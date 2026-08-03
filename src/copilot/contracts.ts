@@ -4,6 +4,7 @@ import { outputContentSchema } from '../outputs/types.js';
 import { copilotIntentSchema } from './graph/state.js';
 import type {
   CopilotGeneratedTurn,
+  CopilotContextSnapshot,
   CopilotProposalStatus,
   DraftAgentPayload,
   OutputRefinementPayload,
@@ -13,6 +14,34 @@ const uuidSchema = z.string().uuid();
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 
 export const copilotProposalKindSchema = z.enum(['output_refinement', 'draft_agent']);
+
+export const copilotContextSnapshotSchema: z.ZodType<CopilotContextSnapshot> = z.object({
+  schemaVersion: z.literal(1),
+  workspaceId: uuidSchema,
+  actorId: uuidSchema,
+  workflow: z.object({
+    id: uuidSchema,
+    publishedVersionId: uuidSchema.nullable(),
+    draftRevision: z.number().int().min(0),
+  }).strict().nullable(),
+  run: z.object({
+    id: uuidSchema,
+    status: z.string().trim().min(1).max(80),
+    workflowVersionId: uuidSchema.nullable(),
+  }).strict().nullable(),
+  task: z.object({
+    id: uuidSchema,
+    status: z.string().trim().min(1).max(80),
+  }).strict(),
+  output: z.object({
+    documentId: uuidSchema,
+    versionId: uuidSchema,
+    versionNumber: z.number().int().min(1),
+    contentHash: hashSchema,
+  }).strict(),
+  capturedAt: z.string().datetime({ offset: true }),
+}).strict();
+
 export const copilotProposalStatusSchema = z.enum([
   'ready_for_review',
   'approved',
@@ -136,7 +165,7 @@ export const copilotGeneratedTurnSchema: z.ZodType<CopilotGeneratedTurn> = z.dis
 ]);
 
 const transitions: Record<CopilotProposalStatus, ReadonlySet<CopilotProposalStatus>> = {
-  ready_for_review: new Set(['approved', 'rejected', 'expired', 'superseded']),
+  ready_for_review: new Set(['approved', 'rejected', 'expired', 'superseded', 'failed']),
   approved: new Set(['applying', 'expired']),
   applying: new Set(['applied', 'failed']),
   applied: new Set(),

@@ -278,7 +278,7 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
       payload: { idempotencyKey: crypto.randomUUID() },
     });
     expect(approval.statusCode, approval.body).toBe(403);
-    expect(approval.json()).toEqual({ error: 'FORBIDDEN' });
+    expect(approval.json()).toMatchObject({ error: 'FORBIDDEN' });
   });
 
   it('rejects stale context, reused keys, and cross-workspace identifiers', async () => {
@@ -302,7 +302,7 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
       payload: { idempotencyKey: crypto.randomUUID() },
     });
     expect(staleApproval.statusCode, staleApproval.body).toBe(409);
-    expect(staleApproval.json()).toEqual({ error: 'COPILOT_CONTEXT_STALE' });
+    expect(staleApproval.json()).toMatchObject({ error: 'COPILOT_CONTEXT_STALE' });
     expect((await db.query<{ current_version_number: number }>(
       'SELECT current_version_number FROM output_documents WHERE id=$1',
       [documentId],
@@ -317,7 +317,7 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
       payload: { idempotencyKey: firstApprovalKey },
     });
     expect(keyConflict.statusCode, keyConflict.body).toBe(409);
-    expect(keyConflict.json()).toEqual({ error: 'COPILOT_IDEMPOTENCY_CONFLICT' });
+    expect(keyConflict.json()).toMatchObject({ error: 'COPILOT_IDEMPOTENCY_CONFLICT' });
     expect(firstReceiptId).toBeTruthy();
 
     const outsider = await register('cross-workspace');
@@ -340,7 +340,7 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
       payload: { taskId: crypto.randomUUID(), outputDocumentId: crypto.randomUUID() },
     });
     expect(crossed.statusCode).toBe(404);
-    expect(crossed.json()).toEqual(missing.json());
+    expect(crossed.json().error).toBe(missing.json().error);
   });
 
   it('audits payload tampering and creates no output version', async () => {
@@ -363,7 +363,7 @@ describe.runIf(enabled)('Copilot refinement and Draft-agent vertical slice', () 
       payload: { idempotencyKey: crypto.randomUUID() },
     });
     expect(response.statusCode, response.body).toBe(409);
-    expect(response.json()).toEqual({ error: 'COPILOT_PROPOSAL_INVALID' });
+    expect(response.json()).toMatchObject({ error: 'COPILOT_PROPOSAL_INVALID' });
     expect((await db.query<{ count: string }>(
       'SELECT count(*)::text FROM output_document_versions WHERE document_id=$1',
       [documentId],

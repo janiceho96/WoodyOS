@@ -3,7 +3,11 @@ import { db } from '../db/client.js';
 import { createDraftAgentWithClient } from '../agents/service.js';
 import { insertAuditEvent } from '../lib/audit.js';
 import { saveOutputVersionWithClient } from '../outputs/service.js';
-import { proposalPayloadHash, safeReceiptError } from './contracts.js';
+import {
+  assertProposalTransition,
+  proposalPayloadHash,
+  safeReceiptError,
+} from './contracts.js';
 import { proposalViewFromRow, type ProposalRow } from './repository.js';
 import type {
   CopilotProposalView,
@@ -50,6 +54,12 @@ type ReceiptRow = {
 
 function applicationError(code: string, statusCode: number) {
   return Object.assign(new Error(code), { statusCode });
+}
+
+function errorStatusCode(error: unknown) {
+  return typeof (error as { statusCode?: unknown })?.statusCode === 'number'
+    ? (error as { statusCode: number }).statusCode
+    : 500;
 }
 
 function receiptFromRow(row: ReceiptRow): ExecutionReceipt {
@@ -165,6 +175,10 @@ async function persistFailedReceipt(database: CopilotDatabase, input: {
       [input.proposalId, input.workspaceId],
     )).rows[0];
     if (!proposal) throw applicationError('COPILOT_PROPOSAL_NOT_FOUND', 404);
+    const terminalStatus = input.errorCode === 'COPILOT_PROPOSAL_EXPIRED' ? 'expired' : 'failed';
+    if (proposal.status !== terminalStatus) {
+      assertProposalTransition(proposal.status, terminalStatus);
+    }
     const approval = (await client.query<{ id: string }>(
       `INSERT INTO copilot_proposal_approvals(
          workspace_id,proposal_id,context_snapshot_id,approved_by,payload_hash,idempotency_key
@@ -181,9 +195,9 @@ async function persistFailedReceipt(database: CopilotDatabase, input: {
       ],
     )).rows[0];
     await client.query(
-      `UPDATE copilot_proposals SET status='failed',error_code=$1,updated_at=now()
-        WHERE id=$2 AND status IN ('ready_for_review','approved','applying')`,
-      [input.errorCode, input.proposalId],
+      `UPDATE copilot_proposals SET status=$1,error_code=$2,updated_at=now()
+        WHERE id=$3 AND status IN ('ready_for_review','approved','applying')`,
+      [terminalStatus, input.errorCode, input.proposalId],
     );
     const auditEventId = await insertAuditEvent(client, {
       workspaceId: input.workspaceId,
@@ -199,7 +213,7 @@ async function persistFailedReceipt(database: CopilotDatabase, input: {
       `INSERT INTO copilot_execution_receipts(
          workspace_id,proposal_id,approval_id,context_snapshot_id,proposal_kind,idempotency_key,
          operation,status,actor_id,resource_type,error_code,audit_event_id
-       ) VALUES($1,$2,$3,$4,$5,$6,$7,'failed',$8,$9,$10,$11)
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,'failed',$8,$9,$10,$11)
        ON CONFLICT(proposal_id) DO UPDATE SET proposal_id=EXCLUDED.proposal_id
        RETURNING *`,
       [
@@ -266,6 +280,7 @@ export async function approveAndApplyCopilotProposal(
     )).rows[0];
     if (!row) throw applicationError('COPILOT_PROPOSAL_NOT_FOUND', 404);
     if (row.status !== 'ready_for_review') throw applicationError('COPILOT_PROPOSAL_NOT_REVIEWABLE', 409);
+    assertProposalTransition(row.status, 'approved');
     await client.query(
       `UPDATE copilot_proposals SET status='approved',approved_at=now(),updated_at=now()
         WHERE id=$1 AND status='ready_for_review'`,
@@ -296,6 +311,7 @@ export async function approveAndApplyCopilotProposal(
         WHERE id=$1 AND status='approved'`,
       [row.id],
     );
+    assertProposalTransition('approved', 'applying');
 
     let resourceId: string;
     let previousVersion: number | null = null;
@@ -355,6 +371,7 @@ export async function approveAndApplyCopilotProposal(
       threadId: row.thread_id,
       receipt: persistedReceipt,
     });
+    assertProposalTransition('applying', 'applied');
     await client.query(
       `UPDATE copilot_proposals SET status='applied',applied_at=now(),updated_at=now()
         WHERE id=$1 AND status='applying'`,
@@ -366,7 +383,7 @@ export async function approveAndApplyCopilotProposal(
     await client.query('ROLLBACK').catch(() => undefined);
     const safe = safeReceiptError(error);
     await persistFailedReceipt(database, { ...input, errorCode: safe.errorCode }).catch(() => undefined);
-    throw error;
+    throw applicationError(safe.errorCode, errorStatusCode(error));
   } finally {
     client.release();
   }

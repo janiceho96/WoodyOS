@@ -37,6 +37,7 @@ import { fileRoutes } from './routes/files.js';
 import { chatThreadRoutes } from './routes/chat-threads.js';
 import { artifactTemplateRoutes } from './routes/artifact-templates.js';
 import { outputDocumentRoutes } from './routes/output-documents.js';
+import { publicErrorCode } from './lib/http.js';
 
 export async function buildApp() {
   if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) throw new Error('JWT_SECRET must be configured in production');
@@ -47,12 +48,12 @@ export async function buildApp() {
   await app.register(swaggerUi, { routePrefix: '/docs' });
   await app.register(jwt, { secret: process.env.JWT_SECRET ?? 'development-only-change-me-32-chars' });
   app.setErrorHandler((error, request, reply) => {
-    request.log.error(error);
     const statusCode = (error as { statusCode?: number }).statusCode ?? 500;
-    const errorCode = statusCode === 500 ? 'INTERNAL_ERROR' : statusCode === 401 ? 'UNAUTHORIZED' : statusCode === 403 ? 'FORBIDDEN' : (error as Error).message;
-    reply.code(statusCode).send({
+    const errorCode = publicErrorCode(error, statusCode);
+    request.log.error({ requestId: request.id, statusCode, errorCode }, 'Request failed');
+    reply.header('x-request-id', request.id).code(statusCode).send({
       error: errorCode,
-      ...(process.env.NODE_ENV === 'test' && statusCode >= 500 ? { detail: error instanceof Error ? error.message : String(error) } : {}),
+      requestId: request.id,
     });
   });
   await authPlugin(app);

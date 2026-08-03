@@ -174,6 +174,7 @@ export async function chatThreadRoutes(app: FastifyInstance) {
     const metadata = {
       citations: attachmentContext.citations.map(({ content: _content, ...citation }) => citation),
       inReplyToUserMessageId: userMessageId,
+      requestId: request.id,
       ...(orchestration ? { event: orchestration.event } : {}),
     };
     const assistant = (await query(
@@ -195,6 +196,7 @@ export async function chatThreadRoutes(app: FastifyInstance) {
       citationCount: attachmentContext.citations.length,
       contextSnapshotId: orchestration?.contextSnapshotId ?? null,
       proposalId: orchestration?.proposalId ?? null,
+      requestId: request.id,
     });
     request.log.info({
       requestId: request.id,

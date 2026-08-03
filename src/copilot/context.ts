@@ -1,5 +1,6 @@
 import { db } from '../db/client.js';
 import type { QueryRunner } from '../lib/audit.js';
+import { copilotContextSnapshotSchema } from './contracts.js';
 import type {
   CopilotContextRequest,
   CopilotContextSnapshot,
@@ -25,6 +26,14 @@ type ContextRow = {
 
 function contextError() {
   return Object.assign(new Error('COPILOT_CONTEXT_NOT_FOUND'), { statusCode: 404 });
+}
+
+function parseSnapshot(value: unknown): CopilotContextSnapshot {
+  try {
+    return copilotContextSnapshotSchema.parse(value);
+  } catch {
+    throw Object.assign(new Error('COPILOT_CONTEXT_INVALID'), { statusCode: 409 });
+  }
 }
 
 function iso(value: Date | string) {
@@ -169,15 +178,21 @@ export async function resolveCopilotContext(
       row.output_version_id,
     ],
   )).rows[0];
-  if (current && equivalentAuthoritativeSnapshot(current.snapshot, snapshot)) {
+  const currentSnapshot = current
+    ? parseSnapshot(current.snapshot)
+    : null;
+  if (current && currentSnapshot && equivalentAuthoritativeSnapshot(currentSnapshot, snapshot)) {
     const currentCapturedAt = iso(current.captured_at);
     return {
       id: current.id,
       threadId: input.threadId,
-      snapshot: { ...current.snapshot, capturedAt: currentCapturedAt },
+      snapshot: { ...currentSnapshot, capturedAt: currentCapturedAt },
       createdAt: currentCapturedAt,
     };
   }
+
+  // Validate the generated snapshot before it can be persisted as proposal authority.
+  parseSnapshot(snapshot);
 
   const inserted = (await runner.query<{ id: string; captured_at: Date | string }>(
     `INSERT INTO copilot_context_snapshots(
@@ -199,5 +214,6 @@ export async function resolveCopilotContext(
   )).rows[0];
   if (!inserted) throw Object.assign(new Error('COPILOT_CONTEXT_PERSIST_FAILED'), { statusCode: 500 });
   snapshot.capturedAt = iso(inserted.captured_at);
+  parseSnapshot(snapshot);
   return { id: inserted.id, threadId: input.threadId, snapshot, createdAt: snapshot.capturedAt };
 }

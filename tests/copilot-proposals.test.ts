@@ -179,7 +179,7 @@ describe('Copilot proposal services', () => {
         output: {
           documentId: refinementPayload.documentId,
           versionId: refinementPayload.baseVersionId,
-          versionNumber: 0,
+          versionNumber: 2,
           contentHash: 'f'.repeat(64),
         },
       }),
@@ -272,6 +272,27 @@ describe('Copilot proposal services', () => {
     }, db.client as never)).rejects.toMatchObject({
       message: 'COPILOT_CONTEXT_NOT_FOUND',
       statusCode: 404,
+    });
+  });
+
+  it('rejects a corrupted persisted snapshot before it can authorize a proposal', async () => {
+    const db = runner([
+      { rows: [authoritativeContextRow()] },
+      { rows: [{ id: contextSnapshotId, snapshot: { schemaVersion: 2 }, captured_at: now }] },
+    ]);
+    await expect(resolveCopilotContext({
+      workspaceId,
+      actorId,
+      threadId,
+      request: {
+        workflowId,
+        workflowRunId,
+        taskId: refinementPayload.documentId,
+        outputDocumentId: refinementPayload.documentId,
+      },
+    }, db.client as never)).rejects.toMatchObject({
+      message: 'COPILOT_CONTEXT_INVALID',
+      statusCode: 409,
     });
   });
 

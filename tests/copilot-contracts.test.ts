@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assertProposalTransition,
+  copilotContextSnapshotSchema,
   clarificationSchema,
   clarificationQuestionsSchema,
   copilotIntentClassificationSchema,
@@ -63,6 +64,28 @@ describe('Copilot contracts', () => {
     expect(() => assertProposalTransition('approved', 'applying')).not.toThrow();
     expect(() => assertProposalTransition('applying', 'applied')).not.toThrow();
     expect(() => assertProposalTransition('applied', 'approved')).toThrow('COPILOT_PROPOSAL_TRANSITION_INVALID');
+    expect(() => assertProposalTransition('ready_for_review', 'failed')).not.toThrow();
+  });
+
+  it('validates persisted snapshots before they can authorize a turn', () => {
+    const valid = {
+      schemaVersion: 1,
+      workspaceId: '0c46a071-6933-4de1-a602-e5310982a947',
+      actorId: '2a55d226-97a7-4de5-aa8c-258f79fdb824',
+      workflow: null,
+      run: null,
+      task: { id: '45f0429e-a911-492e-96cd-62fa17276211', status: 'completed' },
+      output: {
+        documentId: '45f0429e-a911-492e-96cd-62fa17276211',
+        versionId: '6f4d43a5-28dd-4123-b99a-97f9a366aa00',
+        versionNumber: 1,
+        contentHash: 'a'.repeat(64),
+      },
+      capturedAt: '2026-07-29T10:00:00.000Z',
+    };
+    expect(copilotContextSnapshotSchema.safeParse(valid).success).toBe(true);
+    expect(copilotContextSnapshotSchema.safeParse({ ...valid, output: { ...valid.output, contentHash: 'not-a-hash' } }).success).toBe(false);
+    expect(copilotContextSnapshotSchema.safeParse({ ...valid, schemaVersion: 2 }).success).toBe(false);
   });
 
   it('hashes equivalent payloads identically regardless of key order', () => {

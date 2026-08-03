@@ -138,7 +138,7 @@ describe.runIf(enabled)('Copilot proposal API', () => {
       payload: { taskId, outputDocumentId: documentId },
     });
     expect(crossed.statusCode, crossed.body).toBe(404);
-    expect(crossed.json()).toEqual({ error: 'COPILOT_CONTEXT_NOT_FOUND' });
+    expect(crossed.json()).toMatchObject({ error: 'COPILOT_CONTEXT_NOT_FOUND' });
   });
 
   it('answers a contextual question without creating a proposal', async () => {
