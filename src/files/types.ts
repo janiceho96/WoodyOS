@@ -48,6 +48,8 @@ const canonicalMime: Record<SupportedFileExtension, string> = {
   webp: 'image/webp',
 };
 
+const textualExtensions = new Set<SupportedFileExtension>(['csv', 'md', 'txt', 'html']);
+
 function looksLikeZip(buffer: Buffer, marker: string) {
   return buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04])) && buffer.includes(Buffer.from(marker));
 }
@@ -55,6 +57,32 @@ function looksLikeZip(buffer: Buffer, marker: string) {
 function looksTextual(buffer: Buffer) {
   const sample = buffer.subarray(0, Math.min(buffer.length, 8_192));
   return !sample.includes(0);
+}
+
+const signatureChecks: Record<SupportedFileExtension, (buffer: Buffer) => boolean> = {
+  pdf: (buffer) => buffer.subarray(0, 5).toString() === '%PDF-',
+  docx: (buffer) => looksLikeZip(buffer, 'word/'),
+  pptx: (buffer) => looksLikeZip(buffer, 'ppt/'),
+  xlsx: (buffer) => looksLikeZip(buffer, 'xl/'),
+  xlsm: (buffer) => looksLikeZip(buffer, 'xl/'),
+  csv: looksTextual,
+  md: looksTextual,
+  txt: looksTextual,
+  html: looksTextual,
+  png: (buffer) => buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
+  jpg: looksLikeJpeg,
+  jpeg: looksLikeJpeg,
+  webp: (buffer) => buffer.subarray(0, 4).toString() === 'RIFF' && buffer.subarray(8, 12).toString() === 'WEBP',
+};
+
+function looksLikeJpeg(buffer: Buffer) {
+  return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer.at(-2) === 0xff && buffer.at(-1) === 0xd9;
+}
+
+function mimeMatches(extension: SupportedFileExtension, declaredMime: string, expectedMime: string) {
+  if (declaredMime === expectedMime) return true;
+  if (textualExtensions.has(extension) && declaredMime.startsWith('text/')) return true;
+  return (extension === 'jpg' || extension === 'jpeg') && declaredMime === 'image/jpeg';
 }
 
 export function safeOriginalName(value: string) {
@@ -69,24 +97,12 @@ export function inspectUpload(filename: string, declaredMime: string, buffer: Bu
   const extension = extname(name).slice(1).toLowerCase() as SupportedFileExtension;
   if (!SUPPORTED_FILE_EXTENSIONS.includes(extension)) throw Object.assign(new Error('FILE_TYPE_UNSUPPORTED'), { statusCode: 415 });
 
-  const signatureMatches =
-    (extension === 'pdf' && buffer.subarray(0, 5).toString() === '%PDF-')
-    || (extension === 'docx' && looksLikeZip(buffer, 'word/'))
-    || (extension === 'pptx' && looksLikeZip(buffer, 'ppt/'))
-    || ((extension === 'xlsx' || extension === 'xlsm') && looksLikeZip(buffer, 'xl/'))
-    || (extension === 'png' && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])))
-    || ((extension === 'jpg' || extension === 'jpeg') && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer.at(-2) === 0xff && buffer.at(-1) === 0xd9)
-    || (extension === 'webp' && buffer.subarray(0, 4).toString() === 'RIFF' && buffer.subarray(8, 12).toString() === 'WEBP')
-    || (['csv', 'md', 'txt', 'html'].includes(extension) && looksTextual(buffer));
-  if (!signatureMatches) throw Object.assign(new Error('FILE_SIGNATURE_MISMATCH'), { statusCode: 415 });
+  if (!signatureChecks[extension](buffer)) throw Object.assign(new Error('FILE_SIGNATURE_MISMATCH'), { statusCode: 415 });
 
   const expectedMime = canonicalMime[extension];
   const normalizedDeclared = declaredMime.split(';')[0].trim().toLowerCase();
-  if (normalizedDeclared && normalizedDeclared !== 'application/octet-stream') {
-    const compatible = normalizedDeclared === expectedMime
-      || (['csv', 'md', 'txt', 'html'].includes(extension) && normalizedDeclared.startsWith('text/'))
-      || (['jpg', 'jpeg'].includes(extension) && normalizedDeclared === 'image/jpeg');
-    if (!compatible) throw Object.assign(new Error('FILE_MIME_MISMATCH'), { statusCode: 415 });
+  if (normalizedDeclared && normalizedDeclared !== 'application/octet-stream' && !mimeMatches(extension, normalizedDeclared, expectedMime)) {
+    throw Object.assign(new Error('FILE_MIME_MISMATCH'), { statusCode: 415 });
   }
   return { name, extension, mimeType: expectedMime };
 }

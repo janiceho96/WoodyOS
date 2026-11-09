@@ -30,7 +30,7 @@ const installInput = z.object({
 });
 const idParams = z.object({ id: z.string().uuid() });
 
-export async function agentSolutionRoutes(app: FastifyInstance) {
+function registerAgentSolutionPostCompileRoute(app: FastifyInstance) {
   app.post('/compile', {
     preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']),
   }, asyncRoute(async (request, reply) => {
@@ -79,7 +79,9 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     });
     return { solution, draftId };
   }));
+}
 
+function registerAgentSolutionPostInstallRoute(app: FastifyInstance) {
   app.post('/install', {
     preHandler: (request) => app.authorize(request, ['owner', 'admin']),
   }, asyncRoute(async (request, reply) => {
@@ -107,7 +109,9 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     });
     return reply.code(201).send(installed);
   }));
+}
 
+function registerAgentSolutionGetInstallationsRoute(app: FastifyInstance) {
   app.get('/installations', { preHandler: app.authenticate }, asyncRoute(async (request) => ({
     data: (await query(
       `SELECT i.id,i.source_type,i.solution_slug,i.solution_version,i.solution_name,i.status,
@@ -120,7 +124,9 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
       [request.user.workspaceId],
     )).rows,
   })));
+}
 
+function registerAgentSolutionPostInstallationsByIdTestRoute(app: FastifyInstance) {
   app.post('/installations/:id/test', {
     preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']),
   }, asyncRoute(async (request, reply) => {
@@ -188,7 +194,9 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     });
     return reply.code(202).send(run.rows[0]);
   }));
+}
 
+function registerAgentSolutionPostInstallationsByIdActivateRoute(app: FastifyInstance) {
   app.post('/installations/:id/activate', {
     preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']),
   }, asyncRoute(async (request, reply) => {
@@ -265,4 +273,12 @@ export async function agentSolutionRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'agent_solution.activated', 'agent_solution_installation', params.id);
     return { id: params.id, status: 'active' };
   }));
+}
+
+export async function agentSolutionRoutes(app: FastifyInstance) {
+  registerAgentSolutionPostCompileRoute(app);
+  registerAgentSolutionPostInstallRoute(app);
+  registerAgentSolutionGetInstallationsRoute(app);
+  registerAgentSolutionPostInstallationsByIdTestRoute(app);
+  registerAgentSolutionPostInstallationsByIdActivateRoute(app);
 }

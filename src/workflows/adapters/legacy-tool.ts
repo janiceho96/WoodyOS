@@ -21,6 +21,28 @@ import {
 } from '../../policy/action-gateway.js';
 import { limitedActionResult } from '../../lib/action-safety.js';
 import { expirationPolicy } from '../../runtime/approval-expiry.js';
+import { allowedAuthorizationId, completedAuthorizationResult } from './authorization-result.js';
+
+function nonRetryable(message: string) {
+  return Object.assign(new Error(message), { retryable: false });
+}
+
+async function requiredPrecedingApproval(context: WorkflowAdapterContext, tool: ToolRecord) {
+  const { node, run, cursor, iterationKey } = context;
+  if (!toolRequiresApproval(tool)) return undefined;
+  if (retryPolicy(node).maxAttempts > 1) throw nonRetryable(`Write-capable action ${node.id} cannot use automatic retries`);
+  const previous = run.definition_snapshot.nodes.find((candidate) => candidate.id === cursor.previousNodeId);
+  if (!previous || previous.type !== 'approval') {
+    throw nonRetryable(`Write-capable action ${node.id} requires a directly preceding approval node`);
+  }
+  const approved = (await query<{ approved: boolean }>(
+    `SELECT EXISTS(SELECT 1 FROM workflow_run_node_states
+     WHERE workflow_run_id=$1 AND node_id=$2 AND iteration_key=$3 AND status='completed') approved`,
+    [run.id, previous.id, iterationKey],
+  )).rows[0]?.approved;
+  if (!approved) throw nonRetryable(`Write-capable action ${node.id} has no completed approval for this loop iteration`);
+  return { nodeId: previous.id, iterationKey };
+}
 
 export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -38,21 +60,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
     manifestEntry,
   });
   execution.signal.throwIfAborted();
-  const requiresApproval = toolRequiresApproval(tool);
-  let precedingApproval: { nodeId: string; iterationKey: string } | undefined;
-  if (requiresApproval) {
-    const nonRetryable = (message: string) => Object.assign(new Error(message), { retryable: false });
-    if (retryPolicy(node).maxAttempts > 1) throw nonRetryable(`Write-capable action ${node.id} cannot use automatic retries`);
-    const previous = run.definition_snapshot.nodes.find((candidate) => candidate.id === cursor.previousNodeId);
-    if (!previous || previous.type !== 'approval') throw nonRetryable(`Write-capable action ${node.id} requires a directly preceding approval node`);
-    const approved = (await query<{ approved: boolean }>(
-      `SELECT EXISTS(SELECT 1 FROM workflow_run_node_states
-       WHERE workflow_run_id=$1 AND node_id=$2 AND iteration_key=$3 AND status='completed') approved`,
-      [run.id, previous.id, iterationKey],
-    )).rows[0]?.approved;
-    if (!approved) throw nonRetryable(`Write-capable action ${node.id} has no completed approval for this loop iteration`);
-    precedingApproval = { nodeId: previous.id, iterationKey };
-  }
+  const precedingApproval = await requiredPrecedingApproval(context, tool);
   const configuredInput = node.config.input && typeof node.config.input === 'object' && !Array.isArray(node.config.input) ? node.config.input : run.state;
   const input = resolve(configuredInput) as Record<string, unknown>;
   const actionTrace = childTraceContext(execution.trace);
@@ -78,27 +86,23 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
   if (authorization.status === 'awaiting_confirmation') {
     throw Object.assign(new Error(`Write-capable action ${node.id} could not consume its preceding approval safely`), { retryable: false });
   }
-  if (authorization.status === 'denied') {
-    throw Object.assign(new Error(authorization.reason), { retryable: false });
-  }
-  if (authorization.status === 'completed') {
-    setNodeOutput(authorization.result);
-    return { output: authorization.result, result: authorization.result };
-  }
-  if (!(await beginWorkflowAction(authorization.authorizationId, execution.leaseOwnerId))) {
+  const completed = completedAuthorizationResult(authorization, setNodeOutput);
+  if (completed) return completed;
+  const authorizationId = allowedAuthorizationId(authorization);
+  if (!(await beginWorkflowAction(authorizationId, execution.leaseOwnerId))) {
     throw Object.assign(new Error('Legacy action execution could not be claimed safely'), { retryable: false });
   }
   await emitEvent('tool.called', `Calling ${tool.name}`, {
-    authorizationId: authorization.authorizationId,
+    authorizationId,
     toolId: tool.id,
     iterationKey,
     attempt: cursor.attempt,
   }, actionTrace);
   try {
     const output = limitedActionResult(await invokeTool(tool, input, false, execution.signal));
-    await completeWorkflowAction(authorization.authorizationId, output, execution.leaseOwnerId);
+    await completeWorkflowAction(authorizationId, output, execution.leaseOwnerId);
     await emitEvent('tool.completed', `${tool.name} completed`, {
-      authorizationId: authorization.authorizationId,
+      authorizationId,
       toolId: tool.id,
       iterationKey,
       attempt: cursor.attempt,
@@ -109,7 +113,7 @@ export async function executeLegacyToolNode(context: WorkflowAdapterContext) {
     const failure = toolRiskLevel(tool) === 'read' ? error : uncertainActionOutcome(error);
     throw await preserveActionFailure(
       failure,
-      () => failWorkflowAction(authorization.authorizationId, failure, execution.leaseOwnerId),
+      () => failWorkflowAction(authorizationId, failure, execution.leaseOwnerId),
     );
   }
 }

@@ -63,6 +63,71 @@ function visibleBounds(host: HTMLDivElement) {
   return new DOMRect(left, top, right - left, bottom - top);
 }
 
+function useDraggableChat(open: boolean) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const positionRef = useRef<Position>(storedPosition());
+  const dragRef = useRef<DragState | null>(null);
+  const suppressClickRef = useRef(false);
+
+  useEffect(() => {
+    const keepVisible = () => {
+      const host = hostRef.current;
+      if (!host) return;
+      const bounds = visibleBounds(host);
+      const padding = 8;
+      const correctionX = bounds.left < padding ? padding - bounds.left : bounds.right > window.innerWidth - padding ? window.innerWidth - padding - bounds.right : 0;
+      const correctionY = bounds.top < padding ? padding - bounds.top : bounds.bottom > window.innerHeight - padding ? window.innerHeight - padding - bounds.bottom : 0;
+      if (!correctionX && !correctionY) return;
+      positionRef.current = { x: positionRef.current.x + correctionX, y: positionRef.current.y + correctionY };
+      host.style.transform = `translate3d(${positionRef.current.x}px,${positionRef.current.y}px,0)`;
+      try { window.localStorage?.setItem(positionStorageKey, JSON.stringify(positionRef.current)); } catch { /* Position persistence is optional. */ }
+    };
+    const frame = window.requestAnimationFrame(keepVisible);
+    window.addEventListener('resize', keepVisible);
+    return () => { window.cancelAnimationFrame(frame); window.removeEventListener('resize', keepVisible); };
+  }, [open]);
+
+  const startDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const host = hostRef.current;
+    if (event.button !== 0 || !host) return;
+    dragRef.current = { pointerX: event.clientX, pointerY: event.clientY, position: { ...positionRef.current }, bounds: visibleBounds(host) };
+    suppressClickRef.current = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    host.classList.add('dragging');
+  };
+  const moveDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = dragRef.current;
+    const host = hostRef.current;
+    if (!drag || !host) return;
+    const rawX = event.clientX - drag.pointerX;
+    const rawY = event.clientY - drag.pointerY;
+    if (Math.abs(rawX) > 3 || Math.abs(rawY) > 3) suppressClickRef.current = true;
+    const padding = 8;
+    const deltaX = Math.max(padding - drag.bounds.left, Math.min(rawX, window.innerWidth - padding - drag.bounds.right));
+    const deltaY = Math.max(padding - drag.bounds.top, Math.min(rawY, window.innerHeight - padding - drag.bounds.bottom));
+    positionRef.current = { x: drag.position.x + deltaX, y: drag.position.y + deltaY };
+    host.style.transform = `translate3d(${positionRef.current.x}px,${positionRef.current.y}px,0)`;
+  };
+  const finishDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    hostRef.current?.classList.remove('dragging');
+    try { window.localStorage?.setItem(positionStorageKey, JSON.stringify(positionRef.current)); } catch { /* Position persistence is optional. */ }
+  };
+  const resetPosition = () => {
+    positionRef.current = { x: 0, y: 0 };
+    if (hostRef.current) hostRef.current.style.transform = 'translate3d(0,0,0)';
+    try { window.localStorage?.removeItem(positionStorageKey); } catch { /* Position persistence is optional. */ }
+  };
+  const shouldSuppressClick = () => {
+    if (!suppressClickRef.current) return false;
+    suppressClickRef.current = false;
+    return true;
+  };
+  return { hostRef, position: positionRef.current, startDrag, moveDrag, finishDrag, resetPosition, shouldSuppressClick };
+}
+
 export function WoodyChat({ displayName }: { displayName: string }) {
   const copilot = useCopilotContext();
   const [open, setOpen] = useState(false);
@@ -77,10 +142,7 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   const [applyingProposalId, setApplyingProposalId] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const hostRef = useRef<HTMLDivElement>(null);
-  const positionRef = useRef<Position>(storedPosition());
-  const dragRef = useRef<DragState | null>(null);
-  const suppressClickRef = useRef(false);
+  const { hostRef, position, startDrag, moveDrag, finishDrag, resetPosition, shouldSuppressClick } = useDraggableChat(open);
   const attachedContextRef = useRef('');
   const contextViewRef = useRef<CopilotContextView | null>(null);
   const creatingThreadRef = useRef<Promise<string> | null>(null);
@@ -147,23 +209,6 @@ export function WoodyChat({ displayName }: { displayName: string }) {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, pending, error]);
-  useEffect(() => {
-    const keepVisible = () => {
-      const host = hostRef.current; if (!host) return;
-      const bounds = visibleBounds(host);
-      const padding = 8;
-      const correctionX = bounds.left < padding ? padding - bounds.left : bounds.right > window.innerWidth - padding ? window.innerWidth - padding - bounds.right : 0;
-      const correctionY = bounds.top < padding ? padding - bounds.top : bounds.bottom > window.innerHeight - padding ? window.innerHeight - padding - bounds.bottom : 0;
-      if (!correctionX && !correctionY) return;
-      positionRef.current = { x: positionRef.current.x + correctionX, y: positionRef.current.y + correctionY };
-      host.style.transform = `translate3d(${positionRef.current.x}px,${positionRef.current.y}px,0)`;
-      try { window.localStorage?.setItem(positionStorageKey, JSON.stringify(positionRef.current)); } catch { /* Position persistence is optional. */ }
-    };
-    const frame = window.requestAnimationFrame(keepVisible);
-    window.addEventListener('resize', keepVisible);
-    return () => { window.cancelAnimationFrame(frame); window.removeEventListener('resize', keepVisible); };
-  }, [open]);
-
   const ensureThread = async () => {
     if (threadId) return threadId;
     creatingThreadRef.current ??= api.createChatThread().then((created) => {
@@ -305,42 +350,12 @@ export function WoodyChat({ displayName }: { displayName: string }) {
     retryPayloadByAssistantIdRef.current.clear();
     setContextView(null); setThreadId(null); setMessages([welcome(displayName)]); setAttachments([]); setError(''); setDraft('');
   };
-  const startDrag = (event: ReactPointerEvent<HTMLElement>) => {
-    if (event.button !== 0 || !hostRef.current) return;
-    dragRef.current = { pointerX: event.clientX, pointerY: event.clientY, position: { ...positionRef.current }, bounds: visibleBounds(hostRef.current) };
-    suppressClickRef.current = false;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    hostRef.current.classList.add('dragging');
-  };
-  const moveDrag = (event: ReactPointerEvent<HTMLElement>) => {
-    const drag = dragRef.current; const host = hostRef.current; if (!drag || !host) return;
-    const rawX = event.clientX - drag.pointerX;
-    const rawY = event.clientY - drag.pointerY;
-    if (Math.abs(rawX) > 3 || Math.abs(rawY) > 3) suppressClickRef.current = true;
-    const padding = 8;
-    const deltaX = Math.max(padding - drag.bounds.left, Math.min(rawX, window.innerWidth - padding - drag.bounds.right));
-    const deltaY = Math.max(padding - drag.bounds.top, Math.min(rawY, window.innerHeight - padding - drag.bounds.bottom));
-    positionRef.current = { x: drag.position.x + deltaX, y: drag.position.y + deltaY };
-    host.style.transform = `translate3d(${positionRef.current.x}px,${positionRef.current.y}px,0)`;
-  };
-  const finishDrag = (event: ReactPointerEvent<HTMLElement>) => {
-    if (!dragRef.current) return;
-    dragRef.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    hostRef.current?.classList.remove('dragging');
-    try { window.localStorage?.setItem(positionStorageKey, JSON.stringify(positionRef.current)); } catch { /* Position persistence is optional. */ }
-  };
-  const resetPosition = () => {
-    positionRef.current = { x: 0, y: 0 };
-    if (hostRef.current) hostRef.current.style.transform = 'translate3d(0,0,0)';
-    try { window.localStorage?.removeItem(positionStorageKey); } catch { /* Position persistence is optional. */ }
-  };
   const toggleOpen = () => {
-    if (suppressClickRef.current) { suppressClickRef.current = false; return; }
+    if (shouldSuppressClick()) return;
     setOpen((value) => !value);
   };
 
-  return <div ref={hostRef} className={`woody-chat ${open ? 'open' : ''}`} style={{ transform: `translate3d(${positionRef.current.x}px,${positionRef.current.y}px,0)` }}>
+  return <div ref={hostRef} className={`woody-chat ${open ? 'open' : ''}`} style={{ transform: `translate3d(${position.x}px,${position.y}px,0)` }}>
     {open && <section className="woody-chat-panel" role="dialog" aria-label="Chat with Woody" aria-modal="false">
       <header className="woody-chat-header">
         <div className="woody-chat-drag-handle" onPointerDown={startDrag} onPointerMove={moveDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} title="Drag to move Woody">

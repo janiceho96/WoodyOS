@@ -41,6 +41,26 @@ export function resolveBinding(edge: ContractBinding, nodes: Map<string, Workflo
 
 /** Contract compatibility is deliberately strict: only identical JSON value shapes (or any)
  * are accepted. Required output into an optional target is safe; no scalar/object/array coercion occurs. */
+function arrayContractCompatible(binding: ResolvedBinding): boolean {
+  if (binding.targetSchema.items && !binding.sourceSchema.items) return false;
+  if (binding.sourceSchema.items && binding.targetSchema.items) {
+    return contractCompatible({ ...binding, nullable: false, sourceSchema: binding.sourceSchema.items, targetSchema: binding.targetSchema.items });
+  }
+  return true;
+}
+
+function objectContractCompatible(binding: ResolvedBinding): boolean {
+  if (!binding.targetSchema.properties) return true;
+  for (const [key, targetProperty] of Object.entries(binding.targetSchema.properties)) {
+    const sourceProperty = binding.sourceSchema.properties?.[key];
+    const sourceMayOmitRequiredValue = !sourceProperty || !binding.sourceSchema.required?.includes(key);
+    const targetRequiresValue = binding.targetSchema.required?.includes(key) ?? false;
+    if (sourceMayOmitRequiredValue && targetRequiresValue) return false;
+    if (sourceProperty && !contractCompatible({ ...binding, nullable: false, sourceSchema: sourceProperty, targetSchema: targetProperty })) return false;
+  }
+  return true;
+}
+
 export function contractCompatible(binding: ResolvedBinding): boolean {
   const source = binding.sourceSchema.type; const target = binding.targetSchema.type;
   // Dry-run must never promise a conversion that the runtime does not perform.
@@ -48,17 +68,8 @@ export function contractCompatible(binding: ResolvedBinding): boolean {
   if (!source || !target || source === 'any' || target === 'any') return true;
   if (source !== target) return false;
   if ((binding.nullable || binding.sourceSchema.nullable) && !binding.targetSchema.nullable) return false;
-  if (source === 'array' && binding.targetSchema.items && !binding.sourceSchema.items) return false;
-  if (source === 'array' && binding.sourceSchema.items && binding.targetSchema.items) {
-    return contractCompatible({ ...binding, nullable: false, sourceSchema: binding.sourceSchema.items, targetSchema: binding.targetSchema.items });
-  }
-  if (source === 'object' && binding.targetSchema.properties) {
-    for (const [key, targetProperty] of Object.entries(binding.targetSchema.properties)) {
-      const sourceProperty = binding.sourceSchema.properties?.[key];
-      if ((!sourceProperty || !binding.sourceSchema.required?.includes(key)) && binding.targetSchema.required?.includes(key)) return false;
-      if (sourceProperty && !contractCompatible({ ...binding, nullable: false, sourceSchema: sourceProperty, targetSchema: targetProperty })) return false;
-    }
-  }
+  if (source === 'array') return arrayContractCompatible(binding);
+  if (source === 'object') return objectContractCompatible(binding);
   return true;
 }
 

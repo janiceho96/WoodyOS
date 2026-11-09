@@ -1,7 +1,9 @@
 import type { WorkflowDefinition, WorkflowNodeCatalogEntry } from '../../api';
 
 type WorkflowEdge = WorkflowDefinition['edges'][number];
+type WorkflowNode = WorkflowDefinition['nodes'][number];
 type WorkflowNodeType = WorkflowDefinition['nodes'][number]['type'];
+type WorkflowPort = WorkflowNodeCatalogEntry['outputPorts'][number];
 type WorkflowConnection = {
   source?: string | null;
   target?: string | null;
@@ -75,39 +77,29 @@ function resolvePort(
   };
 }
 
-export function mutateWorkflowEdge(input: {
+function connectionEndpoints(input: {
   nodes: WorkflowDefinition['nodes'];
   edges: WorkflowDefinition['edges'];
-  catalog: WorkflowNodeCatalogEntry[];
   connection: WorkflowConnection;
-  previous?: WorkflowEdge;
-}): { edges: WorkflowDefinition['edges']; error?: string } {
+}) {
   const { connection, edges } = input;
   if (!connection.source || !connection.target || connection.source === connection.target) {
-    return { edges, error: 'Connect two different nodes.' };
+    return { error: 'Connect two different nodes.' as const };
   }
   const source = input.nodes.find((node) => node.id === connection.source);
   const target = input.nodes.find((node) => node.id === connection.target);
   if (!source || !target || target.type === 'trigger' || source.type === 'output') {
-    return { edges, error: 'That connection direction is not valid.' };
+    return { error: 'That connection direction is not valid.' as const };
   }
-  const sourceResult = resolvePort(input.catalog, source.type, 'source', connection.sourceHandle);
-  if (!sourceResult.port) return { edges, error: sourceResult.error };
-  const targetResult = resolvePort(input.catalog, target.type, 'target', connection.targetHandle);
-  if (!targetResult.port) return { edges, error: targetResult.error };
-  const sourcePort = sourceResult.port;
-  const targetPort = targetResult.port;
-  if (sourcePort.dataType !== 'any'
-    && targetPort.dataType !== 'any'
-    && sourcePort.dataType !== targetPort.dataType) {
-    return {
-      edges,
-      error: `${sourcePort.label} produces ${sourcePort.dataType}, but ${targetPort.label} expects ${targetPort.dataType}.`,
-    };
-  }
-  const derived = deriveWorkflowEdgeCondition(source.type, target.type, sourcePort.id);
-  if (derived.error) return { edges, error: derived.error };
-  const nextEdge: WorkflowEdge = {
+  return { source, target, edges };
+}
+
+function compatibleDataTypes(sourceType: string, targetType: string) {
+  return sourceType === 'any' || targetType === 'any' || sourceType === targetType;
+}
+
+function connectionEdge(source: WorkflowNode, target: WorkflowNode, sourcePort: WorkflowPort, targetPort: WorkflowPort, condition?: string): WorkflowEdge {
+  return {
     source: source.id,
     target: target.id,
     sourcePort: sourcePort.id,
@@ -116,23 +108,28 @@ export function mutateWorkflowEdge(input: {
     targetSchema: schemaFor(targetPort.dataType),
     required: Boolean(targetPort.required),
     nullable: false,
-    ...(derived.condition ? { condition: derived.condition } : {}),
+    ...(condition ? { condition } : {}),
   };
-  const identityIndex = input.previous ? edges.indexOf(input.previous) : -1;
+}
+
+function placeWorkflowEdge(
+  input: { edges: WorkflowDefinition['edges']; previous?: WorkflowEdge },
+  nextEdge: WorkflowEdge,
+  source: WorkflowNode,
+) {
+  const identityIndex = input.previous ? input.edges.indexOf(input.previous) : -1;
   const previousIndex = input.previous && identityIndex < 0
-    ? edges.findIndex((edge) => sameEdge(edge, input.previous!))
+    ? input.edges.findIndex((edge) => sameEdge(edge, input.previous!))
     : identityIndex;
-  const withoutPrevious = edges.filter((_, index) => index !== previousIndex);
+  const withoutPrevious = input.edges.filter((_, index) => index !== previousIndex);
   if (withoutPrevious.some((edge) => sameEdge(edge, nextEdge))) {
-    return { edges, error: 'That connection already exists.' };
+    return { error: 'That connection already exists.' as const };
   }
   const replaceableIndex = !['condition', 'loop'].includes(source.type)
     ? withoutPrevious.findIndex((edge) => edge.source === source.id && edge.condition !== 'continue')
     : -1;
   if (replaceableIndex >= 0) {
-    return {
-      edges: withoutPrevious.map((edge, index) => index === replaceableIndex ? nextEdge : edge),
-    };
+    return { edges: withoutPrevious.map((edge, index) => index === replaceableIndex ? nextEdge : edge) };
   }
   const insertionIndex = previousIndex >= 0 ? Math.min(previousIndex, withoutPrevious.length) : withoutPrevious.length;
   return {
@@ -142,6 +139,35 @@ export function mutateWorkflowEdge(input: {
       ...withoutPrevious.slice(insertionIndex),
     ],
   };
+}
+
+export function mutateWorkflowEdge(input: {
+  nodes: WorkflowDefinition['nodes'];
+  edges: WorkflowDefinition['edges'];
+  catalog: WorkflowNodeCatalogEntry[];
+  connection: WorkflowConnection;
+  previous?: WorkflowEdge;
+}): { edges: WorkflowDefinition['edges']; error?: string } {
+  const endpoints = connectionEndpoints(input);
+  if ('error' in endpoints) return { edges: input.edges, error: endpoints.error };
+  const { source, target, edges } = endpoints;
+  const sourceResult = resolvePort(input.catalog, source.type, 'source', input.connection.sourceHandle);
+  if (!sourceResult.port) return { edges, error: sourceResult.error };
+  const targetResult = resolvePort(input.catalog, target.type, 'target', input.connection.targetHandle);
+  if (!targetResult.port) return { edges, error: targetResult.error };
+  const sourcePort = sourceResult.port;
+  const targetPort = targetResult.port;
+  if (!compatibleDataTypes(sourcePort.dataType, targetPort.dataType)) {
+    return {
+      edges,
+      error: `${sourcePort.label} produces ${sourcePort.dataType}, but ${targetPort.label} expects ${targetPort.dataType}.`,
+    };
+  }
+  const derived = deriveWorkflowEdgeCondition(source.type, target.type, sourcePort.id);
+  if (derived.error) return { edges, error: derived.error };
+  const nextEdge = connectionEdge(source, target, sourcePort, targetPort, derived.condition);
+  const placed = placeWorkflowEdge(input, nextEdge, source);
+  return 'error' in placed ? { edges, error: placed.error } : placed;
 }
 
 export function insertNodeOnEdge(

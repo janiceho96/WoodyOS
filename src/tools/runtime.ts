@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { decryptJson } from '../lib/crypto.js';
 import { isPublicIp } from '../lib/network.js';
+import { safeHttpRequest } from './web/http.js';
 import type { Tool } from '@anthropic-ai/sdk/resources/messages/messages.js';
 import { invokeJobTool, isJobToolConfig } from './jobs/index.js';
 import { invokeWebTool, isWebToolConfig } from './web/index.js';
@@ -42,7 +43,9 @@ export function toolRiskLevel(tool: ToolRecord): ToolRiskLevel {
 export async function safeEndpoint(raw: string) {
   const url = new URL(raw);
   if (url.protocol !== 'https:') throw new Error('Tool endpoints must use HTTPS');
+  if (url.username || url.password) throw new Error('Tool endpoint credentials must be sent with headers');
   const addresses = await lookup(url.hostname, { all: true, verbatim: true });
+  if (!addresses.length) throw new Error('Tool endpoint hostname could not be resolved');
   for (const { address } of addresses) {
     if (!isPublicIp(address)) throw new Error('Non-public tool endpoints are not allowed');
   }
@@ -63,10 +66,10 @@ function retryAfterMs(value: string | null) {
   return Math.min(maxRetryAfterMs, Math.max(0, timestamp - Date.now()));
 }
 
-function toolHttpError(response: Response) {
+function toolHttpError(response: { status: number; headers: Record<string, string> }) {
   const message = `Tool request failed with HTTP ${response.status}`;
   if (response.status === 429) {
-    const retryAfter = retryAfterMs(response.headers.get('retry-after'));
+    const retryAfter = retryAfterMs(response.headers['retry-after'] ?? null);
     return runtimeError('TOOL_RATE_LIMITED', {
       category: 'rate_limited',
       retryable: true,
@@ -128,9 +131,13 @@ function toolEndpointError(error: unknown, callerSignal: AbortSignal | undefined
   if (
     message === 'Tool endpoints must use HTTPS'
     || message === 'Non-public tool endpoints are not allowed'
+    || message === 'Tool endpoint credentials must be sent with headers'
+    || message === 'Tool endpoint hostname could not be resolved'
+    || /private, local, and reserved|hostname resolves to a private|Only HTTPS addresses|Credentials are not allowed inside URLs|Cross-origin redirects are blocked|External redirect was blocked|Credential-bearing cross-origin redirects are blocked/i.test(message)
     || (
       error instanceof TypeError
-      && (!('code' in error) || error.code === 'ERR_INVALID_URL')
+      && 'code' in error
+      && error.code === 'ERR_INVALID_URL'
     )
   ) {
     return runtimeError('TOOL_ENDPOINT_INVALID', {
@@ -150,16 +157,46 @@ export function definitionFor(tool: ToolRecord): Tool {
   return { name: `tool_${tool.id.replaceAll('-', '_')}`, description: String(config.agentDescription ?? tool.name), input_schema: inputSchema as Tool['input_schema'] };
 }
 
-export async function invokeTool(
-  tool: ToolRecord,
-  input: Record<string, unknown>,
-  healthCheck = false,
-  callerSignal?: AbortSignal,
-) {
-  if (callerSignal?.aborted) throw cancellationError(callerSignal.reason);
-  const config = decryptJson(tool.config);
-  if (isWebToolConfig(config)) return invokeWebTool(config, input, healthCheck, callerSignal);
-  if (isJobToolConfig(config)) return invokeJobTool(config, input, healthCheck, callerSignal);
+type PreparedToolRequest = { endpoint: URL; init: RequestInit; timeoutSignal: AbortSignal };
+
+function toolRequestInit(tool: ToolRecord, config: Record<string, unknown>, input: Record<string, unknown>, healthCheck: boolean, timeout: AbortSignal, endpoint: URL, headers: Record<string, string>): RequestInit {
+  if (healthCheck) return { method: 'GET', signal: timeout, headers };
+  if (tool.kind === 'mcp') {
+    return {
+      method: 'POST',
+      signal: timeout,
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method: 'tools/call',
+        params: { name: String(config.mcpToolName ?? tool.name), arguments: input },
+      }),
+    };
+  }
+  const method = String(config.method ?? 'POST').toUpperCase();
+  if (!['GET', 'POST'].includes(method)) {
+    throw runtimeError('TOOL_METHOD_INVALID', {
+      category: 'validation',
+      retryable: false,
+      message: 'Tool method configuration is invalid',
+    });
+  }
+  if (method === 'GET') {
+    Object.entries(input).forEach(([key, value]) => endpoint.searchParams.set(
+      key,
+      typeof value === 'string' ? value : JSON.stringify(value),
+    ));
+  }
+  return {
+    method,
+    signal: timeout,
+    headers: method === 'POST' ? { 'content-type': 'application/json', ...headers } : headers,
+    body: method === 'POST' ? JSON.stringify(input) : undefined,
+  };
+}
+
+async function prepareToolRequest(tool: ToolRecord, config: Record<string, unknown>, input: Record<string, unknown>, healthCheck: boolean, callerSignal?: AbortSignal): Promise<PreparedToolRequest> {
   const healthUrl = config.healthCheckUrl;
   if (healthCheck && typeof healthUrl !== 'string') throw new Error('A healthCheckUrl is required to test this tool safely');
   const timeoutSignal = AbortSignal.timeout(toolRequestTimeoutMs);
@@ -171,66 +208,47 @@ export async function invokeTool(
   }
   const headers = headersFrom(config.headers);
   const timeout = combineAbortSignals([callerSignal, timeoutSignal]);
-  let request: { endpoint: URL; init: RequestInit };
   try {
-    let init: RequestInit;
-    if (healthCheck) {
-      init = { method: 'GET', signal: timeout, headers };
-    } else if (tool.kind === 'mcp') {
-      init = {
-        method: 'POST',
-        signal: timeout,
-        headers: { 'content-type': 'application/json', ...headers },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: crypto.randomUUID(),
-          method: 'tools/call',
-          params: { name: String(config.mcpToolName ?? tool.name), arguments: input },
-        }),
-      };
-    } else {
-      const method = String(config.method ?? 'POST').toUpperCase();
-      if (!['GET', 'POST'].includes(method)) throw runtimeError('TOOL_METHOD_INVALID', {
-        category: 'validation',
-        retryable: false,
-        message: 'Tool method configuration is invalid',
-      });
-      if (method === 'GET') {
-        Object.entries(input).forEach(([key, value]) => endpoint.searchParams.set(
-          key,
-          typeof value === 'string' ? value : JSON.stringify(value),
-        ));
-      }
-      init = {
-        method,
-        signal: timeout,
-        headers: method === 'POST' ? { 'content-type': 'application/json', ...headers } : headers,
-        body: method === 'POST' ? JSON.stringify(input) : undefined,
-      };
-    }
-    // Construct once before dispatch so invalid headers/body/options cannot be
-    // mistaken for a transport failure thrown by the actual fetch.
+    const init = toolRequestInit(tool, config, input, healthCheck, timeout, endpoint, headers);
+    // Construct once before dispatch so invalid headers/body/options cannot be mistaken for transport failure.
     void new Request(endpoint, init);
-    request = { endpoint, init };
+    return { endpoint, init, timeoutSignal };
   } catch (error) {
     throw toolRequestError(error);
   }
-  let response: Response;
-  try {
-    response = await fetch(request.endpoint, request.init);
-  } catch (error) {
-    throw toolTransportError(error, callerSignal, timeoutSignal);
-  }
-  if (!response.ok) {
-    void response.body?.cancel().catch(() => undefined);
-    throw toolHttpError(response);
-  }
-  let body: string;
-  try {
-    body = await response.text();
-  } catch (error) {
-    throw toolTransportError(error, callerSignal, timeoutSignal);
-  }
+}
+
+function parseToolResponse(body: string) {
   const limited = body.slice(0, 50_000);
-  try { return JSON.parse(limited) as unknown; } catch { return { text: limited }; }
+  try { return JSON.parse(limited) as unknown; }
+  catch { return { text: limited }; }
+}
+
+export async function invokeTool(
+  tool: ToolRecord,
+  input: Record<string, unknown>,
+  healthCheck = false,
+  callerSignal?: AbortSignal,
+) {
+  if (callerSignal?.aborted) throw cancellationError(callerSignal.reason);
+  const config = decryptJson(tool.config);
+  if (isWebToolConfig(config)) return invokeWebTool(config, input, healthCheck, callerSignal);
+  if (isJobToolConfig(config)) return invokeJobTool(config, input, healthCheck, callerSignal);
+  const request = await prepareToolRequest(tool, config, input, healthCheck, callerSignal);
+  let response: Awaited<ReturnType<typeof safeHttpRequest>>;
+  try {
+    response = await safeHttpRequest(request.endpoint.toString(), {
+      method: request.init.method as 'GET' | 'POST',
+      headers: Object.fromEntries(new Headers(request.init.headers).entries()),
+      ...(typeof request.init.body === 'string' ? { body: request.init.body } : {}),
+      signal: request.init.signal ?? undefined,
+      timeoutMs: toolRequestTimeoutMs,
+      maxBytes: 5_000_000,
+      maxRedirects: 3,
+    });
+  } catch (error) {
+    throw toolEndpointError(error, callerSignal, request.timeoutSignal);
+  }
+  if (response.status < 200 || response.status >= 300) throw toolHttpError(response);
+  return parseToolResponse(response.body.toString('utf8'));
 }

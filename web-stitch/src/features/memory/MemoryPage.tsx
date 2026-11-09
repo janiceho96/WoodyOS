@@ -74,7 +74,6 @@ export function MemoryPage() {
 function MemoryCard({ memory, agentName, pending, onAction, edit, supersede }: { memory: ManagedMemory; agentName?: string; pending: boolean; onAction: (action: Action) => void; edit: () => void; supersede: () => void }) {
   const expired = Boolean(memory.expires_at && new Date(memory.expires_at) <= new Date());
   const eligible = memory.verification_status !== 'disputed' && memory.verification_status !== 'superseded' && !expired;
-  const pinLabel = memory.importance >= .8 ? 'Unpin memory' : 'Pin memory';
   const provenance = memory.metadata.provenance;
   const provenanceRecord = provenance && typeof provenance === 'object' && !Array.isArray(provenance)
     ? provenance as Record<string, unknown>
@@ -85,8 +84,24 @@ function MemoryCard({ memory, agentName, pending, onAction, edit, supersede }: {
   return <article className="panel memory-card"><div className="memory-card-head"><div><span className="eyebrow">{label(memory.memory_type)} · {label(memory.scope)} scope</span><p>{memory.content}</p></div><div className="memory-statuses"><Status value={memory.verification_status}/>{expired && <Status value="expired"/>}</div></div>
     <dl className="memory-facts"><div><dt>Source</dt><dd>{memory.source_type}{memory.source_id ? ` · ${memory.source_id}` : ''}</dd></div><div><dt>Provenance</dt><dd>{provenanceText}</dd></div><div><dt>Agent</dt><dd>{agentName ?? memory.agent_id ?? 'Workspace governed'}</dd></div><div><dt>Expiry</dt><dd>{memory.expires_at ? new Date(memory.expires_at).toLocaleString() : 'No expiry'}</dd></div><div><dt>Accesses</dt><dd>{memory.access_count}{memory.last_accessed_at ? ` · last ${new Date(memory.last_accessed_at).toLocaleString()}` : ''}</dd></div><div><dt>Importance</dt><dd>{Math.round(memory.importance * 100)}%</dd></div><div><dt>Confidence</dt><dd>{Math.round(memory.confidence * 100)}%</dd></div>{memory.superseded_by && <div><dt>Replacement</dt><dd>{memory.superseded_by}</dd></div>}</dl>
     {!eligible && <p className="memory-eligibility"><ShieldAlert size={15}/>Not eligible for retrieval</p>}
-    <div className="memory-actions"><button className="button" disabled={pending || memory.verification_status === 'user_confirmed'} onClick={() => onAction({ kind: 'confirm', memory })}><CheckCircle2 size={14}/>Confirm</button><button className="button" disabled={pending || memory.verification_status === 'disputed' || memory.verification_status === 'superseded'} onClick={() => onAction({ kind: 'dispute', memory })}>Dispute</button><button className="button" disabled={pending || memory.verification_status === 'superseded'} onClick={supersede}>Supersede</button><button className="button" disabled={pending || memory.verification_status === 'superseded'} onClick={edit}><Edit3 size={14}/>Edit</button><button className="button" disabled={pending || memory.verification_status === 'superseded'} onClick={() => onAction({ kind: 'pin', memory, importance: memory.importance >= .8 ? .5 : 1 })}><Pin size={14}/>{pinLabel}</button><button className="button" disabled={pending || expired || memory.verification_status === 'superseded'} onClick={() => onAction({ kind: 'expire', memory })}><Clock3 size={14}/>Expire</button><button className="button danger" aria-label="Delete memory" disabled={pending} onClick={() => { if (window.confirm('Delete this memory permanently? This cannot be undone.')) onAction({ kind: 'delete', memory }); }}><Trash2 size={14}/>Delete</button></div>
+    <MemoryCardActions memory={memory} expired={expired} pending={pending} onAction={onAction} edit={edit} supersede={supersede}/>
   </article>;
+}
+
+function MemoryCardActions({ memory, expired, pending, onAction, edit, supersede }: {
+  memory: ManagedMemory;
+  expired: boolean;
+  pending: boolean;
+  onAction: (action: Action) => void;
+  edit: () => void;
+  supersede: () => void;
+}) {
+  const superseded = memory.verification_status === 'superseded';
+  const pinLabel = memory.importance >= .8 ? 'Unpin memory' : 'Pin memory';
+  const remove = () => {
+    if (window.confirm('Delete this memory permanently? This cannot be undone.')) onAction({ kind: 'delete', memory });
+  };
+  return <div className="memory-actions"><button className="button" disabled={pending || memory.verification_status === 'user_confirmed'} onClick={() => onAction({ kind: 'confirm', memory })}><CheckCircle2 size={14}/>Confirm</button><button className="button" disabled={pending || memory.verification_status === 'disputed' || superseded} onClick={() => onAction({ kind: 'dispute', memory })}>Dispute</button><button className="button" disabled={pending || superseded} onClick={supersede}>Supersede</button><button className="button" disabled={pending || superseded} onClick={edit}><Edit3 size={14}/>Edit</button><button className="button" disabled={pending || superseded} onClick={() => onAction({ kind: 'pin', memory, importance: memory.importance >= .8 ? .5 : 1 })}><Pin size={14}/>{pinLabel}</button><button className="button" disabled={pending || expired || superseded} onClick={() => onAction({ kind: 'expire', memory })}><Clock3 size={14}/>Expire</button><button className="button danger" aria-label="Delete memory" disabled={pending} onClick={remove}><Trash2 size={14}/>Delete</button></div>;
 }
 
 function EditMemoryModal({ memory, agents, pending, error, close, save }: { memory: ManagedMemory; agents: Array<{ id: string; name: string }>; pending: boolean; error: Error | null; close: () => void; save: (body: Parameters<typeof api.updateMemory>[1]) => void }) {

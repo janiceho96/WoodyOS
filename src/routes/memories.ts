@@ -70,40 +70,58 @@ const supersedeInput = z.object({
   replacement: createInput.optional(),
 }).refine((value) => Boolean(value.replacementMemoryId || value.replacement), { message: 'replacementMemoryId or replacement is required' });
 
-export async function memoryRoutes(app: FastifyInstance) {
+function registerMemoryListRoute(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const filters = parse(listQuery, request.query, reply); if (!filters) return;
     const memories = await listEligibleMemories({ workspaceId: request.user.workspaceId, ...filters });
     return { data: memories.map(serializeMemory) };
   }));
 
+}
+
+function registerMemoryManagementRoute(app: FastifyInstance) {
   app.get('/manage', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const filters = parse(managementListQuery, request.query, reply); if (!filters) return;
     const result = await listManagedMemories({ workspaceId: request.user.workspaceId, ...filters });
     return { data: result.memories.map(serializeMemory), pagination: result.pagination };
   }));
 
+}
+
+function registerMemoryCreateRoute(app: FastifyInstance) {
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(createInput, request.body, reply); if (!input) return;
     const memory = await createMemory({ ...input, workspaceId: request.user.workspaceId, userId: request.user.sub, actor: { type: 'user', id: request.user.sub } });
     return reply.code(201).send(serializeMemory(memory));
   }));
 
+}
+
+function registerMemoryConfirmRoute(app: FastifyInstance) {
   app.post('/:id/confirm', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
     return serializeMemory(await confirmMemory({ workspaceId: request.user.workspaceId, memoryId: params.id, actorId: request.user.sub }));
   }));
 
+}
+
+function registerMemoryDisputeRoute(app: FastifyInstance) {
   app.post('/:id/dispute', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
     return serializeMemory(await disputeMemory({ workspaceId: request.user.workspaceId, memoryId: params.id, actorId: request.user.sub }));
   }));
 
+}
+
+function registerMemoryExpireRoute(app: FastifyInstance) {
   app.post('/:id/expire', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
     return serializeMemory(await expireMemory({ workspaceId: request.user.workspaceId, memoryId: params.id }));
   }));
 
+}
+
+function registerMemorySupersedeRoute(app: FastifyInstance) {
   app.post('/:id/supersede', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
     const input = parse(supersedeInput, request.body, reply); if (!input) return;
@@ -116,6 +134,9 @@ export async function memoryRoutes(app: FastifyInstance) {
     return { memory: serializeMemory(result.memory), replacement: serializeMemory(result.replacement) };
   }));
 
+}
+
+function registerMemoryUpdateRoute(app: FastifyInstance) {
   app.patch('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
     const input = parse(updateInput, request.body, reply); if (!input) return;
@@ -127,9 +148,24 @@ export async function memoryRoutes(app: FastifyInstance) {
     }));
   }));
 
+}
+
+function registerMemoryDeleteRoute(app: FastifyInstance) {
   app.delete('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply); if (!params) return;
     await deleteMemory({ workspaceId: request.user.workspaceId, memoryId: params.id });
     return reply.code(204).send();
   }));
+}
+
+export async function memoryRoutes(app: FastifyInstance) {
+  registerMemoryListRoute(app);
+  registerMemoryManagementRoute(app);
+  registerMemoryCreateRoute(app);
+  registerMemoryConfirmRoute(app);
+  registerMemoryDisputeRoute(app);
+  registerMemoryExpireRoute(app);
+  registerMemorySupersedeRoute(app);
+  registerMemoryUpdateRoute(app);
+  registerMemoryDeleteRoute(app);
 }

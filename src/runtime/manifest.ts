@@ -157,26 +157,38 @@ function forbiddenSensitiveField(value: unknown): boolean {
     .some(([key, item]) => sensitiveKey.test(key) || forbiddenSensitiveField(item));
 }
 
+function manifestCompatibilityReasons(value: Record<string, unknown>) {
+  const reasons: string[] = [];
+  if (value.manifestVersion !== 1) reasons.push(`Unsupported manifest version ${String(value.manifestVersion)}`);
+  if (value.compatibility === 'legacy_partial') reasons.push('Execution manifest is a legacy partial snapshot');
+  else if (value.compatibility !== 'exact') reasons.push('Execution manifest compatibility is invalid');
+  return reasons;
+}
+
+function runtimeSchemaReason(value: Record<string, unknown>) {
+  const runtime = value.runtime && typeof value.runtime === 'object' && !Array.isArray(value.runtime)
+    ? value.runtime as Record<string, unknown>
+    : null;
+  if (value.compatibility !== 'exact' || !runtime || runtime.stateSchemaVersion === 1) return null;
+  return `Unsupported runtime state schema ${String(runtime.stateSchemaVersion)}`;
+}
+
+function exactManifestShapeReason(value: Record<string, unknown>, reasons: string[]) {
+  if (value.compatibility !== 'exact' || reasons.length > 0 || exactManifestSchema.safeParse(value).success) return null;
+  return 'Execution manifest is malformed';
+}
+
 export function validateManifestCompatibility(manifest: unknown): { ok: boolean; reasons: string[] } {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
     return { ok: false, reasons: ['Execution manifest is missing'] };
   }
   const value = manifest as Record<string, unknown>;
-  const reasons: string[] = [];
-  if (value.manifestVersion !== 1) reasons.push(`Unsupported manifest version ${String(value.manifestVersion)}`);
-  if (value.compatibility === 'legacy_partial') reasons.push('Execution manifest is a legacy partial snapshot');
-  else if (value.compatibility !== 'exact') reasons.push('Execution manifest compatibility is invalid');
-  const runtime = value.runtime && typeof value.runtime === 'object' && !Array.isArray(value.runtime)
-    ? value.runtime as Record<string, unknown>
-    : null;
-  if (value.compatibility === 'exact' && runtime && runtime.stateSchemaVersion !== 1) {
-    reasons.push(`Unsupported runtime state schema ${String(runtime.stateSchemaVersion)}`);
-  }
-  const containsSensitiveField = forbiddenSensitiveField(value);
-  if (containsSensitiveField) reasons.push('Execution manifest contains forbidden sensitive fields');
-  if (value.compatibility === 'exact' && reasons.length === 0 && !exactManifestSchema.safeParse(value).success) {
-    reasons.push('Execution manifest is malformed');
-  }
+  const reasons = manifestCompatibilityReasons(value);
+  const schemaReason = runtimeSchemaReason(value);
+  if (schemaReason) reasons.push(schemaReason);
+  if (forbiddenSensitiveField(value)) reasons.push('Execution manifest contains forbidden sensitive fields');
+  const shapeReason = exactManifestShapeReason(value, reasons);
+  if (shapeReason) reasons.push(shapeReason);
   return { ok: reasons.length === 0, reasons };
 }
 

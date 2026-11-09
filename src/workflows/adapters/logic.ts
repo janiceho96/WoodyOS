@@ -201,85 +201,123 @@ async function persistPendingQualityIteration(context: WorkflowAdapterContext) {
   });
 }
 
+type LoopResult = { branch: 'body' | 'done'; output: Record<string, unknown> };
+
+function limitedLoopResult(node: WorkflowNode, iteration: number, maxIterations: number, onLimit: string): LoopResult {
+  if (onLimit === 'exit') return { branch: 'done', output: { iterations: iteration, reason: 'limit_exit' } };
+  throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
+}
+
+function forEachLoopResult(
+  node: WorkflowNode,
+  cursor: WorkflowCursor,
+  state: Record<string, unknown>,
+  iteration: number,
+  maxIterations: number,
+  onLimit: string,
+): LoopResult {
+  const collection = valueAtPath(state, String(node.config.collectionPath ?? ''));
+  if (!Array.isArray(collection)) throw new Error(`Loop ${node.id} collection is not an array`);
+  if (iteration >= collection.length) return { branch: 'done', output: { iterations: iteration, reason: 'collection_complete' } };
+  if (iteration >= maxIterations) return limitedLoopResult(node, iteration, maxIterations, onLimit);
+
+  const itemVariable = String(node.config.itemVariable ?? 'item');
+  const indexVariable = String(node.config.indexVariable ?? 'index');
+  state[itemVariable] = collection[iteration];
+  state[indexVariable] = iteration;
+  cursor.loops[node.id] = { iteration };
+  return { branch: 'body', output: { iteration, item: collection[iteration] } };
+}
+
+function qualityLoopResult(
+  node: WorkflowNode,
+  cursor: WorkflowCursor,
+  state: Record<string, unknown>,
+  iteration: number,
+  maxIterations: number,
+  onLimit: string,
+): LoopResult | null {
+  const quality = node.config.quality && typeof node.config.quality === 'object' && !Array.isArray(node.config.quality)
+    ? node.config.quality as Record<string, unknown>
+    : null;
+  if (!quality) return null;
+
+  const nodes = state.nodes && typeof state.nodes === 'object' && !Array.isArray(state.nodes)
+    ? state.nodes as Record<string, unknown>
+    : {};
+  const graderNodeId = String(quality.graderNodeId ?? 'grader');
+  const workerNodeId = String(quality.workerNodeId ?? 'worker');
+  const revisionNodeId = String(quality.revisionNodeId ?? workerNodeId);
+  const grader = nodes[graderNodeId] && typeof nodes[graderNodeId] === 'object' && !Array.isArray(nodes[graderNodeId])
+    ? nodes[graderNodeId] as Record<string, unknown>
+    : {};
+  const verdict = grader.data && typeof grader.data === 'object' && !Array.isArray(grader.data)
+    ? grader.data as Record<string, unknown>
+    : null;
+  if (!verdict) return null;
+
+  const historyRoot = state.qualityHistory && typeof state.qualityHistory === 'object' && !Array.isArray(state.qualityHistory)
+    ? state.qualityHistory as Record<string, unknown>
+    : {};
+  const storedHistory = historyRoot[node.id];
+  const materialized = storedHistory && typeof storedHistory === 'object' && !Array.isArray(storedHistory)
+    ? storedHistory as Partial<QualityMaterialization>
+    : null;
+  const history = Array.isArray(storedHistory) ? storedHistory as Array<Record<string, unknown>> : [];
+  const materializedCurrent = materialized?.current?.iteration === iteration
+    ? materialized.current
+    : null;
+  if (iteration > 0 && !materializedCurrent && !history.some((entry) => entry.iteration === iteration)) {
+    const candidateNodeId = iteration === 1 ? workerNodeId : revisionNodeId;
+    history.push({ iteration, candidate: nodes[candidateNodeId] ?? null, verdict, revisionAgentNodeId: candidateNodeId });
+    historyRoot[node.id] = history;
+    state.qualityHistory = historyRoot;
+  }
+
+  const passingScore = Number(node.config.passingScore ?? 0);
+  const passed = verdict.passed === true && typeof verdict.score === 'number' && verdict.score >= passingScore;
+  const latest = materializedCurrent ?? history.at(-1);
+  const historyOutput = materialized ? materialized.entryIds ?? [] : history;
+  if (passed) {
+    return { branch: 'done', output: { iterations: iteration, reason: 'quality_passed', candidate: latest?.candidate ?? null, verdict, history: historyOutput } };
+  }
+  if (iteration >= maxIterations) {
+    if (onLimit === 'exit') {
+      return { branch: 'done', output: { iterations: iteration, reason: 'limit_exit', candidate: latest?.candidate ?? null, verdict, history: historyOutput, warning: 'Quality threshold was not reached before the revision limit.' } };
+    }
+    throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
+  }
+  cursor.loops[node.id] = { iteration };
+  return { branch: 'body', output: { iteration, condition: true, verdict } };
+}
+
+function whileLoopResult(
+  node: WorkflowNode,
+  cursor: WorkflowCursor,
+  state: Record<string, unknown>,
+  iteration: number,
+  maxIterations: number,
+  onLimit: string,
+): LoopResult {
+  const condition = node.config.condition;
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) throw new Error(`Loop ${node.id} has no valid while condition`);
+  const shouldContinue = evaluateCondition(condition as Record<string, unknown>, state);
+  if (!shouldContinue) return { branch: 'done', output: { iterations: iteration, reason: 'condition_false' } };
+  if (iteration >= maxIterations) return limitedLoopResult(node, iteration, maxIterations, onLimit);
+  cursor.loops[node.id] = { iteration };
+  return { branch: 'body', output: { iteration, condition: true } };
+}
+
 export function loopResult(node: WorkflowNode, cursor: WorkflowCursor, state: Record<string, unknown>) {
   const mode = String(node.config.mode ?? 'forEach');
   const maxIterations = Number(node.config.maxIterations ?? 10);
   const onLimit = String(node.config.onLimit ?? 'fail');
   const loop = cursor.loops[node.id] ?? { iteration: 0 };
   if (mode === 'forEach') {
-    const collection = valueAtPath(state, String(node.config.collectionPath ?? ''));
-    if (!Array.isArray(collection)) throw new Error(`Loop ${node.id} collection is not an array`);
-    if (loop.iteration >= collection.length) return { branch: 'done', output: { iterations: loop.iteration, reason: 'collection_complete' } };
-    if (loop.iteration >= maxIterations) {
-      if (onLimit === 'exit') return { branch: 'done', output: { iterations: loop.iteration, reason: 'limit_exit' } };
-      throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
-    }
-    const itemVariable = String(node.config.itemVariable ?? 'item');
-    const indexVariable = String(node.config.indexVariable ?? 'index');
-    state[itemVariable] = collection[loop.iteration];
-    state[indexVariable] = loop.iteration;
-    cursor.loops[node.id] = loop;
-    return { branch: 'body', output: { iteration: loop.iteration, item: collection[loop.iteration] } };
+    return forEachLoopResult(node, cursor, state, loop.iteration, maxIterations, onLimit);
   }
-  const quality = node.config.quality && typeof node.config.quality === 'object' && !Array.isArray(node.config.quality)
-    ? node.config.quality as Record<string, unknown>
-    : null;
-  if (quality) {
-    const nodes = state.nodes && typeof state.nodes === 'object' && !Array.isArray(state.nodes)
-      ? state.nodes as Record<string, unknown>
-      : {};
-    const graderNodeId = String(quality.graderNodeId ?? 'grader');
-    const workerNodeId = String(quality.workerNodeId ?? 'worker');
-    const revisionNodeId = String(quality.revisionNodeId ?? workerNodeId);
-    const grader = nodes[graderNodeId] && typeof nodes[graderNodeId] === 'object' && !Array.isArray(nodes[graderNodeId])
-      ? nodes[graderNodeId] as Record<string, unknown>
-      : {};
-    const verdict = grader.data && typeof grader.data === 'object' && !Array.isArray(grader.data)
-      ? grader.data as Record<string, unknown>
-      : null;
-    const historyRoot = state.qualityHistory && typeof state.qualityHistory === 'object' && !Array.isArray(state.qualityHistory)
-      ? state.qualityHistory as Record<string, unknown>
-      : {};
-    const storedHistory = historyRoot[node.id];
-    const materialized = storedHistory && typeof storedHistory === 'object' && !Array.isArray(storedHistory)
-      ? storedHistory as Partial<QualityMaterialization>
-      : null;
-    const history = Array.isArray(storedHistory) ? storedHistory as Array<Record<string, unknown>> : [];
-    const materializedCurrent = materialized?.current?.iteration === loop.iteration
-      ? materialized.current
-      : null;
-    if (loop.iteration > 0 && verdict && !materializedCurrent && !history.some((entry) => entry.iteration === loop.iteration)) {
-      const candidateNodeId = loop.iteration === 1 ? workerNodeId : revisionNodeId;
-      history.push({ iteration: loop.iteration, candidate: nodes[candidateNodeId] ?? null, verdict, revisionAgentNodeId: candidateNodeId });
-      historyRoot[node.id] = history;
-      state.qualityHistory = historyRoot;
-    }
-    if (verdict) {
-      const passingScore = Number(node.config.passingScore ?? 0);
-      const passed = verdict.passed === true && typeof verdict.score === 'number' && verdict.score >= passingScore;
-      const latest = materializedCurrent ?? history.at(-1);
-      const historyOutput = materialized
-        ? materialized.entryIds ?? []
-        : history;
-      if (passed) return { branch: 'done', output: { iterations: loop.iteration, reason: 'quality_passed', candidate: latest?.candidate ?? null, verdict, history: historyOutput } };
-      if (loop.iteration >= maxIterations) {
-        if (onLimit === 'exit') return { branch: 'done', output: { iterations: loop.iteration, reason: 'limit_exit', candidate: latest?.candidate ?? null, verdict, history: historyOutput, warning: 'Quality threshold was not reached before the revision limit.' } };
-        throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
-      }
-      cursor.loops[node.id] = loop;
-      return { branch: 'body', output: { iteration: loop.iteration, condition: true, verdict } };
-    }
-  }
-  const condition = node.config.condition;
-  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) throw new Error(`Loop ${node.id} has no valid while condition`);
-  const shouldContinue = evaluateCondition(condition as Record<string, unknown>, state);
-  if (!shouldContinue) return { branch: 'done', output: { iterations: loop.iteration, reason: 'condition_false' } };
-  if (loop.iteration >= maxIterations) {
-    if (onLimit === 'exit') return { branch: 'done', output: { iterations: loop.iteration, reason: 'limit_exit' } };
-    throw new Error(`Loop ${node.id} reached its ${maxIterations} iteration safety limit`);
-  }
-  cursor.loops[node.id] = loop;
-  return { branch: 'body', output: { iteration: loop.iteration, condition: true } };
+  return qualityLoopResult(node, cursor, state, loop.iteration, maxIterations, onLimit)
+    ?? whileLoopResult(node, cursor, state, loop.iteration, maxIterations, onLimit);
 }
 
 export async function executeLogicNode(context: WorkflowAdapterContext) {

@@ -37,6 +37,19 @@ function AgentToolAssignment({ tool, done }: { tool: Tool; done: () => void }) {
   })}</div><button className="text-button" onClick={done}>Done assigning</button></section>;
 }
 
+function webResearchPayload(form: FormData): Record<string, unknown> {
+  const provider = String(form.get('provider'));
+  const domains = (name: string) => String(form.get(name) ?? '').split(',').map((item) => item.trim().toLowerCase()).filter(Boolean);
+  const body: Record<string, unknown> = { provider };
+  if (provider === 'tavily' || provider === 'brave') Object.assign(body, { apiKey: String(form.get('apiKey')), safeSearch: String(form.get('safeSearch')), maxResults: Number(form.get('maxResults')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
+  if (provider === 'firecrawl-search') Object.assign(body, { apiKey: String(form.get('apiKey')), maxResults: Number(form.get('maxResults')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
+  if (provider === 'firecrawl-extract') Object.assign(body, { apiKey: String(form.get('apiKey')), maxCharacters: Number(form.get('maxCharacters')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
+  if (provider === 'searxng') Object.assign(body, { endpoint: String(form.get('endpoint')), safeSearch: String(form.get('safeSearch')), maxResults: Number(form.get('maxResults')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
+  if (provider === 'page-reader') Object.assign(body, { maxCharacters: Number(form.get('maxCharacters')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
+  if (provider === 'reddit') Object.assign(body, { clientId: String(form.get('clientId')), clientSecret: String(form.get('clientSecret')), userAgent: String(form.get('userAgent')), maxResults: Number(form.get('maxResults')) });
+  return body;
+}
+
 export function WebResearchPanel() {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
@@ -56,17 +69,7 @@ export function WebResearchPanel() {
   });
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const provider = String(form.get('provider'));
-    const domains = (name: string) => String(form.get(name) ?? '').split(',').map((item) => item.trim().toLowerCase()).filter(Boolean);
-    const body: Record<string, unknown> = { provider };
-    if (provider === 'tavily' || provider === 'brave') Object.assign(body, { apiKey: String(form.get('apiKey')), safeSearch: String(form.get('safeSearch')), maxResults: Number(form.get('maxResults')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
-    if (provider === 'firecrawl-search') Object.assign(body, { apiKey: String(form.get('apiKey')), maxResults: Number(form.get('maxResults')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
-    if (provider === 'firecrawl-extract') Object.assign(body, { apiKey: String(form.get('apiKey')), maxCharacters: Number(form.get('maxCharacters')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
-    if (provider === 'searxng') Object.assign(body, { endpoint: String(form.get('endpoint')), safeSearch: String(form.get('safeSearch')), maxResults: Number(form.get('maxResults')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
-    if (provider === 'page-reader') Object.assign(body, { maxCharacters: Number(form.get('maxCharacters')), allowedDomains: domains('allowedDomains'), blockedDomains: domains('blockedDomains') });
-    if (provider === 'reddit') Object.assign(body, { clientId: String(form.get('clientId')), clientSecret: String(form.get('clientSecret')), userAgent: String(form.get('userAgent')), maxResults: Number(form.get('maxResults')) });
-    install.mutate(body);
+    install.mutate(webResearchPayload(new FormData(event.currentTarget)));
   };
   return <section className="web-research-panel">
     <section className="panel web-research-intro"><Globe2 size={22}/><div><span className="eyebrow">Web research</span><h2>Give selected agents safe internet eyes</h2><p>Search, page reading, and site adapters remain separate tools. Credentials stay encrypted, every tool is read-only, and nothing is assigned to an agent automatically.</p></div></section>

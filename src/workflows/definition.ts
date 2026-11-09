@@ -159,6 +159,160 @@ function loopConfigErrors(node: WorkflowNode) {
   return errors;
 }
 
+function triggerInputSchemaErrors(node: WorkflowNode) {
+  if (!Array.isArray(node.config.inputSchema)) return [];
+  const keys = node.config.inputSchema
+    .filter((field): field is Record<string, unknown> => Boolean(field) && typeof field === 'object' && !Array.isArray(field))
+    .map((field) => field.key)
+    .filter((key): key is string => typeof key === 'string');
+  return new Set(keys).size === keys.length ? [] : [`Trigger node ${node.id} inputSchema keys must be unique`];
+}
+
+function outputNodeErrors(node: WorkflowNode, known: Set<string>) {
+  const errors: string[] = [];
+  const fromNodeId = node.config.fromNodeId;
+  if (fromNodeId !== undefined && (typeof fromNodeId !== 'string' || !known.has(fromNodeId) || fromNodeId === node.id)) {
+    errors.push(`Output node ${node.id} has an invalid fromNodeId`);
+  }
+  const formats = node.config.artifactFormats;
+  if (formats !== undefined && (!Array.isArray(formats) || formats.some((format) => typeof format !== 'string' || !artifactFormats.has(format)) || new Set(formats).size !== formats.length)) {
+    errors.push(`Output node ${node.id} artifactFormats must contain unique supported file formats`);
+  }
+  return errors;
+}
+
+function conditionEdgesValid(edges: WorkflowEdge[]) {
+  const allowed = ['true', 'false'];
+  return edges.length === 2
+    && allowed.every((condition) => edges.some((edge) => edge.condition === condition))
+    && edges.every((edge) => allowed.includes(edge.condition ?? ''));
+}
+
+function loopEdgesValid(edges: WorkflowEdge[]) {
+  const allowed = ['body', 'done'];
+  return edges.length === 2
+    && allowed.every((condition) => edges.some((edge) => edge.condition === condition))
+    && edges.every((edge) => allowed.includes(edge.condition ?? ''));
+}
+
+function nodeDefinitionErrors(node: WorkflowNode, outgoing: WorkflowEdge[], incomingCount: number, known: Set<string>) {
+  const errors: string[] = [];
+  if (node.type === 'trigger' && incomingCount > 0) errors.push('The trigger node cannot have incoming edges');
+  if (node.type === 'trigger') errors.push(...triggerInputSchemaErrors(node));
+  if (node.type === 'output' && outgoing.length) errors.push(`Output node ${node.id} cannot have outgoing edges`);
+  if (!['condition', 'loop', 'output'].includes(node.type) && outgoing.length !== 1) {
+    errors.push(`${node.type} node ${node.id} needs exactly one outgoing edge`);
+  }
+  if (node.type === 'condition') {
+    if (!conditionEdgesValid(outgoing)) errors.push(`Condition node ${node.id} needs exactly one true and one false edge`);
+    errors.push(...conditionConfigErrors(node));
+  }
+  if (node.type === 'loop') {
+    if (!loopEdgesValid(outgoing)) errors.push(`Loop node ${node.id} needs exactly one body and one done edge`);
+    errors.push(...loopConfigErrors(node));
+  }
+  if (node.type === 'output') errors.push(...outputNodeErrors(node, known));
+  errors.push(...workflowNodeConfigErrors(node));
+  errors.push(...retryConfigErrors(node));
+  return errors;
+}
+
+function ancestorIds(nodeId: string, edges: WorkflowEdge[]) {
+  const ancestors = new Set<string>();
+  const pending = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (ancestors.has(id)) continue;
+    ancestors.add(id);
+    for (const edge of edges) if (edge.target === id && !ancestors.has(edge.source)) pending.push(edge.source);
+  }
+  return ancestors;
+}
+
+function dataReferenceValidationErrors(nodes: WorkflowNode[], edges: WorkflowEdge[], known: Set<string>) {
+  return nodes.flatMap((node) => dataReferenceErrors(node, ancestorIds(node.id, edges), known));
+}
+
+function edgeConditionErrors(edges: WorkflowEdge[], nodeById: Map<string, WorkflowNode>) {
+  const errors: string[] = [];
+  for (const edge of edges) {
+    const source = nodeById.get(edge.source);
+    const target = nodeById.get(edge.target);
+    if (!source || !target) continue;
+    if (edge.condition === 'continue') {
+      if (target.type !== 'loop') errors.push(`Continue edge ${edge.source} → ${edge.target} must target a loop node`);
+      if (source.type === 'condition' || source.type === 'loop' || source.type === 'output') errors.push(`Continue edge cannot start from ${source.type} node ${source.id}`);
+    } else if (source.type === 'condition' && !['true', 'false'].includes(edge.condition ?? '')) {
+      errors.push(`Condition edge from ${source.id} must be true or false`);
+    } else if (source.type === 'loop' && !['body', 'done'].includes(edge.condition ?? '')) {
+      errors.push(`Loop edge from ${source.id} must be body or done`);
+    } else if (!['condition', 'loop'].includes(source.type) && edge.condition) {
+      errors.push(`Edge condition ${edge.condition} is not valid from ${source.type} node ${source.id}`);
+    }
+  }
+  return errors;
+}
+
+function reachableNodes(startId: string, outgoing: Map<string, WorkflowEdge[]>) {
+  const reachable = new Set([startId]);
+  const pending = [startId];
+  while (pending.length) {
+    const id = pending.pop()!;
+    for (const edge of outgoing.get(id) ?? []) {
+      if (reachable.has(edge.target)) continue;
+      reachable.add(edge.target);
+      pending.push(edge.target);
+    }
+  }
+  return reachable;
+}
+
+function nonLoopCycleExists(ids: string[], outgoing: Map<string, WorkflowEdge[]>) {
+  const nonLoopOutgoing = new Map(ids.map((id) => [id, (outgoing.get(id) ?? []).filter((edge) => edge.condition !== 'continue')]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const hasCycle = (id: string): boolean => {
+    if (visiting.has(id)) return true;
+    if (visited.has(id)) return false;
+    visiting.add(id);
+    const cyclic = (nonLoopOutgoing.get(id) ?? []).some((edge) => hasCycle(edge.target));
+    visiting.delete(id);
+    visited.add(id);
+    return cyclic;
+  };
+  return ids.some(hasCycle);
+}
+
+function loopBodyErrors(nodes: WorkflowNode[], edges: WorkflowEdge[], outgoing: Map<string, WorkflowEdge[]>) {
+  const nonLoopOutgoing = new Map([...outgoing].map(([id, nodeEdges]) => [id, nodeEdges.filter((edge) => edge.condition !== 'continue')]));
+  const errors: string[] = [];
+  for (const loop of nodes.filter((node) => node.type === 'loop')) {
+    const body = (outgoing.get(loop.id) ?? []).find((edge) => edge.condition === 'body')?.target;
+    if (!body) continue;
+    const bodyReachable = reachableNodes(body, nonLoopOutgoing);
+    const returns = edges.some((edge) => edge.condition === 'continue' && edge.target === loop.id && bodyReachable.has(edge.source));
+    if (!returns) errors.push(`Loop node ${loop.id} body needs a reachable continue edge back to the loop`);
+  }
+  return errors;
+}
+
+function topologyErrors(
+  definition: WorkflowDefinition,
+  ids: string[],
+  known: Set<string>,
+  triggers: WorkflowNode[],
+  outgoing: Map<string, WorkflowEdge[]>,
+) {
+  const errors: string[] = [];
+  const trigger = triggers[0];
+  if (trigger && reachableNodes(trigger.id, outgoing).size !== known.size) {
+    errors.push('Every node must be reachable from the trigger node');
+  }
+  if (nonLoopCycleExists(ids, outgoing)) errors.push('Workflow cycles are allowed only through continue edges back to loop nodes');
+  errors.push(...loopBodyErrors(definition.nodes, definition.edges, outgoing));
+  return errors;
+}
+
 export function workflowDefinitionErrors(definition: WorkflowDefinition) {
   const ids = definition.nodes.map((item) => item.id);
   const known = new Set(ids);
@@ -174,97 +328,14 @@ export function workflowDefinitionErrors(definition: WorkflowDefinition) {
   const incoming = new Map(ids.map((id) => [id, definition.edges.filter((edge) => edge.target === id)]));
 
   for (const node of definition.nodes) {
-    const edges = outgoing.get(node.id) ?? [];
-    if (node.type === 'trigger' && (incoming.get(node.id)?.length ?? 0) > 0) errors.push('The trigger node cannot have incoming edges');
-    if (node.type === 'trigger' && Array.isArray(node.config.inputSchema)) {
-      const keys = node.config.inputSchema
-        .filter((field): field is Record<string, unknown> => Boolean(field) && typeof field === 'object' && !Array.isArray(field))
-        .map((field) => field.key)
-        .filter((key): key is string => typeof key === 'string');
-      if (new Set(keys).size !== keys.length) errors.push(`Trigger node ${node.id} inputSchema keys must be unique`);
-    }
-    if (node.type === 'output' && edges.length) errors.push(`Output node ${node.id} cannot have outgoing edges`);
-    if (!['condition', 'loop', 'output'].includes(node.type) && edges.length !== 1) errors.push(`${node.type} node ${node.id} needs exactly one outgoing edge`);
-    if (node.type === 'condition') {
-      if (edges.length !== 2 || !edges.some((edge) => edge.condition === 'true') || !edges.some((edge) => edge.condition === 'false') || edges.some((edge) => !['true', 'false'].includes(edge.condition ?? ''))) errors.push(`Condition node ${node.id} needs exactly one true and one false edge`);
-      errors.push(...conditionConfigErrors(node));
-    }
-    if (node.type === 'loop') {
-      if (edges.length !== 2 || !edges.some((edge) => edge.condition === 'body') || !edges.some((edge) => edge.condition === 'done') || edges.some((edge) => !['body', 'done'].includes(edge.condition ?? ''))) errors.push(`Loop node ${node.id} needs exactly one body and one done edge`);
-      errors.push(...loopConfigErrors(node));
-    }
-    if (node.type === 'output') {
-      const fromNodeId = node.config.fromNodeId;
-      if (fromNodeId !== undefined && (typeof fromNodeId !== 'string' || !known.has(fromNodeId) || fromNodeId === node.id)) errors.push(`Output node ${node.id} has an invalid fromNodeId`);
-      const formats = node.config.artifactFormats;
-      if (formats !== undefined && (!Array.isArray(formats) || formats.some((format) => typeof format !== 'string' || !artifactFormats.has(format)) || new Set(formats).size !== formats.length)) errors.push(`Output node ${node.id} artifactFormats must contain unique supported file formats`);
-    }
-    errors.push(...workflowNodeConfigErrors(node));
-    errors.push(...retryConfigErrors(node));
+    errors.push(...nodeDefinitionErrors(node, outgoing.get(node.id) ?? [], incoming.get(node.id)?.length ?? 0, known));
   }
 
-  if (known.size === ids.length && definition.edges.every((edge) => known.has(edge.source) && known.has(edge.target))) {
-    for (const node of definition.nodes) {
-      const ancestors = new Set<string>();
-      const pending = definition.edges.filter((edge) => edge.target === node.id).map((edge) => edge.source);
-      while (pending.length) {
-        const id = pending.pop()!;
-        if (ancestors.has(id)) continue;
-        ancestors.add(id);
-        for (const edge of definition.edges) if (edge.target === id && !ancestors.has(edge.source)) pending.push(edge.source);
-      }
-      errors.push(...dataReferenceErrors(node, ancestors, known));
-    }
-  }
-
-  for (const edge of definition.edges) {
-    const source = nodeById.get(edge.source);
-    const target = nodeById.get(edge.target);
-    if (!source || !target) continue;
-    if (edge.condition === 'continue') {
-      if (target.type !== 'loop') errors.push(`Continue edge ${edge.source} → ${edge.target} must target a loop node`);
-      if (source.type === 'condition' || source.type === 'loop' || source.type === 'output') errors.push(`Continue edge cannot start from ${source.type} node ${source.id}`);
-    } else if (source.type === 'condition' && !['true', 'false'].includes(edge.condition ?? '')) errors.push(`Condition edge from ${source.id} must be true or false`);
-    else if (source.type === 'loop' && !['body', 'done'].includes(edge.condition ?? '')) errors.push(`Loop edge from ${source.id} must be body or done`);
-    else if (!['condition', 'loop'].includes(source.type) && edge.condition) errors.push(`Edge condition ${edge.condition} is not valid from ${source.type} node ${source.id}`);
-  }
-
-  if (known.size === ids.length && definition.edges.every((edge) => known.has(edge.source) && known.has(edge.target))) {
-    const trigger = triggers[0];
-    if (trigger) {
-      const reachable = new Set([trigger.id]);
-      const pending = [trigger.id];
-      while (pending.length) {
-        const id = pending.pop()!;
-        for (const edge of outgoing.get(id) ?? []) if (!reachable.has(edge.target)) { reachable.add(edge.target); pending.push(edge.target); }
-      }
-      if (reachable.size !== known.size) errors.push('Every node must be reachable from the trigger node');
-    }
-    const nonLoopOutgoing = new Map(ids.map((id) => [id, (outgoing.get(id) ?? []).filter((edge) => edge.condition !== 'continue')]));
-    const visiting = new Set<string>();
-    const visited = new Set<string>();
-    const hasCycle = (id: string): boolean => {
-      if (visiting.has(id)) return true;
-      if (visited.has(id)) return false;
-      visiting.add(id);
-      const cyclic = (nonLoopOutgoing.get(id) ?? []).some((edge) => hasCycle(edge.target));
-      visiting.delete(id); visited.add(id);
-      return cyclic;
-    };
-    if (ids.some(hasCycle)) errors.push('Workflow cycles are allowed only through continue edges back to loop nodes');
-    for (const loop of definition.nodes.filter((item) => item.type === 'loop')) {
-      const body = (outgoing.get(loop.id) ?? []).find((edge) => edge.condition === 'body')?.target;
-      if (!body) continue;
-      const bodyReachable = new Set([body]);
-      const pending = [body];
-      while (pending.length) {
-        const id = pending.pop()!;
-        for (const edge of nonLoopOutgoing.get(id) ?? []) if (!bodyReachable.has(edge.target)) { bodyReachable.add(edge.target); pending.push(edge.target); }
-      }
-      const returns = definition.edges.some((edge) => edge.condition === 'continue' && edge.target === loop.id && bodyReachable.has(edge.source));
-      if (!returns) errors.push(`Loop node ${loop.id} body needs a reachable continue edge back to the loop`);
-    }
-  }
+  const nodeReferencesExist = known.size === ids.length
+    && definition.edges.every((edge) => known.has(edge.source) && known.has(edge.target));
+  if (nodeReferencesExist) errors.push(...dataReferenceValidationErrors(definition.nodes, definition.edges, known));
+  errors.push(...edgeConditionErrors(definition.edges, nodeById));
+  if (nodeReferencesExist) errors.push(...topologyErrors(definition, ids, known, triggers, outgoing));
   return [...new Set(errors)];
 }
 

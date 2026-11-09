@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, AlertTriangle, ArrowUpRight, CalendarDays, CheckCircle2, CircleAlert, Download, Eye, FileArchive, FileSpreadsheet, FileText, LoaderCircle, Play, Presentation, RefreshCw, Search, Square, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, artifactFormats, type Artifact, type ArtifactFormat, type FileAsset, type Task, type TaskDetail, type WorkflowReplay } from '../../api';
+import { api, artifactFormats, type Artifact, type ArtifactFormat, type FileAsset, type OutputDocumentDetail, type Task, type TaskDetail, type WorkflowReplay } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { OutputViewer } from '../../components/OutputViewer';
 import { EmptyState, PageHeader, Status } from '../../components/ui';
@@ -221,6 +221,44 @@ function artifactRevisionLabel(artifact: Artifact, currentVersionId?: string) {
   return artifact.output_document_version_id === currentVersionId ? 'Current revision' : 'Older revision';
 }
 
+async function openArtifactFile(artifact: Artifact, inline: boolean, options: {
+  setOpeningArtifactId: (id: string | null) => void;
+  setHtmlPreview: (preview: { title: string; html: string } | null) => void;
+  reportError: (message: string) => void;
+}) {
+  const sandboxHtml = inline && artifact.format === 'html';
+  const pendingTab = inline && !sandboxHtml ? window.open('', '_blank', 'noopener,noreferrer') : null;
+  options.setOpeningArtifactId(artifact.id);
+  try {
+    const file = await api.artifactFile(artifact.id, inline);
+    if (sandboxHtml) {
+      options.setHtmlPreview({ title: file.filename, html: await file.blob.text() });
+      return;
+    }
+    const url = URL.createObjectURL(file.blob);
+    if (inline && pendingTab) pendingTab.location.href = url;
+    else {
+      const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.filename; anchor.click();
+    }
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch (cause) {
+    pendingTab?.close();
+    options.reportError(cause instanceof Error ? cause.message : 'Could not open artifact');
+  } finally {
+    options.setOpeningArtifactId(null);
+  }
+}
+
+function availableArtifactFormats(artifacts: Artifact[], outputDocument: OutputDocumentDetail | null, currentVersionId?: string) {
+  const existing = new Set(artifacts
+    .filter((artifact) => artifact.status !== 'failed')
+    .filter((artifact) => outputDocument
+      ? artifact.output_document_version_id === currentVersionId
+      : !artifact.output_document_version_id)
+    .map((artifact) => artifact.format));
+  return artifactFormats.filter((format) => !existing.has(format));
+}
+
 export function ArtifactPanel({ task, refresh }: { task: TaskDetail; refresh: () => void }) {
   const { session, report, reportError } = useWorkspace();
   const canDelete = !session.workspace.role || ['owner', 'admin'].includes(session.workspace.role);
@@ -250,36 +288,8 @@ export function ArtifactPanel({ task, refresh }: { task: TaskDetail; refresh: ()
     onSuccess: () => { report('Artifact deleted'); refresh(); },
     onError: (cause) => reportError(cause instanceof Error ? cause.message : 'Could not delete artifact'),
   });
-  const openArtifact = async (artifact: Artifact, inline: boolean) => {
-    const sandboxHtml = inline && artifact.format === 'html';
-    const pendingTab = inline && !sandboxHtml ? window.open('', '_blank', 'noopener,noreferrer') : null;
-    setOpeningArtifactId(artifact.id);
-    try {
-      const file = await api.artifactFile(artifact.id, inline);
-      if (sandboxHtml) {
-        setHtmlPreview({ title: file.filename, html: await file.blob.text() });
-        return;
-      }
-      const url = URL.createObjectURL(file.blob);
-      if (inline && pendingTab) pendingTab.location.href = url;
-      else {
-        const anchor = document.createElement('a'); anchor.href = url; anchor.download = file.filename; anchor.click();
-      }
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    } catch (cause) {
-      pendingTab?.close();
-      reportError(cause instanceof Error ? cause.message : 'Could not open artifact');
-    } finally {
-      setOpeningArtifactId(null);
-    }
-  };
-  const existing = new Set((task.artifacts ?? [])
-    .filter((artifact) => artifact.status !== 'failed')
-    .filter((artifact) => outputDocument
-      ? artifact.output_document_version_id === currentVersionId
-      : !artifact.output_document_version_id)
-    .map((artifact) => artifact.format));
-  const available = artifactFormats.filter((format) => !existing.has(format));
+  const openArtifact = (artifact: Artifact, inline: boolean) => openArtifactFile(artifact, inline, { setOpeningArtifactId, setHtmlPreview, reportError });
+  const available = availableArtifactFormats(task.artifacts ?? [], outputDocument, currentVersionId);
   if (!task.artifacts?.length && task.status !== 'completed') return null;
   return <section className="artifact-section"><div className="section-title"><div><h3>Downloadable files</h3><small>{outputDocument ? `New files use saved version ${outputDocument.current_version_number}. Older files remain available below.` : "HTML files open in Woody's safe viewer. Other formats preview or download normally."}</small></div><button className="icon-button" onClick={refresh} aria-label="Refresh artifacts"><RefreshCw size={14}/></button></div>{outputDocumentQuery.error && <div className="inline-error"><AlertTriangle size={15}/><span>Woody could not verify which output version these files use.</span></div>}{task.artifacts?.length ? <div className="artifact-list">{task.artifacts.map((artifact) => <article key={artifact.id}><span className={`artifact-icon ${artifact.format}`}>{artifactIcon(artifact.format)}</span><span><strong>{artifact.filename}</strong><small>{artifact.format.toUpperCase()} · {artifact.status === 'ready' ? bytes(artifact.size_bytes) : artifact.status.replaceAll('_', ' ')}</small><small className={`artifact-revision ${artifact.output_document_version_id === currentVersionId ? 'current' : ''}`}>{artifactRevisionLabel(artifact, currentVersionId)}</small>{artifact.error_message && <em>{artifact.error_message}</em>}</span><Status value={artifact.status}/>{artifact.status === 'ready' && artifact.format === 'html' && <button className="button artifact-view-button" aria-label={`View HTML ${artifact.filename}`} disabled={openingArtifactId === artifact.id} onClick={() => void openArtifact(artifact, true)}>{openingArtifactId === artifact.id ? <LoaderCircle className="spin" size={14}/> : <Eye size={14}/>}View HTML</button>}{artifact.status === 'ready' && artifact.format === 'pdf' && <button className="icon-button" aria-label={`Preview ${artifact.filename}`} disabled={openingArtifactId === artifact.id} onClick={() => void openArtifact(artifact, true)}><Eye size={15}/></button>}{artifact.status === 'ready' && <button className="icon-button" aria-label={`Download ${artifact.filename}`} disabled={openingArtifactId === artifact.id} onClick={() => void openArtifact(artifact, false)}><Download size={15}/></button>}{canDelete && <button className="icon-button danger" aria-label={`Delete ${artifact.filename}`} disabled={remove.isPending} onClick={() => remove.mutate(artifact.id)}><Trash2 size={14}/></button>}</article>)}</div> : <p className="artifact-empty">No downloadable files were requested for this task.</p>}{task.status === 'completed' && available.length > 0 && <div className="artifact-request"><span>{available.map((format) => <label key={format}><input type="checkbox" checked={formats.includes(format)} onChange={(event) => setFormats((current) => event.target.checked ? [...current, format] : current.filter((item) => item !== format))}/>{format.toUpperCase()}</label>)}</span><button className="button" disabled={!formats.length || requestFiles.isPending || outputDocumentQuery.isLoading || Boolean(outputDocumentQuery.error)} onClick={() => requestFiles.mutate()}>{requestFiles.isPending ? <LoaderCircle className="spin" size={14}/> : <Download size={14}/>} {outputDocument ? 'Regenerate selected' : 'Generate selected'}</button></div>}{htmlPreview && <HtmlArtifactPreview title={htmlPreview.title} html={htmlPreview.html} close={() => setHtmlPreview(null)}/>}</section>;
 }

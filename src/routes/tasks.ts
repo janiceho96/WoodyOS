@@ -47,7 +47,7 @@ function publicAuthorization(row: Record<string, unknown>) {
   };
 }
 
-export async function taskRoutes(app: FastifyInstance) {
+function registerTaskListRoute(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => {
     const result = await query(
       `SELECT t.*,a.name agent_name,a.role agent_role,a.avatar_config agent_avatar,w.name workflow_name,
@@ -71,6 +71,10 @@ export async function taskRoutes(app: FastifyInstance) {
     );
     return { data: result.rows.map((row) => publicTask(row)) };
   }));
+
+}
+
+function registerTaskCreateRoute(app: FastifyInstance) {
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(taskInput, request.body, reply); if (!input) return;
     const agent = await query('SELECT id,status,published_version_id FROM agents WHERE id=$1 AND workspace_id=$2', [input.agentId, request.user.workspaceId]);
@@ -171,6 +175,10 @@ export async function taskRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'task.created', 'task', task.id, { agentId: input.agentId, attachmentIds });
     return reply.code(202).send({ ...task, attachmentIds });
   }));
+
+}
+
+function registerTaskStreamRoute(app: FastifyInstance) {
   app.get('/:id/stream', { preHandler: app.authenticate }, async (request, reply) => {
     const id = (request.params as { id: string }).id;
     const task = await query('SELECT id FROM tasks WHERE id=$1 AND workspace_id=$2', [id, request.user.workspaceId]);
@@ -195,6 +203,10 @@ export async function taskRoutes(app: FastifyInstance) {
     heartbeat.unref();
     request.raw.on('close', () => { closed = true; clearInterval(heartbeat); });
   });
+
+}
+
+function registerTaskDetailsRoute(app: FastifyInstance) {
   app.get('/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const id = (request.params as { id: string }).id;
     const task = await query('SELECT t.*,a.name agent_name,a.role agent_role,a.avatar_config agent_avatar FROM tasks t JOIN agents a ON a.id=t.agent_id WHERE t.id=$1 AND t.workspace_id=$2', [id, request.user.workspaceId]);
@@ -223,6 +235,10 @@ export async function taskRoutes(app: FastifyInstance) {
       attachments: attachments.rows,
     };
   }));
+
+}
+
+function registerTaskCancelRoute(app: FastifyInstance) {
   app.post('/:id/cancel', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const id = (request.params as { id: string }).id;
     const result = await requestCancellation({
@@ -255,6 +271,10 @@ export async function taskRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'task.cancel_requested', 'task', result.id);
     return reply.code(202).send(result);
   }));
+
+}
+
+function registerTaskFeedbackRoute(app: FastifyInstance) {
   app.put('/:id/feedback', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const input = parse(feedbackInput, request.body, reply); if (!input) return;
     const task = await query('SELECT id FROM tasks WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);
@@ -262,4 +282,13 @@ export async function taskRoutes(app: FastifyInstance) {
     const result = await query('INSERT INTO task_feedback(workspace_id,task_id,user_id,rating,comment) VALUES($1,$2,$3,$4,$5) ON CONFLICT(task_id,user_id) DO UPDATE SET rating=EXCLUDED.rating,comment=EXCLUDED.comment,updated_at=now() RETURNING *', [request.user.workspaceId, task.rows[0].id, request.user.sub, input.rating, input.comment ?? null]);
     return result.rows[0];
   }));
+}
+
+export async function taskRoutes(app: FastifyInstance) {
+  registerTaskListRoute(app);
+  registerTaskCreateRoute(app);
+  registerTaskStreamRoute(app);
+  registerTaskDetailsRoute(app);
+  registerTaskCancelRoute(app);
+  registerTaskFeedbackRoute(app);
 }

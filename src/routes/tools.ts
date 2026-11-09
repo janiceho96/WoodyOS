@@ -26,20 +26,32 @@ export function toolConfigurationError(kind: z.infer<typeof inputSchema>['kind']
   return null;
 }
 
-export async function toolRoutes(app: FastifyInstance) {
+function registerToolGetRootRoute(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => ({ data: (await query('SELECT id,name,kind,description,permissions,enabled,created_at,updated_at FROM tools WHERE workspace_id=$1 ORDER BY name', [request.user.workspaceId])).rows })));
+}
+
+function registerToolGetDemosRoute(app: FastifyInstance) {
   app.get('/demos', { preHandler: app.authenticate }, asyncRoute(async (request) => {
     const installedNames = new Set((await query<{ name: string }>('SELECT name FROM tools WHERE workspace_id=$1 AND name = ANY($2::text[])', [request.user.workspaceId, demoApiCatalog.map((demo) => demo.name)])).rows.map((row) => row.name));
     return { data: demoApiCatalog.map((demo) => ({ ...publicDemoApi(demo), installed: installedNames.has(demo.name) })) };
   }));
+}
+
+function registerToolGetWebCatalogRoute(app: FastifyInstance) {
   app.get('/web/catalog', { preHandler: app.authenticate }, asyncRoute(async (request) => {
     const installed = new Set((await query<{ name: string }>("SELECT name FROM tools WHERE workspace_id=$1 AND kind='internal' AND permissions ? 'web.read'", [request.user.workspaceId])).rows.map((row) => row.name));
     return { data: webResearchCatalog.map((entry) => ({ ...entry, installed: installed.has(webCatalogToolName(entry.id)) })) };
   }));
+}
+
+function registerToolGetJobsCatalogRoute(app: FastifyInstance) {
   app.get('/jobs/catalog', { preHandler: app.authenticate }, asyncRoute(async (request) => {
     const installed = new Set((await query<{ name: string }>("SELECT name FROM tools WHERE workspace_id=$1 AND kind='internal' AND permissions ? 'jobs.read'", [request.user.workspaceId])).rows.map((row) => row.name));
     return { data: jobToolCatalog.map((entry) => ({ ...entry, installed: installed.has('Jobs · Adzuna Search') })) };
   }));
+}
+
+function registerToolPostJobsInstallRoute(app: FastifyInstance) {
   app.post('/jobs/install', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(jobToolInstallSchema, request.body, reply); if (!input) return;
     const normalized = jobToolInstallSchema.parse(input);
@@ -64,6 +76,9 @@ export async function toolRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'tool.jobs_installed', 'tool', created.id, { provider: normalized.provider, country: normalized.country });
     return reply.code(201).send(created);
   }));
+}
+
+function registerToolPostWebInstallRoute(app: FastifyInstance) {
   app.post('/web/install', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(webToolInstallSchema, request.body, reply); if (!input) return;
     const normalized = webToolInstallSchema.parse(input);
@@ -88,6 +103,9 @@ export async function toolRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'tool.web_installed', 'tool', created.id, { provider: normalized.provider });
     return reply.code(201).send(created);
   }));
+}
+
+function registerToolPostDemosByslugInstallRoute(app: FastifyInstance) {
   app.post('/demos/:slug/install', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const params = parse(demoParams, request.params, reply); if (!params) return;
     const demo = demoApiCatalog.find((entry) => entry.slug === params.slug);
@@ -103,6 +121,9 @@ export async function toolRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'tool.demo_installed', 'tool', created.id, { demo: demo.slug, provider: demo.provider });
     return reply.code(201).send({ ...created, alreadyInstalled: false });
   }));
+}
+
+function registerToolPostRootRoute(app: FastifyInstance) {
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(inputSchema, request.body, reply); if (!input) return;
     const configError = toolConfigurationError(input.kind, input.config);
@@ -111,6 +132,9 @@ export async function toolRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'tool.created', 'tool', result.rows[0].id);
     return reply.code(201).send(result.rows[0]);
   }));
+}
+
+function registerToolPatchByIdRoute(app: FastifyInstance) {
   app.patch('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(inputSchema.partial(), request.body, reply); if (!input) return;
     const existing = await query<{ kind: z.infer<typeof inputSchema>['kind'] }>('SELECT kind FROM tools WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);
@@ -132,12 +156,18 @@ export async function toolRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'tool.updated', 'tool', result.rows[0].id, { fields: entries.map(([field]) => field) });
     return result.rows[0];
   }));
+}
+
+function registerToolDeleteByIdRoute(app: FastifyInstance) {
   app.delete('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const result = await query('UPDATE tools SET enabled=false,updated_at=now() WHERE id=$1 AND workspace_id=$2 RETURNING id', [(request.params as { id: string }).id, request.user.workspaceId]);
     if (!result.rowCount) return reply.code(404).send({ error: 'TOOL_NOT_FOUND' });
     await audit(request.user.workspaceId, request.user.sub, 'tool.disabled', 'tool', result.rows[0].id);
     return reply.code(204).send();
   }));
+}
+
+function registerToolPostByIdTestRoute(app: FastifyInstance) {
   app.post('/:id/test', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const tool = await query<{ id: string; enabled: boolean; config: StoredConfig }>('SELECT id,enabled,config FROM tools WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);
     if (!tool.rowCount || !tool.rows[0].enabled) return reply.code(404).send({ error: 'TOOL_NOT_AVAILABLE' });
@@ -147,4 +177,18 @@ export async function toolRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'tool.test_requested', 'tool', tool.rows[0].id);
     return { toolId: tool.rows[0].id, status: 'healthy', result: testResult };
   }));
+}
+
+export async function toolRoutes(app: FastifyInstance) {
+  registerToolGetRootRoute(app);
+  registerToolGetDemosRoute(app);
+  registerToolGetWebCatalogRoute(app);
+  registerToolGetJobsCatalogRoute(app);
+  registerToolPostJobsInstallRoute(app);
+  registerToolPostWebInstallRoute(app);
+  registerToolPostDemosByslugInstallRoute(app);
+  registerToolPostRootRoute(app);
+  registerToolPatchByIdRoute(app);
+  registerToolDeleteByIdRoute(app);
+  registerToolPostByIdTestRoute(app);
 }

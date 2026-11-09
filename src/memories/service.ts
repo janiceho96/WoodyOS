@@ -223,7 +223,7 @@ export async function deleteMemory(input: { workspaceId: string; memoryId: strin
   if (!result.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
 }
 
-export async function updateMemory(input: {
+type MemoryUpdateInput = {
   workspaceId: string;
   memoryId: string;
   content?: string;
@@ -233,52 +233,56 @@ export async function updateMemory(input: {
   agentId?: string | null;
   expiresAt?: Date | null;
   actorId?: string;
-}): Promise<MemoryRecord> {
-  const snapshotResult = await query<{
-    agent_id: string | null;
-    user_id: string | null;
-    scope: MemoryScope;
-    revision_token: string;
-    semantic_search: boolean;
-  }>(
-    `SELECT m.agent_id,m.user_id,m.scope,m.updated_at::text revision_token,
-      COALESCE((a.memory_config->>'semanticSearch')::boolean,false) semantic_search
-       FROM memories m
-       LEFT JOIN agents a ON a.id=m.agent_id AND a.workspace_id=m.workspace_id
-      WHERE m.id=$1 AND m.workspace_id=$2 AND m.verification_status <> 'superseded'`,
-    [input.memoryId, input.workspaceId],
-  );
-  if (!snapshotResult.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
-  const snapshot = snapshotResult.rows[0];
+};
+
+type MemoryUpdateSnapshot = {
+  agent_id: string | null;
+  user_id: string | null;
+  scope: MemoryScope;
+  revision_token: string;
+  semantic_search: boolean;
+};
+
+function memoryOwnershipUpdates(input: MemoryUpdateInput, snapshot: MemoryUpdateSnapshot) {
   const changesOwnership = input.scope !== undefined || input.agentId !== undefined;
-  const entries: Array<[string, unknown]> = [];
   const targetScope = input.scope ?? snapshot.scope;
   let targetAgentId = input.agentId === undefined ? snapshot.agent_id : input.agentId;
-  if (changesOwnership) {
-    if (targetScope === 'workspace') {
-      entries.push(['scope', 'workspace'], ['agent_id', null], ['user_id', null]);
-      targetAgentId = null;
-    } else if (targetScope === 'agent') {
-      if (!targetAgentId) throw new MemoryServiceError('AGENT_REQUIRED_FOR_SCOPE', 400);
-      entries.push(['scope', 'agent'], ['agent_id', targetAgentId], ['user_id', null]);
-    } else {
-      if (!input.actorId) throw new MemoryServiceError('USER_SCOPE_ACTOR_REQUIRED', 403);
-      entries.push(['scope', 'user'], ['agent_id', targetAgentId], ['user_id', input.actorId]);
-    }
+  const entries: Array<[string, unknown]> = [];
+  if (!changesOwnership) return { targetScope, targetAgentId, entries };
+
+  if (targetScope === 'workspace') {
+    entries.push(['scope', 'workspace'], ['agent_id', null], ['user_id', null]);
+    targetAgentId = null;
+  } else if (targetScope === 'agent') {
+    if (!targetAgentId) throw new MemoryServiceError('AGENT_REQUIRED_FOR_SCOPE', 400);
+    entries.push(['scope', 'agent'], ['agent_id', targetAgentId], ['user_id', null]);
+  } else {
+    if (!input.actorId) throw new MemoryServiceError('USER_SCOPE_ACTOR_REQUIRED', 403);
+    entries.push(['scope', 'user'], ['agent_id', targetAgentId], ['user_id', input.actorId]);
   }
+  return { targetScope, targetAgentId, entries };
+}
+
+async function memoryPolicyForUpdate(input: MemoryUpdateInput, snapshot: MemoryUpdateSnapshot, targetScope: MemoryScope, targetAgentId: string | null) {
   const targetHasAgentPolicy = targetScope !== 'workspace' && Boolean(targetAgentId);
-  const preflightSemanticEnabled = targetHasAgentPolicy
-    ? targetAgentId === snapshot.agent_id && targetScope === snapshot.scope
-      ? snapshot.semantic_search === true
-      : await authoritativeSemanticSearch(input.workspaceId, targetAgentId!, { query })
-    : false;
-  let preflightEmbedding: number[] | null | undefined;
+  if (!targetHasAgentPolicy) return { targetHasAgentPolicy, semanticEnabled: false };
+  const keepsCurrentPolicy = targetAgentId === snapshot.agent_id && targetScope === snapshot.scope;
+  const semanticEnabled = keepsCurrentPolicy
+    ? snapshot.semantic_search === true
+    : await authoritativeSemanticSearch(input.workspaceId, targetAgentId!, { query });
+  return { targetHasAgentPolicy, semanticEnabled };
+}
+
+async function appendContentUpdates(input: MemoryUpdateInput, semanticEnabled: boolean, entries: Array<[string, unknown]>) {
   if (input.content !== undefined) {
-    preflightEmbedding = preflightSemanticEnabled ? await boundedEmbedding(input.content) : null;
-    entries.push(['content', input.content], ['embedding', preflightEmbedding?.length ? `[${preflightEmbedding.join(',')}]` : null]);
-  } else if (!preflightSemanticEnabled) {
+    const embedding = semanticEnabled ? await boundedEmbedding(input.content) : null;
+    entries.push(['content', input.content], ['embedding', embedding?.length ? `[${embedding.join(',')}]` : null]);
+  } else if (!semanticEnabled) {
     entries.push(['embedding', null]);
   }
+}
+
+function appendOptionalMemoryUpdates(input: MemoryUpdateInput, entries: Array<[string, unknown]>) {
   if (input.importance !== undefined) {
     if (!Number.isFinite(input.importance) || input.importance < 0 || input.importance > 1) {
       throw new MemoryServiceError('IMPORTANCE_INVALID', 400);
@@ -292,12 +296,24 @@ export async function updateMemory(input: {
     }
     entries.push(['expires_at', input.expiresAt]);
   }
-  if (!entries.length) throw new MemoryServiceError('NO_UPDATES', 400);
-  const set = entries.map(([field], index) => field === 'metadata'
-    ? `metadata=(metadata || ($${index + 1}::jsonb - 'provenance'))`
-    : field === 'embedding'
-      ? `embedding=$${index + 1}::vector`
-    : `${field}=$${index + 1}`).join(', ');
+}
+
+function memoryUpdateAssignments(entries: Array<[string, unknown]>) {
+  return entries.map(([field], index) => {
+    if (field === 'metadata') return `metadata=(metadata || ($${index + 1}::jsonb - 'provenance'))`;
+    if (field === 'embedding') return `embedding=$${index + 1}::vector`;
+    return `${field}=$${index + 1}`;
+  }).join(', ');
+}
+
+async function persistMemoryUpdates(
+  input: MemoryUpdateInput,
+  snapshot: MemoryUpdateSnapshot,
+  entries: Array<[string, unknown]>,
+  targetAgentId: string | null,
+  targetHasAgentPolicy: boolean,
+  semanticEnabled: boolean,
+) {
   const values = entries.map(([, value]) => value);
   const policyCondition = targetHasAgentPolicy
     ? `AND EXISTS (
@@ -307,17 +323,37 @@ export async function updateMemory(input: {
          AND COALESCE((target_agent.memory_config->>'semanticSearch')::boolean,false)=$${values.length + 6}
     )`
     : '';
-  const result = await query<MemoryRow>(
-    `UPDATE memories SET ${set},updated_at=now()
+  return query<MemoryRow>(
+    `UPDATE memories SET ${memoryUpdateAssignments(entries)},updated_at=now()
       WHERE id=$${values.length + 1} AND workspace_id=$${values.length + 2}
         AND verification_status <> 'superseded'
         AND updated_at::text=$${values.length + 3}
         ${policyCondition}
       RETURNING ${memoryColumns}`,
     targetHasAgentPolicy
-      ? [...values, input.memoryId, input.workspaceId, snapshot.revision_token, targetAgentId, input.workspaceId, preflightSemanticEnabled]
+      ? [...values, input.memoryId, input.workspaceId, snapshot.revision_token, targetAgentId, input.workspaceId, semanticEnabled]
       : [...values, input.memoryId, input.workspaceId, snapshot.revision_token],
   );
+}
+
+export async function updateMemory(input: MemoryUpdateInput): Promise<MemoryRecord> {
+  const snapshotResult = await query<MemoryUpdateSnapshot>(
+    `SELECT m.agent_id,m.user_id,m.scope,m.updated_at::text revision_token,
+      COALESCE((a.memory_config->>'semanticSearch')::boolean,false) semantic_search
+       FROM memories m
+       LEFT JOIN agents a ON a.id=m.agent_id AND a.workspace_id=m.workspace_id
+      WHERE m.id=$1 AND m.workspace_id=$2 AND m.verification_status <> 'superseded'`,
+    [input.memoryId, input.workspaceId],
+  );
+  if (!snapshotResult.rowCount) throw new MemoryServiceError('MEMORY_NOT_FOUND', 404);
+  const snapshot = snapshotResult.rows[0];
+  const ownership = memoryOwnershipUpdates(input, snapshot);
+  const policy = await memoryPolicyForUpdate(input, snapshot, ownership.targetScope, ownership.targetAgentId);
+  const entries = ownership.entries;
+  await appendContentUpdates(input, policy.semanticEnabled, entries);
+  appendOptionalMemoryUpdates(input, entries);
+  if (!entries.length) throw new MemoryServiceError('NO_UPDATES', 400);
+  const result = await persistMemoryUpdates(input, snapshot, entries, ownership.targetAgentId, policy.targetHasAgentPolicy, policy.semanticEnabled);
   if (!result.rowCount) throw new MemoryServiceError('MEMORY_UPDATE_CONFLICT', 409);
   return mapMemory(result.rows[0]);
 }

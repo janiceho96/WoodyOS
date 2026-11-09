@@ -351,6 +351,68 @@ async function failOrRetry(
   return false;
 }
 
+async function failBeforeNodeExecution(run: WorkflowRunRecord, message: string, lease?: ExecutionLeaseContext) {
+  const failure = workflowFailure(message, run.state);
+  await transitionActiveRun(
+    "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
+    [failure.output, failure.error, run.id],
+    lease,
+  );
+  await mutateWorkflowArtifacts("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id], lease);
+}
+
+type WorkflowEventEmitter = (
+  nodeId: string | null,
+  type: string,
+  message: string,
+  payload?: Record<string, unknown>,
+  parentTrace?: TraceContext,
+) => Promise<void>;
+
+function storeWorkflowNodeOutput(run: WorkflowRunRecord, nodeId: string, value: unknown) {
+  run.state[nodeId] = value;
+  const nodeState = run.state.nodes && typeof run.state.nodes === 'object' && !Array.isArray(run.state.nodes)
+    ? run.state.nodes as Record<string, unknown>
+    : {};
+  nodeState[nodeId] = value;
+  run.state.nodes = nodeState;
+}
+
+async function executeWorkflowNode(input: {
+  run: WorkflowRunRecord;
+  node: WorkflowNode;
+  cursor: WorkflowCursor;
+  iterationKey: string;
+  executeAgentTask: AgentTaskExecutor;
+  signal: AbortSignal;
+  leaseOwnerId?: string;
+  nodeTrace: TraceContext;
+  executionManifest: ExecutionManifest | null;
+  emitWorkflowEvent: WorkflowEventEmitter;
+  registerActionIdentity: (identity: WorkflowActionIdentity) => void;
+}) {
+  const { run, node, cursor, iterationKey: key, executeAgentTask, signal, leaseOwnerId, nodeTrace, executionManifest, emitWorkflowEvent } = input;
+  return executeRegisteredWorkflowNode({
+    execution: {
+      trace: nodeTrace,
+      signal,
+      leaseOwnerId,
+      ...(run.run_mode === 'production'
+        ? { mode: 'production' as const, manifest: executionManifest! }
+        : { mode: 'test' as const, manifest: null }),
+    },
+    run,
+    node,
+    cursor,
+    iterationKey: key,
+    executeAgentTask,
+    emitEvent: (type, message, payload = {}, trace = nodeTrace) => emitWorkflowEvent(node.id, type, message, payload, trace),
+    resolve: (value) => resolveWorkflowTemplates(value, run.state),
+    setNodeOutput: (value) => storeWorkflowNodeOutput(run, node.id, value),
+    registerActionIdentity: input.registerActionIdentity,
+  });
+}
+
 export async function executeWorkflowStep(
   workflowRunId: string,
   executeAgentTask: AgentTaskExecutor,
@@ -383,24 +445,12 @@ export async function executeWorkflowStep(
     parentTrace: TraceContext = authoritativeTraceContext(run),
   ) => workflowEvent(run, nodeId, type, message, payload, parentTrace, lease);
   if (run.step_count > WORKFLOW_STEP_LIMIT) {
-    const failure = workflowFailure('Workflow exceeded the 10000-step safety limit', run.state);
-    await transitionActiveRun(
-      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
-      [failure.output, failure.error, run.id],
-      lease,
-    );
-    await mutateWorkflowArtifacts("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id], lease);
+    await failBeforeNodeExecution(run, 'Workflow exceeded the 10000-step safety limit', lease);
     return null;
   }
   const cursor = run.cursor;
   if (!cursor?.nodeId) {
-    const failure = workflowFailure('Workflow cursor is missing', run.state);
-    await transitionActiveRun(
-      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
-      [failure.output, failure.error, run.id],
-      lease,
-    );
-    await mutateWorkflowArtifacts("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id], lease);
+    await failBeforeNodeExecution(run, 'Workflow cursor is missing', lease);
     await emitWorkflowEvent(null, 'workflow.failed', 'Workflow cursor is missing');
     return null;
   }
@@ -409,13 +459,7 @@ export async function executeWorkflowStep(
   const node = run.definition_snapshot.nodes.find((candidate) => candidate.id === cursor.nodeId);
   if (!node) {
     const message = `Workflow cursor references missing node ${cursor.nodeId}`;
-    const failure = workflowFailure(message, run.state);
-    await transitionActiveRun(
-      "UPDATE workflow_runs SET status='failed',output=$1,error=$2,completed_at=now(),updated_at=now() WHERE id=$3 AND status='running' RETURNING id",
-      [failure.output, failure.error, run.id],
-      lease,
-    );
-    await mutateWorkflowArtifacts("UPDATE artifacts SET status='skipped',error_message=NULL,updated_at=now() WHERE workflow_run_id=$1 AND status='pending'", [run.id], lease);
+    await failBeforeNodeExecution(run, message, lease);
     await emitWorkflowEvent(null, 'workflow.failed', message);
     return null;
   }
@@ -432,33 +476,18 @@ export async function executeWorkflowStep(
     executionManifest = run.run_mode === 'production'
       ? assertManifestCompatible(run.execution_manifest)
       : null;
-    const execution = await executeRegisteredWorkflowNode({
-      execution: {
-        trace: nodeTrace,
-        signal,
-        leaseOwnerId,
-        ...(run.run_mode === 'production'
-          ? { mode: 'production' as const, manifest: executionManifest! }
-          : { mode: 'test' as const, manifest: null }),
-      },
+    const execution = await executeWorkflowNode({
       run,
       node,
       cursor,
       iterationKey: key,
       executeAgentTask,
-      emitEvent: (type, message, payload = {}, trace = nodeTrace) => emitWorkflowEvent(node.id, type, message, payload, trace),
-      resolve: (value) => resolveWorkflowTemplates(value, run.state),
-      setNodeOutput: (value) => {
-        run.state[node.id] = value;
-        const nodeState = run.state.nodes && typeof run.state.nodes === 'object' && !Array.isArray(run.state.nodes)
-          ? run.state.nodes as Record<string, unknown>
-          : {};
-        nodeState[node.id] = value;
-        run.state.nodes = nodeState;
-      },
-      registerActionIdentity: (identity) => {
-        actionIdentity = identity;
-      },
+      signal,
+      leaseOwnerId,
+      nodeTrace,
+      executionManifest,
+      emitWorkflowEvent,
+      registerActionIdentity: (identity) => { actionIdentity = identity; },
     });
     signal.throwIfAborted();
     if (execution.waiting) {

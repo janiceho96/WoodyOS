@@ -119,12 +119,57 @@ export function normalizeCompilerEdgeCondition(value: unknown) {
   return value;
 }
 
-export function parseCompilerOutput(text: string, mode: CompileMode): AgentSolution {
-  const raw = jsonFromText(text);
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw Object.assign(new Error('PROMPT_COMPILER_INVALID_RESPONSE'), { statusCode: 502 });
+function validTokenRange(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const range = value as Record<string, unknown>;
+  return typeof range.minimum === 'number'
+    && typeof range.maximum === 'number'
+    && Number.isInteger(range.minimum)
+    && Number.isInteger(range.maximum)
+    && range.minimum >= 128
+    && range.maximum >= range.minimum;
+}
+
+function validModelConfig(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const config = value as Record<string, unknown>;
+  return typeof config.temperature === 'number'
+    && config.temperature >= 0
+    && config.temperature <= 2
+    && typeof config.maxTokens === 'number'
+    && Number.isInteger(config.maxTokens)
+    && config.maxTokens >= 128
+    && config.maxTokens <= 128_000
+    && typeof config.topP === 'number'
+    && config.topP >= 0
+    && config.topP <= 1;
+}
+
+function normalizeAgentConfig(agent: unknown) {
+  if (!agent || typeof agent !== 'object' || Array.isArray(agent)) return agent;
+  const normalized = { ...(agent as Record<string, unknown>) };
+  delete normalized.model;
+  if (!validModelConfig(normalized.modelConfig)) {
+    normalized.modelConfig = { temperature: 0.2, maxTokens: 4096, topP: 1 };
   }
-  const candidate = { ...unwrapCompilerObject(raw as Record<string, unknown>) };
+  return normalized;
+}
+
+function normalizeWorkflowEdges(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const workflow = { ...(value as Record<string, unknown>) };
+  if (!Array.isArray(workflow.edges)) return workflow;
+  workflow.edges = workflow.edges.map((edge) => {
+    if (!edge || typeof edge !== 'object' || Array.isArray(edge)) return edge;
+    const normalized = { ...(edge as Record<string, unknown>) };
+    if ('condition' in normalized) normalized.condition = normalizeCompilerEdgeCondition(normalized.condition);
+    return normalized;
+  });
+  return workflow;
+}
+
+function normalizeCompilerCandidate(raw: Record<string, unknown>) {
+  const candidate = { ...unwrapCompilerObject(raw) };
   candidate.source = 'generated';
   candidate.version = 1;
   if (typeof candidate.name === 'string') candidate.slug = slugifySolutionName(candidate.name);
@@ -136,65 +181,33 @@ export function parseCompilerOutput(text: string, mode: CompileMode): AgentSolut
   ) {
     candidate.estimatedModelCalls = Math.min(30, Math.max(1, Array.isArray(candidate.agents) ? candidate.agents.length : 1));
   }
-  const tokenRange = candidate.estimatedTokenRange;
-  if (
-    !tokenRange
-    || typeof tokenRange !== 'object'
-    || Array.isArray(tokenRange)
-    || typeof (tokenRange as Record<string, unknown>).minimum !== 'number'
-    || typeof (tokenRange as Record<string, unknown>).maximum !== 'number'
-    || !Number.isInteger((tokenRange as Record<string, unknown>).minimum)
-    || !Number.isInteger((tokenRange as Record<string, unknown>).maximum)
-    || Number((tokenRange as Record<string, unknown>).minimum) < 128
-    || Number((tokenRange as Record<string, unknown>).maximum) < Number((tokenRange as Record<string, unknown>).minimum)
-  ) {
+  if (!validTokenRange(candidate.estimatedTokenRange)) {
     candidate.estimatedTokenRange = { minimum: 1_000, maximum: 8_000 };
   }
-  if (Array.isArray(candidate.agents)) {
-    candidate.agents = candidate.agents.map((agent) => {
-      if (!agent || typeof agent !== 'object' || Array.isArray(agent)) return agent;
-      const normalized = { ...(agent as Record<string, unknown>) };
-      delete normalized.model;
-      const config = normalized.modelConfig;
-      if (
-        !config
-        || typeof config !== 'object'
-        || Array.isArray(config)
-        || typeof (config as Record<string, unknown>).temperature !== 'number'
-        || Number((config as Record<string, unknown>).temperature) < 0
-        || Number((config as Record<string, unknown>).temperature) > 2
-        || typeof (config as Record<string, unknown>).maxTokens !== 'number'
-        || !Number.isInteger((config as Record<string, unknown>).maxTokens)
-        || Number((config as Record<string, unknown>).maxTokens) < 128
-        || Number((config as Record<string, unknown>).maxTokens) > 128_000
-        || typeof (config as Record<string, unknown>).topP !== 'number'
-        || Number((config as Record<string, unknown>).topP) < 0
-        || Number((config as Record<string, unknown>).topP) > 1
-      ) {
-        normalized.modelConfig = { temperature: 0.2, maxTokens: 4096, topP: 1 };
-      }
-      return normalized;
-    });
-  }
+  if (Array.isArray(candidate.agents)) candidate.agents = candidate.agents.map(normalizeAgentConfig);
   if (candidate.workflow && typeof candidate.workflow === 'object' && !Array.isArray(candidate.workflow)) {
-    const workflow = { ...(candidate.workflow as Record<string, unknown>) };
-    if (Array.isArray(workflow.edges)) {
-      workflow.edges = workflow.edges.map((edge) => {
-        if (!edge || typeof edge !== 'object' || Array.isArray(edge)) return edge;
-        const normalized = { ...(edge as Record<string, unknown>) };
-        if ('condition' in normalized) normalized.condition = normalizeCompilerEdgeCondition(normalized.condition);
-        return normalized;
-      });
-    }
-    candidate.workflow = workflow;
+    candidate.workflow = normalizeWorkflowEdges(candidate.workflow);
   }
-  const solution = parseAgentSolution(candidate);
+  return candidate;
+}
+
+function validateCompilerMode(solution: AgentSolution, mode: CompileMode) {
   if (mode === 'single' && solution.agents.length !== 1) {
     throw Object.assign(new Error('PROMPT_COMPILER_MODE_MISMATCH'), { statusCode: 502 });
   }
   if (mode === 'multi' && solution.agents.length < 2) {
     throw Object.assign(new Error('PROMPT_COMPILER_MODE_MISMATCH'), { statusCode: 502 });
   }
+}
+
+export function parseCompilerOutput(text: string, mode: CompileMode): AgentSolution {
+  const raw = jsonFromText(text);
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw Object.assign(new Error('PROMPT_COMPILER_INVALID_RESPONSE'), { statusCode: 502 });
+  }
+  const candidate = normalizeCompilerCandidate(raw as Record<string, unknown>);
+  const solution = parseAgentSolution(candidate);
+  validateCompilerMode(solution, mode);
   if (containsLikelySecret(JSON.stringify(solution))) {
     throw Object.assign(new Error('PROMPT_COMPILER_RETURNED_SECRET'), { statusCode: 502 });
   }

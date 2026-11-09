@@ -321,8 +321,11 @@ const workflowListSql = `SELECT w.*,
    WHERE workflow_id=w.id AND run_mode='test' AND test_target_node_id IS NULL ORDER BY created_at DESC LIMIT 1
  ) latest_test ON true`;
 
-export async function workflowRoutes(app: FastifyInstance) {
+function registerWorkflowGetRootRoute(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => ({ data: (await query(`${workflowListSql} WHERE w.workspace_id=$1 AND w.status <> 'archived' ORDER BY w.updated_at DESC`, [request.user.workspaceId])).rows })));
+}
+
+function registerWorkflowPostRootRoute(app: FastifyInstance) {
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(workflowInput, request.body, reply); if (!input) return;
     const definition = input.definition as WorkflowDefinition;
@@ -337,6 +340,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'workflow.created', 'workflow', result.rows[0].id);
     return reply.code(201).send(result.rows[0]);
   }));
+}
+
+function registerWorkflowGetByIdLayoutRoute(app: FastifyInstance) {
   app.get('/:id/layout', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const workflowId = (request.params as { id: string }).id;
     const result = await query<{
@@ -364,6 +370,9 @@ export async function workflowRoutes(app: FastifyInstance) {
       updatedAt: layout.updated_at,
     };
   }));
+}
+
+function registerWorkflowPutByIdLayoutRoute(app: FastifyInstance) {
   app.put('/:id/layout', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(workflowLayoutInputSchema, request.body, reply); if (!input) return;
     const layout = { schemaVersion: input.schemaVersion ?? 1, positions: input.positions, viewport: input.viewport ?? { x: 0, y: 0, zoom: 1 } };
@@ -397,10 +406,16 @@ export async function workflowRoutes(app: FastifyInstance) {
       updatedAt: result.rows[0].updated_at,
     };
   }));
+}
+
+function registerWorkflowGetByIdRoute(app: FastifyInstance) {
   app.get('/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const result = await query(`${workflowListSql} WHERE w.id=$1 AND w.workspace_id=$2`, [(request.params as { id: string }).id, request.user.workspaceId]);
     return result.rowCount ? result.rows[0] : reply.code(404).send({ error: 'WORKFLOW_NOT_FOUND' });
   }));
+}
+
+function registerWorkflowPatchByIdRoute(app: FastifyInstance) {
   app.patch('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(workflowInput.partial(), request.body, reply); if (!input) return;
     if (input.definition) {
@@ -435,12 +450,18 @@ export async function workflowRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'workflow.updated', 'workflow', result.rows[0].id, { fields: entries.map(([field]) => field) });
     return result.rows[0];
   }));
+}
+
+function registerWorkflowDeleteByIdRoute(app: FastifyInstance) {
   app.delete('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const result = await query('DELETE FROM workflows WHERE id=$1 AND workspace_id=$2 RETURNING id', [(request.params as { id: string }).id, request.user.workspaceId]);
     if (!result.rowCount) return reply.code(404).send({ error: 'WORKFLOW_NOT_FOUND' });
     await audit(request.user.workspaceId, request.user.sub, 'workflow.deleted', 'workflow', result.rows[0].id);
     return reply.code(204).send();
   }));
+}
+
+function registerWorkflowGetByIdRegressionCasesRoute(app: FastifyInstance) {
   app.get('/:id/regression-cases', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const cases = await query(
       `SELECT id,workspace_id,workflow_id,name,input,fixtures,assertions,created_by,created_at,updated_at
@@ -451,6 +472,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     );
     return { data: cases.rows };
   }));
+}
+
+function registerWorkflowPostByIdRegressionCasesRoute(app: FastifyInstance) {
   app.post('/:id/regression-cases', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(regressionCaseInputSchema, request.body, reply); if (!input) return;
     const payload = regressionCasePayload({ name: input.name, input: input.input ?? {}, fixtures: input.fixtures ?? {}, assertions: input.assertions });
@@ -465,6 +489,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'workflow.regression_case_created', 'workflow_regression_case', created.rows[0].id, { workflowId });
     return reply.code(201).send(created.rows[0]);
   }));
+}
+
+function registerWorkflowPatchByIdRegressionCasesByCaseIdRoute(app: FastifyInstance) {
   app.patch('/:id/regression-cases/:caseId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const update = parse(regressionCaseUpdateSchema, request.body, reply); if (!update) return;
     const existing = await query<{ id: string; name: string; input: Record<string, unknown>; fixtures: Record<string, unknown>; assertions: unknown }>(
@@ -488,6 +515,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'workflow.regression_case_updated', 'workflow_regression_case', existing.rows[0].id, { workflowId: (request.params as { id: string }).id });
     return saved.rows[0];
   }));
+}
+
+function registerWorkflowDeleteByIdRegressionCasesByCaseIdRoute(app: FastifyInstance) {
   app.delete('/:id/regression-cases/:caseId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const removed = await query(
       `DELETE FROM workflow_regression_cases WHERE id=$1 AND workflow_id=$2 AND workspace_id=$3 RETURNING id`,
@@ -497,6 +527,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'workflow.regression_case_deleted', 'workflow_regression_case', removed.rows[0].id, { workflowId: (request.params as { id: string }).id });
     return reply.code(204).send();
   }));
+}
+
+function registerWorkflowGetByIdEvaluationsRoute(app: FastifyInstance) {
   app.get('/:id/evaluations', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request) => ({
     data: (await query(
       `SELECT evaluation.id,evaluation.workflow_version_id,evaluation.regression_case_id,evaluation.execution_manifest,evaluation.trace_id,
@@ -510,6 +543,9 @@ export async function workflowRoutes(app: FastifyInstance) {
       [(request.params as { id: string }).id, request.user.workspaceId],
     )).rows,
   })));
+}
+
+function registerWorkflowPostByIdEvaluationsRoute(app: FastifyInstance) {
   app.post('/:id/evaluations', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(evaluationRunInputSchema, request.body, reply); if (!input) return;
     const workflowId = (request.params as { id: string }).id;
@@ -579,6 +615,9 @@ export async function workflowRoutes(app: FastifyInstance) {
       client.release();
     }
   }));
+}
+
+function registerWorkflowPostByIdDryRunRoute(app: FastifyInstance) {
   app.post('/:id/dry-run', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(runInputSchema, request.body, reply); if (!input) return;
     const workflow = await query<WorkflowRecord>(
@@ -590,6 +629,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     // audit event, artifact, queue item, worker task, or persisted execution manifest.
     return dryRunWorkflow({ workspaceId: request.user.workspaceId, definition: workflow.rows[0].definition, input: input.input ?? {}, resources: await dryRunResources(request.user.workspaceId, workflow.rows[0].definition) });
   }));
+}
+
+function registerWorkflowPostByIdTestRunsRoute(app: FastifyInstance) {
   app.post('/:id/test-runs', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(runInputSchema, request.body, reply); if (!input) return;
     const workflow = await query<WorkflowRecord>(
@@ -614,6 +656,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     });
     return reply.code(202).send(created.run);
   }));
+}
+
+function registerWorkflowPostByIdNodesByNodeIdTestRunsRoute(app: FastifyInstance) {
   app.post('/:id/nodes/:nodeId/test-runs', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(runInputSchema, request.body, reply); if (!input) return;
     const params = request.params as { id: string; nodeId: string };
@@ -643,6 +688,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     });
     return reply.code(202).send(created.run);
   }));
+}
+
+function registerWorkflowPostByIdPublishRoute(app: FastifyInstance) {
   app.post('/:id/publish', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const workflowId = (request.params as { id: string }).id;
     const client = await db.connect();
@@ -701,6 +749,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     });
     return published;
   }));
+}
+
+function registerWorkflowPostByIdRunsRoute(app: FastifyInstance) {
   app.post('/:id/runs', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const workflow = await query<WorkflowRecord & { published_name: string; published_definition: WorkflowDefinition }>(
       `SELECT w.*,v.name published_name,v.definition published_definition
@@ -729,6 +780,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     });
     return reply.code(202).send(created.run);
   }));
+}
+
+function registerWorkflowGetRunsByRunIdReplayRoute(app: FastifyInstance) {
   app.get('/runs/:runId/replay', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const runId = (request.params as { runId: string }).runId;
     const membership = await query<{ role: 'owner' | 'admin' | 'member' | 'viewer' }>(
@@ -745,6 +799,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     if (!replay) return reply.code(404).send({ error: 'WORKFLOW_RUN_NOT_FOUND' });
     return replay;
   }));
+}
+
+function registerWorkflowGetRunsByRunIdRoute(app: FastifyInstance) {
   app.get('/runs/:runId', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const runId = (request.params as { runId: string }).runId;
     const run = await query('SELECT * FROM workflow_runs WHERE id=$1 AND workspace_id=$2', [runId, request.user.workspaceId]);
@@ -787,6 +844,9 @@ export async function workflowRoutes(app: FastifyInstance) {
       },
     };
   }));
+}
+
+function registerWorkflowPostRunsByRunIdCancelRoute(app: FastifyInstance) {
   app.post('/runs/:runId/cancel', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const runId = (request.params as { runId: string }).runId;
     const result = await requestCancellation({
@@ -829,6 +889,9 @@ export async function workflowRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'workflow.cancel_requested', 'workflow_run', result.id);
     return reply.code(202).send(result);
   }));
+}
+
+function registerWorkflowPostRunsByRunIdApprovalsByApprovalIdRoute(app: FastifyInstance) {
   app.post('/runs/:runId/approvals/:approvalId', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(z.object({ decision: z.enum(['approved', 'rejected']), comment: z.string().max(2000).optional() }), request.body, reply); if (!input) return;
     const params = request.params as { runId: string; approvalId: string };
@@ -967,4 +1030,29 @@ export async function workflowRoutes(app: FastifyInstance) {
     );
     return approval;
   }));
+}
+
+export async function workflowRoutes(app: FastifyInstance) {
+  registerWorkflowGetRootRoute(app);
+  registerWorkflowPostRootRoute(app);
+  registerWorkflowGetByIdLayoutRoute(app);
+  registerWorkflowPutByIdLayoutRoute(app);
+  registerWorkflowGetByIdRoute(app);
+  registerWorkflowPatchByIdRoute(app);
+  registerWorkflowDeleteByIdRoute(app);
+  registerWorkflowGetByIdRegressionCasesRoute(app);
+  registerWorkflowPostByIdRegressionCasesRoute(app);
+  registerWorkflowPatchByIdRegressionCasesByCaseIdRoute(app);
+  registerWorkflowDeleteByIdRegressionCasesByCaseIdRoute(app);
+  registerWorkflowGetByIdEvaluationsRoute(app);
+  registerWorkflowPostByIdEvaluationsRoute(app);
+  registerWorkflowPostByIdDryRunRoute(app);
+  registerWorkflowPostByIdTestRunsRoute(app);
+  registerWorkflowPostByIdNodesByNodeIdTestRunsRoute(app);
+  registerWorkflowPostByIdPublishRoute(app);
+  registerWorkflowPostByIdRunsRoute(app);
+  registerWorkflowGetRunsByRunIdReplayRoute(app);
+  registerWorkflowGetRunsByRunIdRoute(app);
+  registerWorkflowPostRunsByRunIdCancelRoute(app);
+  registerWorkflowPostRunsByRunIdApprovalsByApprovalIdRoute(app);
 }

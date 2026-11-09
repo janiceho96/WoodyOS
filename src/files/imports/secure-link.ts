@@ -1,34 +1,15 @@
 import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
 import { basename } from 'node:path';
 import { Agent, fetch } from 'undici';
 import { safeOriginalName } from '../types.js';
+import { isPublicIp } from '../../lib/network.js';
 import type { CloudImportAdapter, CloudImportRequest, DownloadedCloudFile } from './types.js';
 
 const MAX_BYTES = 25 * 1024 * 1024;
 
-function isPrivateIpv4(address: string) {
-  const parts = address.split('.').map(Number);
-  return parts[0] === 0 || parts[0] === 10 || parts[0] === 127
-    || (parts[0] === 169 && parts[1] === 254)
-    || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
-    || (parts[0] === 192 && parts[1] === 168)
-    || parts[0] >= 224;
-}
-
-function isPrivateAddress(address: string) {
-  if (isIP(address) === 4) return isPrivateIpv4(address);
-  const normalized = address.toLowerCase().split('%')[0];
-  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
-  if (mapped) return isPrivateIpv4(mapped);
-  // Public IPv6 unicast currently occupies 2000::/3. Reject every other range
-  // (loopback, link-local, unique-local, multicast, documentation and reserved).
-  return !/^[23][0-9a-f]{0,3}:/.test(normalized) || normalized.startsWith('2001:db8:');
-}
-
 async function validatedAddresses(hostname: string) {
   const resolved = await lookup(hostname, { all: true, verbatim: true });
-  if (!resolved.length || resolved.some((entry) => isPrivateAddress(entry.address))) {
+  if (!resolved.length || resolved.some((entry) => !isPublicIp(entry.address))) {
     throw Object.assign(new Error('CLOUD_IMPORT_PRIVATE_ADDRESS_BLOCKED'), { statusCode: 400 });
   }
   return resolved;

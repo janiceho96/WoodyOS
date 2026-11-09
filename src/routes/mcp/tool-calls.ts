@@ -11,6 +11,7 @@ import {
 import type { WorkflowDefinition } from '../../workflows/definition.js';
 import { serializeRuntimeError } from '../../runtime/errors.js';
 import { authoritativeTraceContext } from '../../runtime/trace.js';
+import type { PoolClient } from 'pg';
 
 const idParams = z.object({ id: z.string().uuid() });
 const listQuery = z.object({
@@ -23,7 +24,197 @@ const decisionInput = z.object({
   comment: z.string().max(2_000).optional(),
 });
 
-export async function mcpToolCallRoutes(app: FastifyInstance) {
+type McpDecision = {
+  id: string;
+  workspaceId: string;
+  userId: string;
+  decision: 'approved' | 'rejected';
+  comment?: string;
+};
+
+type PendingMcpDecision = {
+  task_id: string;
+  agent_id: string;
+  workflow_run_id: string | null;
+  run_mode: 'test' | 'production' | null;
+  workflow_version_id: string | null;
+  definition_snapshot: WorkflowDefinition | null;
+  action_authorization_id: string | null;
+  execution_manifest: unknown;
+  run_execution_manifest: unknown;
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string | null;
+};
+
+async function lockLinkedAuthorization(client: PoolClient, input: McpDecision) {
+  const linked = await client.query<{ action_authorization_id: string | null }>(
+    'SELECT action_authorization_id FROM mcp_tool_calls WHERE id=$1 AND workspace_id=$2',
+    [input.id, input.workspaceId],
+  );
+  const authorizationId = linked.rows[0]?.action_authorization_id ?? null;
+  if (!authorizationId) return { valid: true, authorizationId: null };
+  const locked = await client.query(
+    `SELECT id FROM action_authorizations
+     WHERE id=$1 AND workspace_id=$2 AND status='awaiting_confirmation' AND expires_at>now()
+     FOR UPDATE`,
+    [authorizationId, input.workspaceId],
+  );
+  return { valid: Boolean(locked.rowCount), authorizationId };
+}
+
+async function lockPendingMcpDecision(client: PoolClient, input: McpDecision, authorizationId: string | null) {
+  const pending = await client.query<PendingMcpDecision>(
+    `SELECT calls.task_id,tasks.agent_id,calls.workflow_run_id,run.run_mode,
+            run.workflow_version_id,run.definition_snapshot,
+            calls.action_authorization_id,tasks.execution_manifest,
+            run.execution_manifest run_execution_manifest,tasks.trace_id,
+            tasks.span_id,tasks.parent_span_id
+     FROM mcp_tool_calls calls JOIN mcp_tool_confirmations confirmation ON confirmation.tool_call_id=calls.id
+     JOIN tasks ON tasks.id=calls.task_id
+     LEFT JOIN workflow_runs run ON run.id=tasks.workflow_run_id
+     WHERE calls.id=$1 AND calls.workspace_id=$2 AND calls.status='awaiting_confirmation'
+     AND calls.action_authorization_id IS NOT DISTINCT FROM $3::uuid
+     AND confirmation.status='pending' AND confirmation.expires_at > now()
+     FOR UPDATE OF calls,confirmation,tasks`,
+    [input.id, input.workspaceId, authorizationId],
+  );
+  const row = pending.rows[0];
+  return row?.task_id ? row : null;
+}
+
+async function assertMcpDecisionDependencies(client: PoolClient, input: McpDecision, pending: PendingMcpDecision) {
+  if (pending.run_mode === 'test') return;
+  if (pending.workflow_run_id && pending.workflow_version_id && pending.definition_snapshot) {
+    await assertWorkflowManifestDependencies({
+      workspaceId: input.workspaceId,
+      workflowVersionId: pending.workflow_version_id,
+      definition: pending.definition_snapshot,
+      manifest: pending.run_execution_manifest,
+    }, client);
+    return;
+  }
+  await assertTaskManifestDependencies({
+    workspaceId: input.workspaceId,
+    agentId: pending.agent_id,
+    manifest: pending.execution_manifest,
+  }, client);
+}
+
+async function writeMcpDecision(client: PoolClient, input: McpDecision, pending: PendingMcpDecision) {
+  const authorizationId = pending.action_authorization_id;
+  if (authorizationId) {
+    const authorizationUpdated = await client.query(
+      `UPDATE action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
+       WHERE id=$4 AND workspace_id=$5 AND status='awaiting_confirmation' AND expires_at>now()
+       RETURNING id`,
+      [input.decision, input.userId, input.comment ?? null, authorizationId, input.workspaceId],
+    );
+    if (authorizationUpdated.rowCount !== 1) return false;
+  }
+  await client.query(
+    `UPDATE mcp_tool_confirmations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
+     WHERE tool_call_id=$4 AND status='pending'`,
+    [input.decision, input.userId, input.comment ?? null, input.id],
+  );
+  await client.query(
+    `UPDATE mcp_tool_calls SET status=$1,completed_at=CASE WHEN $1='rejected' THEN now() ELSE NULL END
+     WHERE id=$2 AND workspace_id=$3 AND status='awaiting_confirmation'`,
+    [input.decision === 'approved' ? 'pending' : 'rejected', input.id, input.workspaceId],
+  );
+  await client.query(
+    `UPDATE task_runtime_checkpoints SET status=$1,updated_at=now()
+     WHERE task_id=$2 AND pending_tool_call_id=$3 AND status='awaiting_confirmation'`,
+    [input.decision, pending.task_id, input.id],
+  );
+  await client.query(
+    `UPDATE tasks SET status='queued',updated_at=now() WHERE id=$1 AND workspace_id=$2 AND status='awaiting_approval'`,
+    [pending.task_id, input.workspaceId],
+  );
+  return true;
+}
+
+async function applyMcpDecision(input: McpDecision) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const linked = await lockLinkedAuthorization(client, input);
+    if (!linked.valid) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    const pending = await lockPendingMcpDecision(client, input, linked.authorizationId);
+    if (!pending) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    await assertMcpDecisionDependencies(client, input, pending);
+    if (!await writeMcpDecision(client, input, pending)) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    await client.query('COMMIT');
+    return {
+      taskId: pending.task_id,
+      workflowRunId: pending.workflow_run_id,
+      traceId: authoritativeTraceContext(pending).traceId,
+      linkedAuthorizationId: linked.authorizationId,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function restoreMcpDecisionAfterQueueFailure(input: McpDecision, taskId: string, linkedAuthorizationId: string | null) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    if (linkedAuthorizationId) {
+      const authorizationRestored = await client.query(
+        `UPDATE action_authorizations SET status='awaiting_confirmation',
+                resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+          WHERE id=$1 AND workspace_id=$2 AND status=$3
+          RETURNING id`,
+        [linkedAuthorizationId, input.workspaceId, input.decision],
+      );
+      if (authorizationRestored.rowCount !== 1) {
+        throw new Error('Unable to restore linked action authorization after enqueue failure');
+      }
+    }
+    await client.query(
+      `UPDATE mcp_tool_confirmations SET status='pending',
+              resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
+        WHERE tool_call_id=$1 AND status=$2`,
+      [input.id, input.decision],
+    );
+    await client.query(
+      `UPDATE mcp_tool_calls SET status='awaiting_confirmation',completed_at=NULL
+        WHERE id=$1 AND status=$2`,
+      [input.id, input.decision === 'approved' ? 'pending' : 'rejected'],
+    );
+    await client.query(
+      `UPDATE task_runtime_checkpoints SET status='awaiting_confirmation',updated_at=now()
+        WHERE task_id=$1 AND pending_tool_call_id=$2 AND status=$3`,
+      [taskId, input.id, input.decision],
+    );
+    await client.query(
+      `UPDATE tasks SET status='awaiting_approval',updated_at=now()
+        WHERE id=$1 AND workspace_id=$2 AND status='queued'`,
+      [taskId, input.workspaceId],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function registerMcpToolCallListRoute(app: FastifyInstance) {
   app.get('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const input = parse(listQuery, request.query, reply);
     if (!input) return;
@@ -60,186 +251,39 @@ export async function mcpToolCallRoutes(app: FastifyInstance) {
       }),
     };
   }));
+}
 
+function registerMcpToolCallDecisionRoute(app: FastifyInstance) {
   app.post('/:id/decision', {
     preHandler: (request) => app.authorize(request, ['owner', 'admin']),
   }, asyncRoute(async (request, reply) => {
     const params = parse(idParams, request.params, reply);
     const input = parse(decisionInput, request.body, reply);
     if (!params || !input) return;
-    const client = await db.connect();
-    let taskId = '';
-    let workflowRunId: string | null = null;
-    let traceId = '';
-    let linkedAuthorizationId: string | null = null;
+    const decision = {
+      id: params.id,
+      workspaceId: request.user.workspaceId,
+      userId: request.user.sub,
+      decision: input.decision,
+      comment: input.comment,
+    };
+    const applied = await applyMcpDecision(decision);
+    if (!applied) return reply.code(409).send({ error: 'MCP_CONFIRMATION_NOT_PENDING' });
+    const { taskId, workflowRunId, traceId, linkedAuthorizationId } = applied;
     try {
-      await client.query('BEGIN');
-      const linkedAuthorization = await client.query<{ action_authorization_id: string | null }>(
-        `SELECT action_authorization_id FROM mcp_tool_calls WHERE id=$1 AND workspace_id=$2`,
-        [params.id, request.user.workspaceId],
-      );
-      linkedAuthorizationId = linkedAuthorization.rows[0]?.action_authorization_id ?? null;
-      if (linkedAuthorizationId) {
-        const locked = await client.query(
-          `SELECT id FROM action_authorizations
-           WHERE id=$1 AND workspace_id=$2 AND status='awaiting_confirmation' AND expires_at>now()
-           FOR UPDATE`,
-          [linkedAuthorizationId, request.user.workspaceId],
-        );
-        if (!locked.rowCount) {
-          await client.query('ROLLBACK');
-          return reply.code(409).send({ error: 'MCP_CONFIRMATION_NOT_PENDING' });
-        }
-      }
-      const pending = await client.query<{
-        task_id: string;
-        agent_id: string;
-        workflow_run_id: string | null;
-        run_mode: 'test' | 'production' | null;
-        workflow_version_id: string | null;
-        definition_snapshot: WorkflowDefinition | null;
-        action_authorization_id: string | null;
-        execution_manifest: unknown;
-        run_execution_manifest: unknown;
-        trace_id: string;
-        span_id: string;
-        parent_span_id: string | null;
-      }>(
-        `SELECT calls.task_id,tasks.agent_id,calls.workflow_run_id,run.run_mode,
-                run.workflow_version_id,run.definition_snapshot,
-                calls.action_authorization_id,tasks.execution_manifest,
-                run.execution_manifest run_execution_manifest,tasks.trace_id,
-                tasks.span_id,tasks.parent_span_id
-         FROM mcp_tool_calls calls JOIN mcp_tool_confirmations confirmation ON confirmation.tool_call_id=calls.id
-         JOIN tasks ON tasks.id=calls.task_id
-         LEFT JOIN workflow_runs run ON run.id=tasks.workflow_run_id
-         WHERE calls.id=$1 AND calls.workspace_id=$2 AND calls.status='awaiting_confirmation'
-         AND calls.action_authorization_id IS NOT DISTINCT FROM $3::uuid
-         AND confirmation.status='pending' AND confirmation.expires_at > now()
-         FOR UPDATE OF calls,confirmation,tasks`,
-        [params.id, request.user.workspaceId, linkedAuthorizationId],
-      );
-      if (!pending.rowCount || !pending.rows[0].task_id) {
-        await client.query('ROLLBACK');
-        return reply.code(409).send({ error: 'MCP_CONFIRMATION_NOT_PENDING' });
-      }
-      taskId = pending.rows[0].task_id;
-      workflowRunId = pending.rows[0].workflow_run_id;
-      traceId = authoritativeTraceContext(pending.rows[0]).traceId;
-      const actionAuthorizationId = pending.rows[0].action_authorization_id;
-      if (pending.rows[0].run_mode !== 'test') {
-        const row = pending.rows[0];
-        if (row.workflow_run_id && row.workflow_version_id && row.definition_snapshot) {
-          await assertWorkflowManifestDependencies({
-            workspaceId: request.user.workspaceId,
-            workflowVersionId: row.workflow_version_id,
-            definition: row.definition_snapshot,
-            manifest: row.run_execution_manifest,
-          }, client);
-        } else {
-          await assertTaskManifestDependencies({
-            workspaceId: request.user.workspaceId,
-            agentId: row.agent_id,
-            manifest: row.execution_manifest,
-          }, client);
-        }
-      }
-      if (actionAuthorizationId) {
-        const authorizationUpdated = await client.query(
-          `UPDATE action_authorizations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
-           WHERE id=$4 AND workspace_id=$5 AND status='awaiting_confirmation' AND expires_at>now()
-           RETURNING id`,
-          [
-            input.decision,
-            request.user.sub,
-            input.comment ?? null,
-            actionAuthorizationId,
-            request.user.workspaceId,
-          ],
-        );
-        if (authorizationUpdated.rowCount !== 1) {
-          await client.query('ROLLBACK');
-          return reply.code(409).send({ error: 'MCP_CONFIRMATION_NOT_PENDING' });
-        }
-      }
-      await client.query(
-        `UPDATE mcp_tool_confirmations SET status=$1,resolved_by=$2,decision_comment=$3,resolved_at=now()
-         WHERE tool_call_id=$4 AND status='pending'`,
-        [input.decision, request.user.sub, input.comment ?? null, params.id],
-      );
-      await client.query(
-        `UPDATE mcp_tool_calls SET status=$1,completed_at=CASE WHEN $1='rejected' THEN now() ELSE NULL END
-         WHERE id=$2 AND workspace_id=$3 AND status='awaiting_confirmation'`,
-        [input.decision === 'approved' ? 'pending' : 'rejected', params.id, request.user.workspaceId],
-      );
-      await client.query(
-        `UPDATE task_runtime_checkpoints SET status=$1,updated_at=now()
-         WHERE task_id=$2 AND pending_tool_call_id=$3 AND status='awaiting_confirmation'`,
-        [input.decision, taskId, params.id],
-      );
-      await client.query(
-        `UPDATE tasks SET status='queued',updated_at=now() WHERE id=$1 AND workspace_id=$2 AND status='awaiting_approval'`,
-        [taskId, request.user.workspaceId],
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-    try {
-      await enqueueTask(taskId, `${taskId}:${params.id}:${input.decision}`, traceId);
+      await enqueueTask(taskId, taskId + ':' + params.id + ':' + input.decision, traceId);
     } catch (queueError) {
-      const recovery = await db.connect();
-      try {
-        await recovery.query('BEGIN');
-        if (linkedAuthorizationId) {
-          const authorizationRestored = await recovery.query(
-            `UPDATE action_authorizations SET status='awaiting_confirmation',
-                    resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
-              WHERE id=$1 AND workspace_id=$2 AND status=$3
-              RETURNING id`,
-            [linkedAuthorizationId, request.user.workspaceId, input.decision],
-          );
-          if (authorizationRestored.rowCount !== 1) {
-            throw new Error('Unable to restore linked action authorization after enqueue failure');
-          }
-        }
-        await recovery.query(
-          `UPDATE mcp_tool_confirmations SET status='pending',
-                  resolved_by=NULL,decision_comment=NULL,resolved_at=NULL
-            WHERE tool_call_id=$1 AND status=$2`,
-          [params.id, input.decision],
-        );
-        await recovery.query(
-          `UPDATE mcp_tool_calls SET status='awaiting_confirmation',completed_at=NULL
-            WHERE id=$1 AND status=$2`,
-          [params.id, input.decision === 'approved' ? 'pending' : 'rejected'],
-        );
-        await recovery.query(
-          `UPDATE task_runtime_checkpoints SET status='awaiting_confirmation',updated_at=now()
-            WHERE task_id=$1 AND pending_tool_call_id=$2 AND status=$3`,
-          [taskId, params.id, input.decision],
-        );
-        await recovery.query(
-          `UPDATE tasks SET status='awaiting_approval',updated_at=now()
-            WHERE id=$1 AND workspace_id=$2 AND status='queued'`,
-          [taskId, request.user.workspaceId],
-        );
-        await recovery.query('COMMIT');
-      } catch (recoveryError) {
-        await recovery.query('ROLLBACK');
-        throw recoveryError;
-      } finally {
-        recovery.release();
-      }
+      await restoreMcpDecisionAfterQueueFailure(decision, taskId, linkedAuthorizationId);
       throw queueError;
-    }
-    await audit(request.user.workspaceId, request.user.sub, `mcp.tool_call.${input.decision}`, 'mcp_tool_call', params.id, {
+    }    await audit(request.user.workspaceId, request.user.sub, `mcp.tool_call.${input.decision}`, 'mcp_tool_call', params.id, {
       taskId,
       workflowRunId,
     });
     return { id: params.id, taskId, decision: input.decision };
   }));
+}
+
+export async function mcpToolCallRoutes(app: FastifyInstance) {
+  registerMcpToolCallListRoute(app);
+  registerMcpToolCallDecisionRoute(app);
 }

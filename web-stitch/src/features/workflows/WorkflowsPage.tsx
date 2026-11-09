@@ -1,7 +1,7 @@
 import type { Connection } from '@xyflow/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Blocks, Bot, BrainCircuit, CheckCircle2, Download, Edit3, Eye, FileOutput, GitBranch, Globe2, LoaderCircle, LockKeyhole, Play, Plus, RefreshCw, Rocket, Save, Search, ShieldCheck, TestTube2, Trash2, Wrench, X } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, type Artifact, type Workflow, type WorkflowDefinition, type WorkflowDryRun, type WorkflowEditorLayout, type WorkflowNode, type WorkflowNodeCatalogEntry, type WorkflowRegressionCase, type WorkflowResources, type WorkflowRun } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { OutputViewer } from '../../components/OutputViewer';
@@ -42,6 +42,25 @@ function configFor(type: WorkflowNode['type'], resources: WorkflowResources): Re
   if (type === 'loop') return { mode: 'forEach', collectionPath: 'input.items', itemVariable: 'item', indexVariable: 'index', maxIterations: 10, onLimit: 'fail' };
   if (type === 'approval') return { prompt: 'Review this workflow step before it continues.' };
   return {};
+}
+
+function nodeAvailabilityIssue(type: WorkflowNode['type'], definition: WorkflowNodeCatalogEntry | undefined, config: Record<string, unknown>) {
+  if (!definition?.available) return definition?.availabilityReason ?? 'That node is unavailable.';
+  if (type === 'agent' && !config.agentId) return 'Create or activate an agent before adding an Agent node.';
+  if (['action', 'api_action'].includes(type) && !config.toolId) return 'Connect an API tool before adding an API action.';
+  if (type === 'mcp_action' && (!config.agentId || !config.mcpToolId)) return 'Assign an enabled MCP tool to an active agent before adding an App action.';
+  return null;
+}
+
+function edgesAfterAddingNode(nodes: WorkflowNode[], edges: WorkflowDefinition['edges'], type: WorkflowNode['type'], nodeId: string) {
+  const isStarterConnection = nodes.length === 2
+    && edges.length === 1
+    && edges[0].source === nodes[0].id
+    && edges[0].target === nodes[1].id;
+  if (!isStarterConnection) return edges;
+  return ['condition', 'loop'].includes(type)
+    ? [{ source: nodes[0].id, target: nodeId }]
+    : [{ source: nodes[0].id, target: nodeId }, { source: nodeId, target: nodes[1].id }];
 }
 
 function cloneSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
@@ -185,18 +204,13 @@ export function WorkflowsPage() {
   const addNode = (type: WorkflowNode['type'], position?: { x: number; y: number }) => {
     if (['trigger', 'output'].includes(type)) return;
     const definition = catalog.find((entry) => entry.type === type);
-    if (!definition?.available) return reportError(definition?.availabilityReason ?? 'That node is unavailable.');
     const config = configFor(type, resources);
-    if (type === 'agent' && !config.agentId) return reportError('Create or activate an agent before adding an Agent node.');
-    if (['action', 'api_action'].includes(type) && !config.toolId) return reportError('Connect an API tool before adding an API action.');
-    if (type === 'mcp_action' && (!config.agentId || !config.mcpToolId)) return reportError('Assign an enabled MCP tool to an active agent before adding an App action.');
+    const unavailableReason = nodeAvailabilityIssue(type, definition, config);
+    if (unavailableReason) return reportError(unavailableReason);
     const node: WorkflowNode = { id: idFor(type), type, config };
     const outputIndex = Math.max(1, nodes.findIndex((item) => item.type === 'output'));
     const nextNodes = [...nodes.slice(0, outputIndex), node, ...nodes.slice(outputIndex)];
-    let nextEdges = edges;
-    if (nodes.length === 2 && edges.length === 1 && edges[0].source === nodes[0].id && edges[0].target === nodes[1].id) {
-      nextEdges = ['condition', 'loop'].includes(type) ? [{ source: nodes[0].id, target: node.id }] : [{ source: nodes[0].id, target: node.id }, { source: node.id, target: nodes[1].id }];
-    }
+    const nextEdges = edgesAfterAddingNode(nodes, edges, type, node.id);
     const nextPositions = [...positions, { nodeId: node.id, x: position?.x ?? 330, y: position?.y ?? 280 }];
     commit({ nodes: nextNodes, edges: nextEdges, positions: nextPositions });
     setSelectedNodeId(node.id);
@@ -301,14 +315,36 @@ export function WorkflowsPage() {
     <div className="workflow-editor-shell" ref={editorShellRef}>
       <div className="workflow-layout visual">
         <div className="workflow-side-dock">
-          <aside className="node-library panel">
-        <span className="eyebrow">Node library</span><h2>Drag work onto the canvas</h2><p>{simpleMode ? 'Common building blocks only. Switch to Advanced for branches, loops and legacy tools.' : 'All installed node types, including advanced control flow.'}</p>
-        <div className="library-mode-switch" role="group" aria-label="Node library mode"><button type="button" className={simpleMode ? 'active' : ''} aria-pressed={simpleMode} onClick={() => setSimpleMode(true)}>Simple</button><button type="button" className={!simpleMode ? 'active' : ''} aria-pressed={!simpleMode} onClick={() => setSimpleMode(false)}>Advanced</button></div>
-        {!simpleMode && resources.agents.length > 0 && <details className="quality-loop-builder"><summary>Build a quality-review loop</summary><label>Worker agent<select value={qualityWorkerId} onChange={(event) => setQualityWorkerId(event.target.value)}>{resources.agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Grader agent<select value={qualityGraderId} onChange={(event) => setQualityGraderId(event.target.value)}>{resources.agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Revision strategy<select value={qualityRevisionStrategy} onChange={(event) => setQualityRevisionStrategy(event.target.value as typeof qualityRevisionStrategy)}><option value="same_worker">Same worker</option><option value="dedicated_agent">Dedicated revision agent</option></select></label>{qualityRevisionStrategy === 'dedicated_agent' && <label>Revision agent<select value={qualityRevisionAgentId} onChange={(event) => setQualityRevisionAgentId(event.target.value)}>{resources.agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label>}<div className="quality-loop-numbers"><label>Passing score<input type="number" min="0" max="100" value={qualityPassingScore} onChange={(event) => setQualityPassingScore(Number(event.target.value))}/></label><label>Maximum revisions<input type="number" min="0" max="99" value={qualityMaximumRevisions} onChange={(event) => setQualityMaximumRevisions(Number(event.target.value))}/></label></div><label>When limit is reached<select value={qualityOnLimit} onChange={(event) => setQualityOnLimit(event.target.value as typeof qualityOnLimit)}><option value="human_review">Request human review</option><option value="return_best">Return best result with warning</option><option value="fail">Fail workflow</option></select></label><button className="button primary" type="button" disabled={!qualityWorkerId || !qualityGraderId || qualityTemplate.isPending || (qualityRevisionStrategy === 'dedicated_agent' && !qualityRevisionAgentId)} onClick={() => qualityTemplate.mutate()}>{qualityTemplate.isPending ? <LoaderCircle className="spin" size={14}/> : <BrainCircuit size={14}/>}Build editable loop</button><small>This replaces the current canvas and can be undone.</small></details>}
-        <label className="palette-search"><Search size={14}/><input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Search nodes"/></label>
-        <div className="node-palette">{palette.map((entry) => <button key={entry.type} type="button" draggable={entry.available} disabled={!entry.available} title={entry.available ? `Add ${entry.title}` : entry.availabilityReason} onDragStart={(event) => { event.dataTransfer.setData('application/woody-node', entry.type); event.dataTransfer.effectAllowed = 'move'; }} onClick={() => addNode(entry.type)}><span>{paletteIcon(entry.type)}</span><span><strong>{entry.title}</strong><small>{entry.available ? entry.description : entry.availabilityReason ?? entry.description}</small></span>{entry.available ? <Plus size={14}/> : <LockKeyhole size={13}/>}</button>)}</div>
-        <div className="resource-summary"><span><Bot size={14}/><strong>{resources.agents.length}</strong> agents</span><span><Blocks size={14}/><strong>{resources.mcpTools.length}</strong> app actions</span><span><BrainCircuit size={14}/><strong>{resources.knowledge.ready}</strong> ready documents</span></div>
-          </aside>
+          <WorkflowNodeLibrary
+            simpleMode={simpleMode}
+            setSimpleMode={setSimpleMode}
+            paletteSearch={paletteSearch}
+            setPaletteSearch={setPaletteSearch}
+            palette={palette}
+            resources={resources}
+            addNode={addNode}
+          >
+            <QualityLoopBuilder
+              visible={!simpleMode && resources.agents.length > 0}
+              agents={resources.agents}
+              workerId={qualityWorkerId}
+              setWorkerId={setQualityWorkerId}
+              graderId={qualityGraderId}
+              setGraderId={setQualityGraderId}
+              revisionStrategy={qualityRevisionStrategy}
+              setRevisionStrategy={setQualityRevisionStrategy}
+              revisionAgentId={qualityRevisionAgentId}
+              setRevisionAgentId={setQualityRevisionAgentId}
+              passingScore={qualityPassingScore}
+              setPassingScore={setQualityPassingScore}
+              maximumRevisions={qualityMaximumRevisions}
+              setMaximumRevisions={setQualityMaximumRevisions}
+              onLimit={qualityOnLimit}
+              setOnLimit={setQualityOnLimit}
+              pending={qualityTemplate.isPending}
+              build={() => qualityTemplate.mutate()}
+            />
+          </WorkflowNodeLibrary>
           {inspectorPanel}
         </div>
         <section className="workflow-canvas visual panel">
@@ -322,6 +358,51 @@ export function WorkflowsPage() {
     {dryRunResult && <DryRunPanel result={dryRunResult} dismiss={() => setDryRunResult(null)}/>}
     {runId && <WorkflowRunPanel detail={runDetail.data} loading={runDetail.isLoading} refresh={() => void runDetail.refetch()} decide={(approvalId, decision) => decide.mutate({ approvalId, decision })} decideAction={(authorizationId, decision) => decideAction.mutate({ authorizationId, decision })} deciding={decide.isPending || decideAction.isPending}/>}
   </div>;
+}
+
+function WorkflowNodeLibrary({ simpleMode, setSimpleMode, paletteSearch, setPaletteSearch, palette, resources, addNode, children }: {
+  simpleMode: boolean;
+  setSimpleMode: (mode: boolean) => void;
+  paletteSearch: string;
+  setPaletteSearch: (value: string) => void;
+  palette: WorkflowNodeCatalogEntry[];
+  resources: WorkflowResources;
+  addNode: (type: WorkflowNode['type']) => void;
+  children: ReactNode;
+}) {
+  return <aside className="node-library panel">
+    <span className="eyebrow">Node library</span><h2>Drag work onto the canvas</h2><p>{simpleMode ? 'Common building blocks only. Switch to Advanced for branches, loops and legacy tools.' : 'All installed node types, including advanced control flow.'}</p>
+    <div className="library-mode-switch" role="group" aria-label="Node library mode"><button type="button" className={simpleMode ? 'active' : ''} aria-pressed={simpleMode} onClick={() => setSimpleMode(true)}>Simple</button><button type="button" className={!simpleMode ? 'active' : ''} aria-pressed={!simpleMode} onClick={() => setSimpleMode(false)}>Advanced</button></div>
+    {children}
+    <label className="palette-search"><Search size={14}/><input value={paletteSearch} onChange={(event) => setPaletteSearch(event.target.value)} placeholder="Search nodes"/></label>
+    <div className="node-palette">{palette.map((entry) => <button key={entry.type} type="button" draggable={entry.available} disabled={!entry.available} title={entry.available ? `Add ${entry.title}` : entry.availabilityReason} onDragStart={(event) => { event.dataTransfer.setData('application/woody-node', entry.type); event.dataTransfer.effectAllowed = 'move'; }} onClick={() => addNode(entry.type)}><span>{paletteIcon(entry.type)}</span><span><strong>{entry.title}</strong><small>{entry.available ? entry.description : entry.availabilityReason ?? entry.description}</small></span>{entry.available ? <Plus size={14}/> : <LockKeyhole size={13}/>}</button>)}</div>
+    <div className="resource-summary"><span><Bot size={14}/><strong>{resources.agents.length}</strong> agents</span><span><Blocks size={14}/><strong>{resources.mcpTools.length}</strong> app actions</span><span><BrainCircuit size={14}/><strong>{resources.knowledge.ready}</strong> ready documents</span></div>
+  </aside>;
+}
+
+function QualityLoopBuilder({ visible, agents, workerId, setWorkerId, graderId, setGraderId, revisionStrategy, setRevisionStrategy, revisionAgentId, setRevisionAgentId, passingScore, setPassingScore, maximumRevisions, setMaximumRevisions, onLimit, setOnLimit, pending, build }: {
+  visible: boolean;
+  agents: WorkflowResources['agents'];
+  workerId: string;
+  setWorkerId: (value: string) => void;
+  graderId: string;
+  setGraderId: (value: string) => void;
+  revisionStrategy: 'same_worker' | 'dedicated_agent';
+  setRevisionStrategy: (value: 'same_worker' | 'dedicated_agent') => void;
+  revisionAgentId: string;
+  setRevisionAgentId: (value: string) => void;
+  passingScore: number;
+  setPassingScore: (value: number) => void;
+  maximumRevisions: number;
+  setMaximumRevisions: (value: number) => void;
+  onLimit: 'return_best' | 'human_review' | 'fail';
+  setOnLimit: (value: 'return_best' | 'human_review' | 'fail') => void;
+  pending: boolean;
+  build: () => void;
+}) {
+  if (!visible) return null;
+  const canBuild = Boolean(workerId && graderId) && !pending && (revisionStrategy !== 'dedicated_agent' || Boolean(revisionAgentId));
+  return <details className="quality-loop-builder"><summary>Build a quality-review loop</summary><label>Worker agent<select value={workerId} onChange={(event) => setWorkerId(event.target.value)}>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Grader agent<select value={graderId} onChange={(event) => setGraderId(event.target.value)}>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><label>Revision strategy<select value={revisionStrategy} onChange={(event) => setRevisionStrategy(event.target.value as typeof revisionStrategy)}><option value="same_worker">Same worker</option><option value="dedicated_agent">Dedicated revision agent</option></select></label>{revisionStrategy === 'dedicated_agent' && <label>Revision agent<select value={revisionAgentId} onChange={(event) => setRevisionAgentId(event.target.value)}>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label>}<div className="quality-loop-numbers"><label>Passing score<input type="number" min="0" max="100" value={passingScore} onChange={(event) => setPassingScore(Number(event.target.value))}/></label><label>Maximum revisions<input type="number" min="0" max="99" value={maximumRevisions} onChange={(event) => setMaximumRevisions(Number(event.target.value))}/></label></div><label>When limit is reached<select value={onLimit} onChange={(event) => setOnLimit(event.target.value as typeof onLimit)}><option value="human_review">Request human review</option><option value="return_best">Return best result with warning</option><option value="fail">Fail workflow</option></select></label><button className="button primary" type="button" disabled={!canBuild} onClick={build}>{pending ? <LoaderCircle className="spin" size={14}/> : <BrainCircuit size={14}/>}Build editable loop</button><small>This replaces the current canvas and can be undone.</small></details>;
 }
 
 function SchemaNodeInspector({ node, definition, nodes, edges, resources, update, remove }: { node: WorkflowNode; definition: WorkflowNodeCatalogEntry; nodes: WorkflowNode[]; edges: WorkflowDefinition['edges']; resources: WorkflowResources; update: (changes: Record<string, unknown>) => void; remove: () => void }) {

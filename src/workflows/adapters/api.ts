@@ -10,6 +10,33 @@ import {
 import { childTraceContext } from '../../runtime/trace.js';
 import { preserveActionFailure, uncertainActionOutcome } from '../../runtime/errors.js';
 import { expirationPolicy } from '../../runtime/approval-expiry.js';
+import { allowedAuthorizationId, completedAuthorizationResult } from './authorization-result.js';
+
+async function executeAuthorizedApiAction(input: {
+  context: WorkflowAdapterContext;
+  tool: ToolRecord;
+  arguments_: Record<string, unknown>;
+  authorizationId: string;
+  actionTrace: ReturnType<typeof childTraceContext>;
+}) {
+  const { context, tool, arguments_, authorizationId, actionTrace } = input;
+  const { execution, node, emitEvent, setNodeOutput } = context;
+  if (!(await beginWorkflowAction(authorizationId, execution.leaseOwnerId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
+  await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId, toolId: tool.id }, actionTrace);
+  try {
+    const output = limitedActionResult(await invokeTool(tool, arguments_, false, execution.signal));
+    await completeWorkflowAction(authorizationId, output, execution.leaseOwnerId);
+    await emitEvent('api.completed', `${tool.name} completed`, { authorizationId, toolId: tool.id }, actionTrace);
+    setNodeOutput(output);
+    return { output, result: output };
+  } catch (error) {
+    const failure = toolRiskLevel(tool) === 'read' ? error : uncertainActionOutcome(error);
+    throw await preserveActionFailure(
+      failure,
+      () => failWorkflowAction(authorizationId, failure, execution.leaseOwnerId),
+    );
+  }
+}
 
 export async function executeApiActionNode(context: WorkflowAdapterContext) {
   const { execution, run, node, cursor, iterationKey, emitEvent, resolve, setNodeOutput } = context;
@@ -55,24 +82,8 @@ export async function executeApiActionNode(context: WorkflowAdapterContext) {
     await emitEvent('action.confirmation_requested', `Confirmation is required before ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
     return { waiting: true, waitingMessage: `Confirm ${tool.name} before Woody continues`, output: null };
   }
-  if (authorization.status === 'denied') throw Object.assign(new Error(authorization.reason), { retryable: false });
-  if (authorization.status === 'completed') {
-    setNodeOutput(authorization.result);
-    return { output: authorization.result, result: authorization.result };
-  }
-  if (!(await beginWorkflowAction(authorization.authorizationId, execution.leaseOwnerId))) throw Object.assign(new Error('External action execution could not be claimed safely'), { retryable: false });
-  await emitEvent('api.called', `Calling ${tool.name}`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
-  try {
-    const output = limitedActionResult(await invokeTool(tool, arguments_, false, execution.signal));
-    await completeWorkflowAction(authorization.authorizationId, output, execution.leaseOwnerId);
-    await emitEvent('api.completed', `${tool.name} completed`, { authorizationId: authorization.authorizationId, toolId: tool.id }, actionTrace);
-    setNodeOutput(output);
-    return { output, result: output };
-  } catch (error) {
-    const failure = toolRiskLevel(tool) === 'read' ? error : uncertainActionOutcome(error);
-    throw await preserveActionFailure(
-      failure,
-      () => failWorkflowAction(authorization.authorizationId, failure, execution.leaseOwnerId),
-    );
-  }
+  const completed = completedAuthorizationResult(authorization, setNodeOutput);
+  if (completed) return completed;
+  const authorizationId = allowedAuthorizationId(authorization);
+  return executeAuthorizedApiAction({ context, tool, arguments_, authorizationId, actionTrace });
 }

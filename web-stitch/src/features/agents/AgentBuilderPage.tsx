@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Bot, BrainCircuit, Check, ChevronLeft, ChevronRight, Code2, Database, FileText, Globe2, House, LoaderCircle, Play, Rocket, Save, Settings, ShieldCheck, Sparkles, Wrench, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, isApiTool, type Agent, type AgentAvatarConfig, type AgentPromptTone } from '../../api';
+import { api, isApiTool, type Agent, type AgentAvatarConfig, type AgentMcpAccess, type AgentPromptTone, type Tool } from '../../api';
 import { useWorkspace } from '../../app/workspace';
 import { Status } from '../../components/ui';
 import { humanize } from '../../lib/format';
@@ -50,6 +50,44 @@ function fromAgent(agent?: Agent, defaultModel = ''): Draft {
   };
 }
 
+function validateAgentDraft(draft: Draft) {
+  return {
+    purpose: draft.name.trim().length >= 2 && draft.role.trim().length >= 2 && draft.goal.trim().length >= 2,
+    instructions: draft.instructions.trim().length >= 10,
+    resources: true,
+    model: draft.model.trim().length >= 2 && draft.maxTokens >= 128,
+    review: false,
+  };
+}
+
+function assignedApiTools(draft: Draft, tools: Tool[]) {
+  const apiTools = tools.filter(isApiTool);
+  const enabledApiTools = apiTools.filter((tool) => tool.enabled);
+  const normalizedToolAssignment = normalizeAgentApiToolIds(draft.toolIds, tools);
+  const activeTools = enabledApiTools.filter((tool) => normalizedToolAssignment.toolIds.includes(tool.id));
+  const activeWebTools = activeTools.filter((tool) => tool.permissions.includes('web.read'));
+  return { enabledApiTools, normalizedToolAssignment, activeTools, activeWebTools };
+}
+
+function mcpAccessReview(agentExists: boolean, loading: boolean, failed: boolean, access?: AgentMcpAccess): {
+  summary: string;
+  reviewStatus: ReviewStatus;
+  reviewIndicator?: ReviewIndicator;
+} {
+  const connectionCount = access?.connections.length ?? 0;
+  const state = !agentExists ? 'unsaved' : loading ? 'loading' : failed ? 'error' : 'loaded';
+  const summary = state === 'unsaved'
+    ? 'Save this agent before assigning MCP access'
+    : state === 'error'
+      ? 'MCP access could not be loaded'
+      : state === 'loading'
+        ? 'Loading MCP access…'
+        : mcpAccessSummary(access);
+  const reviewStatus = state === 'loaded' ? connectionCount ? 'warning' : 'success' : state === 'error' ? 'warning' : 'neutral';
+  const reviewIndicator: ReviewIndicator | undefined = state === 'loading' ? 'loading' : state === 'unsaved' ? 'none' : undefined;
+  return { summary, reviewStatus, reviewIndicator };
+}
+
 export function AgentBuilderPage() {
   const { agentId } = useParams();
   const navigate = useNavigate();
@@ -70,19 +108,9 @@ export function AgentBuilderPage() {
     });
   }, [agent, defaultModel]);
 
-  const validation = {
-    purpose: draft.name.trim().length >= 2 && draft.role.trim().length >= 2 && draft.goal.trim().length >= 2,
-    instructions: draft.instructions.trim().length >= 10,
-    resources: true,
-    model: draft.model.trim().length >= 2 && draft.maxTokens >= 128,
-    review: false,
-  };
+  const validation = validateAgentDraft(draft);
   const ready = validation.purpose && validation.model;
-  const apiTools = data.tools.filter(isApiTool);
-  const enabledApiTools = apiTools.filter((tool) => tool.enabled);
-  const normalizedToolAssignment = normalizeAgentApiToolIds(draft.toolIds, data.tools);
-  const activeTools = enabledApiTools.filter((tool) => normalizedToolAssignment.toolIds.includes(tool.id));
-  const activeWebTools = activeTools.filter((tool) => tool.permissions.includes('web.read'));
+  const { enabledApiTools, normalizedToolAssignment, activeTools, activeWebTools } = assignedApiTools(draft, data.tools);
   const webReady = !draft.capabilities.webBrowser || activeWebTools.length > 0;
   const currentIndex = steps.findIndex((item) => item.id === step);
   const mcpAccess = useQuery({
@@ -90,20 +118,12 @@ export function AgentBuilderPage() {
     queryFn: () => api.agentMcpAccess(agent!.id),
     enabled: Boolean(agent?.id),
   });
-  const mcpAccessState = !agent ? 'unsaved' : mcpAccess.isLoading ? 'loading' : mcpAccess.isError ? 'error' : 'loaded';
-  const mcpSummary = mcpAccessState === 'unsaved'
-    ? 'Save this agent before assigning MCP access'
-    : mcpAccessState === 'error'
-      ? 'MCP access could not be loaded'
-      : mcpAccessState === 'loading'
-      ? 'Loading MCP access…'
-      : mcpAccessSummary(mcpAccess.data);
-  const mcpReviewStatus = mcpAccessState === 'loaded'
-    ? mcpAccess.data?.connections.length ? 'warning' : 'success'
-    : mcpAccessState === 'error' ? 'warning' : 'neutral';
-  const mcpReviewIndicator: ReviewIndicator | undefined = mcpAccessState === 'loading'
-    ? 'loading'
-    : mcpAccessState === 'unsaved' ? 'none' : undefined;
+  const { summary: mcpSummary, reviewStatus: mcpReviewStatus, reviewIndicator: mcpReviewIndicator } = mcpAccessReview(
+    Boolean(agent),
+    mcpAccess.isLoading,
+    mcpAccess.isError,
+    mcpAccess.data,
+  );
 
   const mutation = useMutation({
     mutationFn: async (status: Agent['status']) => {

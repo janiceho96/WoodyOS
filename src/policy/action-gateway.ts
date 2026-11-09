@@ -142,6 +142,49 @@ async function subjectAllowsActions(input: Pick<ActionRequest, 'workspaceId' | '
   return result.rows[0]?.subject_allows_actions !== false;
 }
 
+async function findExistingActionAuthorization(
+  input: ActionRequest,
+  hash: string,
+  subject: ReturnType<typeof subjectColumns>,
+) {
+  return (await query<AuthorizationRow>(
+    `SELECT id,status,result_summary,encrypted_result,error_message,expires_at,workspace_id,subject_type,workflow_run_id,task_id
+     FROM action_authorizations
+     WHERE subject_type=$1
+       AND workflow_run_id IS NOT DISTINCT FROM $2::uuid
+       AND task_id IS NOT DISTINCT FROM $3::uuid
+       AND action_key=$4 AND adapter=$5 AND resource_id=$6 AND operation=$7 AND arguments_hash=$8
+     ORDER BY requested_at DESC LIMIT 1`,
+    [input.subject.type, subject.workflowRunId, subject.taskId, input.actionKey, input.adapter, input.resourceId, input.operation, hash],
+  )).rows[0];
+}
+
+function existingAuthorizationResult(existing: AuthorizationRow) {
+  if (existing.status === 'awaiting_confirmation' && new Date(existing.expires_at).getTime() <= Date.now()) {
+    return { status: 'denied' as const, authorizationId: existing.id, reason: 'Action confirmation expired' };
+  }
+  if (existing.status === 'awaiting_confirmation') return { status: 'awaiting_confirmation' as const, authorizationId: existing.id };
+  if (existing.status === 'approved') return { status: 'allowed' as const, authorizationId: existing.id };
+  if (existing.status === 'executing') {
+    return {
+      status: 'denied' as const,
+      authorizationId: existing.id,
+      reason: 'The previous external action may still be executing. Woody stopped instead of risking a duplicate write.',
+    };
+  }
+  if (existing.status === 'consumed') {
+    const result = existing.encrypted_result
+      ? decryptJsonWithContext(existing.encrypted_result, resultContext(existing)).value
+      : existing.result_summary;
+    return { status: 'completed' as const, authorizationId: existing.id, result };
+  }
+  return {
+    status: 'denied' as const,
+    authorizationId: existing.id,
+    reason: existing.error_message ?? `Action was ${existing.status}`,
+  };
+}
+
 async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalSatisfied = false) {
   if (!(await subjectAllowsActions(input))) {
     return {
@@ -152,32 +195,8 @@ async function authorizeActionWithTrust(input: ActionRequest, precedingApprovalS
   }
   const hash = actionArgumentHash(input.arguments);
   const subject = subjectColumns(input.subject);
-  const existing = (await query<AuthorizationRow>(
-    `SELECT id,status,result_summary,encrypted_result,error_message,expires_at,workspace_id,subject_type,workflow_run_id,task_id
-     FROM action_authorizations
-     WHERE subject_type=$1
-       AND workflow_run_id IS NOT DISTINCT FROM $2::uuid
-       AND task_id IS NOT DISTINCT FROM $3::uuid
-       AND action_key=$4 AND adapter=$5 AND resource_id=$6 AND operation=$7 AND arguments_hash=$8
-     ORDER BY requested_at DESC LIMIT 1`,
-    [input.subject.type, subject.workflowRunId, subject.taskId, input.actionKey, input.adapter, input.resourceId, input.operation, hash],
-  )).rows[0];
-
-  if (existing) {
-    if (existing.status === 'awaiting_confirmation' && new Date(existing.expires_at).getTime() <= Date.now()) {
-      return { status: 'denied' as const, authorizationId: existing.id, reason: 'Action confirmation expired' };
-    }
-    if (existing.status === 'awaiting_confirmation') return { status: 'awaiting_confirmation' as const, authorizationId: existing.id };
-    if (existing.status === 'approved') return { status: 'allowed' as const, authorizationId: existing.id };
-    if (existing.status === 'executing') return { status: 'denied' as const, authorizationId: existing.id, reason: 'The previous external action may still be executing. Woody stopped instead of risking a duplicate write.' };
-    if (existing.status === 'consumed') {
-      const result = existing.encrypted_result
-        ? decryptJsonWithContext(existing.encrypted_result, resultContext(existing)).value
-        : existing.result_summary;
-      return { status: 'completed' as const, authorizationId: existing.id, result };
-    }
-    return { status: 'denied' as const, authorizationId: existing.id, reason: existing.error_message ?? `Action was ${existing.status}` };
-  }
+  const existing = await findExistingActionAuthorization(input, hash, subject);
+  if (existing) return existingAuthorizationResult(existing);
 
   const status = actionNeedsConfirmation(input.riskLevel) && !precedingApprovalSatisfied
     ? 'awaiting_confirmation'

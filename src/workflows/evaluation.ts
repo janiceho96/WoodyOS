@@ -244,6 +244,96 @@ export function evaluateRegressionAssertions(output: unknown, measurements: Eval
   });
 }
 
+type FixtureNodeResult =
+  | { kind: 'continue'; output: unknown; result: unknown; costDelta?: number; qualityScore?: number }
+  | { kind: 'finish'; output: unknown };
+
+type FixtureNodeContext = {
+  input: FixtureEvaluationInput;
+  manifest: ExecutionManifest;
+  state: Record<string, unknown>;
+  cursor: WorkflowCursor;
+};
+
+function fixtureTriggerResult(context: FixtureNodeContext): FixtureNodeResult {
+  return { kind: 'continue', output: context.state.input, result: context.state.input };
+}
+
+function fixtureExternalResult(node: WorkflowNode, identity: NonNullable<ReturnType<typeof externalIdentity>>, context: FixtureNodeContext): FixtureNodeResult {
+  const { input, manifest, state } = context;
+  if (!Object.hasOwn(input.fixtures, identity.key)) {
+    throw evaluationError('EVALUATION_FIXTURE_REQUIRED', `Fixture ${identity.key} is required for ${node.id}`, { nodeId: node.id, fixtureKey: identity.key });
+  }
+  const resolvedInput = externalFixtureInput(node, state);
+  const fixture = structuredClone(input.fixtures[identity.key]);
+  const fixtureRecord = asRecord(fixture);
+  if (fixtureRecord && Object.hasOwn(fixtureRecord, 'expectedInput') && !jsonEquals(fixtureRecord.expectedInput, resolvedInput)) {
+    throw evaluationError('EVALUATION_FIXTURE_INPUT_MISMATCH', `Fixture ${identity.key} does not match resolved node input`, { nodeId: node.id, fixtureKey: identity.key });
+  }
+  const output = node.type === 'knowledge_search'
+    ? knowledgeFixtureOutput(fixture, resolvedInput, node.id, identity.key)
+    : fixtureRecord && Object.hasOwn(fixtureRecord, 'output') ? fixtureRecord.output : fixture;
+  return { kind: 'continue', output, result: output };
+}
+
+async function fixtureAgentResult(node: WorkflowNode, context: FixtureNodeContext): Promise<FixtureNodeResult> {
+  const { input, manifest, state } = context;
+  if (!input.executeModel) throw evaluationError('EVALUATION_MODEL_EXECUTOR_REQUIRED', `Evaluation needs a pinned model executor for agent node ${node.id}`, { nodeId: node.id });
+  const agentId = node.config.agentId;
+  if (typeof agentId !== 'string' || !manifest.agents[agentId]) {
+    throw evaluationError('EVALUATION_MANIFEST_RESOURCE_MISSING', `Pinned manifest does not authorize agent ${String(agentId)}`, { nodeId: node.id });
+  }
+  const mappedInput = resolveNodeInput(asRecord(node.config.inputMapping) ?? undefined, state);
+  const model = await input.executeModel({ node: { ...node, config: { ...node.config, input: mappedInput } }, state });
+  return {
+    kind: 'continue',
+    output: model.output,
+    result: model.output,
+    costDelta: Number.isFinite(model.costUsd) ? Number(model.costUsd) : 0,
+    ...(typeof model.qualityScore === 'number' && Number.isFinite(model.qualityScore) ? { qualityScore: model.qualityScore } : {}),
+  };
+}
+
+function fixtureApprovalResult(node: WorkflowNode, context: FixtureNodeContext): FixtureNodeResult {
+  const key = evaluationFixtureKey('approval', node.id, 'decision');
+  if (!Object.hasOwn(context.input.fixtures, key)) {
+    throw evaluationError('EVALUATION_APPROVAL_FIXTURE_REQUIRED', `Fixture ${key} is required for approval node ${node.id}`, { nodeId: node.id, fixtureKey: key });
+  }
+  if (!approvalDecision(context.input.fixtures[key], node.id)) {
+    throw evaluationError('EVALUATION_APPROVAL_REJECTED', `Approval fixture rejected node ${node.id}`, { nodeId: node.id, fixtureKey: key });
+  }
+  const output = { approved: true, mode: 'evaluation' };
+  return { kind: 'continue', output, result: output };
+}
+
+function fixtureOutputResult(node: WorkflowNode, state: Record<string, unknown>): FixtureNodeResult {
+  if (asRecord(node.config.output)) Object.assign(state, node.config.output);
+  const fromNodeId = node.config.fromNodeId;
+  if (typeof fromNodeId === 'string' && !(fromNodeId in state)) {
+    throw evaluationError('EVALUATION_OUTPUT_UNAVAILABLE', `Output node ${node.id} references unavailable result ${fromNodeId}`);
+  }
+  return { kind: 'finish', output: typeof fromNodeId === 'string' ? state[fromNodeId] : state };
+}
+
+async function evaluateFixtureNode(node: WorkflowNode, context: FixtureNodeContext): Promise<FixtureNodeResult> {
+  if (node.type === 'trigger') return fixtureTriggerResult(context);
+  const identity = externalIdentity(node, context.manifest);
+  if (identity) return fixtureExternalResult(node, identity, context);
+
+  if (node.type === 'agent') return fixtureAgentResult(node, context);
+  if (node.type === 'condition') {
+    const result = evaluateCondition(node.config, context.state);
+    return { kind: 'continue', output: result, result };
+  }
+  if (node.type === 'loop') {
+    const loop = loopResult(node, context.cursor, context.state);
+    return { kind: 'continue', output: loop.output, result: loop.branch };
+  }
+  if (node.type === 'approval') return fixtureApprovalResult(node, context);
+  if (node.type === 'output') return fixtureOutputResult(node, context.state);
+  throw evaluationError('EVALUATION_NODE_UNSUPPORTED', `Evaluation does not support node type ${node.type}`, { nodeId: node.id, type: node.type });
+}
+
 export async function runFixtureEvaluation(input: FixtureEvaluationInput): Promise<FixtureEvaluationResult> {
   const assertions = validateRegressionAssertions(input.assertions);
   validateEvaluationFixtures(input.fixtures);
@@ -271,63 +361,22 @@ export async function runFixtureEvaluation(input: FixtureEvaluationInput): Promi
   const started = performance.now();
 
   for (let step = 0; current && cursor && step <= WORKFLOW_STEP_LIMIT; step += 1) {
-    let nodeOutput: unknown = null;
-    let result: unknown;
-    const identity = externalIdentity(current, manifest);
-    if (current.type === 'trigger') {
-      nodeOutput = state.input;
-      result = nodeOutput;
-    } else if (identity) {
-      if (!Object.hasOwn(input.fixtures, identity.key)) throw evaluationError('EVALUATION_FIXTURE_REQUIRED', `Fixture ${identity.key} is required for ${current.id}`, { nodeId: current.id, fixtureKey: identity.key });
-      const resolvedInput = externalFixtureInput(current, state);
-      const fixture = structuredClone(input.fixtures[identity.key]);
-      const fixtureRecord = asRecord(fixture);
-      if (fixtureRecord && Object.hasOwn(fixtureRecord, 'expectedInput') && !jsonEquals(fixtureRecord.expectedInput, resolvedInput)) {
-        throw evaluationError('EVALUATION_FIXTURE_INPUT_MISMATCH', `Fixture ${identity.key} does not match resolved node input`, { nodeId: current.id, fixtureKey: identity.key });
-      }
-      nodeOutput = current.type === 'knowledge_search'
-        ? knowledgeFixtureOutput(fixture, resolvedInput, current.id, identity.key)
-        : fixtureRecord && Object.hasOwn(fixtureRecord, 'output') ? fixtureRecord.output : fixture;
-      result = nodeOutput;
-    } else if (current.type === 'agent') {
-      if (!input.executeModel) throw evaluationError('EVALUATION_MODEL_EXECUTOR_REQUIRED', `Evaluation needs a pinned model executor for agent node ${current.id}`, { nodeId: current.id });
-      const agentId = current.config.agentId;
-      if (typeof agentId !== 'string' || !manifest.agents[agentId]) throw evaluationError('EVALUATION_MANIFEST_RESOURCE_MISSING', `Pinned manifest does not authorize agent ${String(agentId)}`, { nodeId: current.id });
-      const mappedInput = resolveNodeInput(asRecord(current.config.inputMapping) ?? undefined, state);
-      const model = await input.executeModel({ node: { ...current, config: { ...current.config, input: mappedInput } }, state });
-      nodeOutput = model.output;
-      costUsd += Number.isFinite(model.costUsd) ? Number(model.costUsd) : 0;
-      if (typeof model.qualityScore === 'number' && Number.isFinite(model.qualityScore)) qualityScore = model.qualityScore;
-      result = nodeOutput;
-    } else if (current.type === 'condition') {
-      result = evaluateCondition(current.config, state);
-      nodeOutput = result;
-    } else if (current.type === 'loop') {
-      const loop = loopResult(current, cursor, state);
-      result = loop.branch;
-      nodeOutput = loop.output;
-    } else if (current.type === 'approval') {
-      const key = evaluationFixtureKey('approval', current.id, 'decision');
-      if (!Object.hasOwn(input.fixtures, key)) throw evaluationError('EVALUATION_APPROVAL_FIXTURE_REQUIRED', `Fixture ${key} is required for approval node ${current.id}`, { nodeId: current.id, fixtureKey: key });
-      if (!approvalDecision(input.fixtures[key], current.id)) throw evaluationError('EVALUATION_APPROVAL_REJECTED', `Approval fixture rejected node ${current.id}`, { nodeId: current.id, fixtureKey: key });
-      nodeOutput = { approved: true, mode: 'evaluation' };
-      result = nodeOutput;
-    } else if (current.type === 'output') {
-      if (asRecord(current.config.output)) Object.assign(state, current.config.output);
-      const fromNodeId = current.config.fromNodeId;
-      output = typeof fromNodeId === 'string' ? state[fromNodeId] : state;
-      if (typeof fromNodeId === 'string' && !(fromNodeId in state)) throw evaluationError('EVALUATION_OUTPUT_UNAVAILABLE', `Output node ${current.id} references unavailable result ${fromNodeId}`);
+    const evaluated = await evaluateFixtureNode(current, { input, manifest, state, cursor });
+    if (evaluated.kind === 'finish') {
+      output = evaluated.output;
       const durationMs = input.measurements?.durationMs ?? Math.round(performance.now() - started);
       const measurements = { costUsd, durationMs, qualityScore };
       const assertionResults = evaluateRegressionAssertions(output, measurements, assertions);
       return { status: assertionResults.every((result) => result.passed) ? 'passed' : 'failed', output, assertionResults, measurements };
-    } else throw evaluationError('EVALUATION_NODE_UNSUPPORTED', `Evaluation does not support node type ${current.type}`, { nodeId: current.id, type: current.type });
+    }
 
     if (current.type !== 'trigger') {
-      state[current.id] = nodeOutput;
-      (state.nodes as Record<string, unknown>)[current.id] = nodeOutput;
+      state[current.id] = evaluated.output;
+      (state.nodes as Record<string, unknown>)[current.id] = evaluated.output;
     }
-    const advanced = advanceWorkflowCursor(input.definition, cursor, current, result);
+    costUsd += evaluated.costDelta ?? 0;
+    if (evaluated.qualityScore !== undefined) qualityScore = evaluated.qualityScore;
+    const advanced = advanceWorkflowCursor(input.definition, cursor, current, evaluated.result);
     if (!advanced) throw evaluationError('EVALUATION_PATH_INVALID', `Node ${current.id} did not resolve an outgoing edge`, { nodeId: current.id });
     cursor = advanced.cursor;
     current = nodes.get(cursor.nodeId);

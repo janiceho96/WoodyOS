@@ -1,7 +1,6 @@
 import { lookup } from 'node:dns/promises';
-import { request as httpRequest } from 'node:http';
-import { request as httpsRequest } from 'node:https';
 import { isIP, type LookupFunction } from 'node:net';
+import { Agent, buildConnector } from 'undici';
 import { isPublicIp } from '../../lib/network.js';
 import { combinedAbortSignal } from '../../runtime/cancellation.js';
 
@@ -34,11 +33,14 @@ export function validatedPublicHttpsUrl(raw: string) {
 }
 
 async function pinnedAddress(url: URL) {
-  if (isIP(url.hostname)) {
-    if (!isPublicIp(url.hostname)) throw Object.assign(new Error('Private, local, and reserved addresses are blocked'), { statusCode: 400 });
-    return { address: url.hostname, family: isIP(url.hostname) as 4 | 6 };
+  const hostname = url.hostname.startsWith('[') && url.hostname.endsWith(']')
+    ? url.hostname.slice(1, -1)
+    : url.hostname;
+  if (isIP(hostname)) {
+    if (!isPublicIp(hostname)) throw Object.assign(new Error('Private, local, and reserved addresses are blocked'), { statusCode: 400 });
+    return { address: hostname, family: isIP(hostname) as 4 | 6 };
   }
-  const addresses = await lookup(url.hostname, { all: true, verbatim: true });
+  const addresses = await lookup(hostname, { all: true, verbatim: true });
   if (!addresses.length || addresses.some(({ address }) => !isPublicIp(address))) {
     throw Object.assign(new Error('The hostname resolves to a private, local, or reserved address'), { statusCode: 400 });
   }
@@ -68,51 +70,55 @@ function headerMap(headers: Record<string, string | string[] | undefined>) {
 async function oneRequest(url: URL, options: Required<Pick<SafeHttpOptions, 'method' | 'timeoutMs' | 'maxBytes'>> & SafeHttpOptions) {
   options.signal?.throwIfAborted();
   const pinned = await pinnedAddress(url);
-  const transport = url.protocol === 'https:' ? httpsRequest : httpRequest;
-  return new Promise<SafeHttpResponse>((resolve, reject) => {
-    let settled = false;
-    const finishError = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-    const request = transport(url, {
+  const agent = new Agent({ connect: buildConnector({ lookup: createPinnedLookup(pinned) }), connections: 1, pipelining: 0 });
+  let response: Response | undefined;
+  try {
+    const headers = Object.fromEntries(Object.entries(options.headers ?? {}).filter(([name]) => name.toLowerCase() !== 'host'));
+    response = await fetch(url, {
       method: options.method,
       headers: {
         accept: 'application/json, text/html;q=0.9, text/plain;q=0.8',
         'user-agent': 'Woody-Agent-OS/0.1 (+local-user-controlled-web-research)',
-        ...options.headers,
-        host: url.host,
+        ...headers,
       },
-      lookup: createPinnedLookup(pinned),
-      servername: url.hostname,
-      timeout: options.timeoutMs,
+      body: options.body,
       signal: combinedAbortSignal(options.signal, options.timeoutMs),
-    }, (response) => {
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      response.on('data', (chunk: Buffer | string) => {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        bytes += buffer.length;
-        if (bytes > options.maxBytes) {
-          response.destroy();
-          finishError(Object.assign(new Error(`Response exceeded the ${options.maxBytes.toLocaleString()} byte safety limit`), { statusCode: 413 }));
-          return;
-        }
-        chunks.push(buffer);
-      });
-      response.on('end', () => {
-        if (settled) return;
-        settled = true;
-        resolve({ status: response.statusCode ?? 0, headers: headerMap(response.headers), body: Buffer.concat(chunks), url: url.toString() });
-      });
-      response.on('error', finishError);
-    });
-    request.on('timeout', () => request.destroy(Object.assign(new Error('External request timed out'), { statusCode: 504 })));
-    request.on('error', finishError);
-    if (options.body) request.write(options.body);
-    request.end();
-  });
+      redirect: 'manual',
+      dispatcher: agent,
+    } as RequestInit & { dispatcher: Agent; redirect: 'manual' });
+    const body = await readResponseBody(response, options.maxBytes);
+    return {
+      status: response.status,
+      headers: headerMap(Object.fromEntries(response.headers.entries())),
+      body,
+      url: url.toString(),
+    };
+  } finally {
+    if (response?.body && !response.body.locked) await response.body.cancel().catch(() => undefined);
+    await agent.close();
+  }
+}
+
+async function readResponseBody(response: Response, maxBytes: number) {
+  const reader = response.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        throw Object.assign(new Error(`Response exceeded the ${maxBytes.toLocaleString()} byte safety limit`), { statusCode: 413 });
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, bytes);
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export async function safeHttpRequest(rawUrl: string, options: SafeHttpOptions = {}): Promise<SafeHttpResponse> {

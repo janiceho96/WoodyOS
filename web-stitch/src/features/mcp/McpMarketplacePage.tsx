@@ -230,12 +230,49 @@ function CatalogCard({ server, install }: { server: McpCatalogServer; install: (
   return <article className="mcp-catalog-card panel"><div className="mcp-card-head"><AppBrandMark appId="mcp" title={server.title}/><span className="transport-tag">COMMUNITY HTTP</span></div><h2>{server.title}</h2><code>{server.registry_name}</code><p>{server.description || 'No server description was provided.'}</p><div className="mcp-card-meta"><span><ServerCog size={13}/>{endpointCount} endpoint{endpointCount === 1 ? '' : 's'}</span>{server.repository_url && <a href={server.repository_url} target="_blank" rel="noreferrer">Repository <ExternalLink size={12}/></a>}</div><button className="button" onClick={install}>Review community server</button></article>;
 }
 
+type McpAuthType = 'none' | 'bearer' | 'custom_headers' | 'oauth2';
+
+function authFromInstallForm(form: FormData, authType: McpAuthType, curated: CuratedMcpApp | null): { auth: Record<string, unknown>; error?: string } {
+  if (authType === 'bearer') return { auth: { type: 'bearer', token: String(form.get('token')) } };
+  if (authType === 'custom_headers') {
+    try {
+      return { auth: { type: 'custom_headers', headers: JSON.parse(String(form.get('headers'))) } };
+    } catch {
+      return { auth: { type: authType }, error: 'Custom headers must be a valid JSON object' };
+    }
+  }
+  if (authType === 'oauth2' && curated?.requiresOAuthClient) {
+    return {
+      auth: {
+        type: 'oauth2',
+        clientId: String(form.get('oauthClientId')),
+        clientSecret: String(form.get('oauthClientSecret')),
+      },
+    };
+  }
+  return { auth: { type: authType } };
+}
+
+function connectionInput(target: Exclude<InstallTarget, null>, form: FormData, auth: Record<string, unknown>, endpoint?: McpCatalogServer['endpoints'][number]): Parameters<typeof api.createMcpConnection>[0] {
+  if (target.kind === 'custom') {
+    return {
+      name: String(form.get('name')),
+      description: String(form.get('description')),
+      endpointUrl: String(form.get('endpointUrl')),
+      transport: 'streamable-http',
+      auth,
+    };
+  }
+  if (target.kind === 'curated') return { curatedAppId: target.app.id, auth };
+  return { catalogServerId: target.server.id, catalogEndpointId: endpoint?.id, auth };
+}
+
 function InstallDialog({ target, cancel, complete }: { target: Exclude<InstallTarget, null>; cancel: () => void; complete: (connectionId: string) => void }) {
   const { report, reportError } = useWorkspace();
   const queryClient = useQueryClient();
   const curated = target.kind === 'curated' ? target.app : null;
   const catalogServer = target.kind === 'catalog' ? target.server : null;
-  const [authType, setAuthType] = useState<'none' | 'bearer' | 'custom_headers' | 'oauth2'>(curated?.defaultAuth ?? 'none');
+  const [authType, setAuthType] = useState<McpAuthType>(curated?.defaultAuth ?? 'none');
   const mutation = useMutation({
     mutationFn: api.createMcpConnection,
     onSuccess: async (connection) => {
@@ -269,37 +306,12 @@ function InstallDialog({ target, cancel, complete }: { target: Exclude<InstallTa
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    let auth: Record<string, unknown> = { type: authType };
-    if (authType === 'bearer') auth = { type: 'bearer', token: String(form.get('token')) };
-    if (authType === 'custom_headers') {
-      try {
-        auth = { type: 'custom_headers', headers: JSON.parse(String(form.get('headers'))) };
-      } catch {
-        reportError('Custom headers must be a valid JSON object');
-        return;
-      }
+    const auth = authFromInstallForm(form, authType, curated);
+    if (auth.error) {
+      reportError(auth.error);
+      return;
     }
-    if (authType === 'oauth2' && curated?.requiresOAuthClient) {
-      auth = {
-        type: 'oauth2',
-        clientId: String(form.get('oauthClientId')),
-        clientSecret: String(form.get('oauthClientSecret')),
-      };
-    }
-    mutation.mutate(target.kind === 'custom' ? {
-      name: String(form.get('name')),
-      description: String(form.get('description')),
-      endpointUrl: String(form.get('endpointUrl')),
-      transport: 'streamable-http',
-      auth,
-    } : target.kind === 'curated' ? {
-      curatedAppId: target.app.id,
-      auth,
-    } : {
-      catalogServerId: target.server.id,
-      catalogEndpointId: endpoint?.id,
-      auth,
-    });
+    mutation.mutate(connectionInput(target, form, auth.auth, endpoint));
   };
   return <form className="form-grid" onSubmit={submit}>
     <div className="security-note"><ShieldCheck size={17}/><span>The connection starts <strong>off</strong> for safety. Authentication is encrypted by the backend and never returned to the browser.</span></div>

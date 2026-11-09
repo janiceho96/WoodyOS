@@ -2,6 +2,12 @@ import { Activity, ArrowRight, BookOpen, Bot, Check, CheckCircle2, ChevronLeft, 
 import { useCallback, useEffect, useState } from 'react';
 import { api, type Agent, type Onboarding, type Task } from '../../api';
 
+function handleOnboardingKey(event: KeyboardEvent, step: number, move: (step: number) => void, onPause: () => void) {
+  if (event.key === 'Escape') onPause();
+  if (event.key === 'ArrowRight' && step < 6) move(step + 1);
+  if (event.key === 'ArrowLeft' && step > 1) move(step - 1);
+}
+
 export function OnboardingFlow({ state, storageKey, agents, tasks, onUpdate, onPage, onPause, onCreateAgent }: {
   state: Onboarding; storageKey: string; agents: Agent[]; tasks: Task[]; onUpdate: (state: Onboarding) => void;
   onPage: (path: string) => void; onPause: () => void; onCreateAgent: () => void;
@@ -14,7 +20,7 @@ export function OnboardingFlow({ state, storageKey, agents, tasks, onUpdate, onP
   }, [onUpdate, storageKey]);
   const move = useCallback((next: number) => { setStep(next); void save('progress', next); }, [save]);
   useEffect(() => {
-    const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onPause(); if (event.key === 'ArrowRight' && step < 6) move(step + 1); if (event.key === 'ArrowLeft' && step > 1) move(step - 1); };
+    const handler = (event: KeyboardEvent) => handleOnboardingKey(event, step, move, onPause);
     window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler);
   }, [move, onPause, step]);
   const completed = { agent: agents.some((agent) => agent.status === 'active'), task: tasks.length > 0 };

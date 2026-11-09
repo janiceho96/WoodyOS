@@ -23,6 +23,8 @@ export type DryRunResult = {
   manifest: { definitionHash: string; inputHash: string; dependenciesHash: string; previewHash: string };
 };
 
+type DryRunInput = { workspaceId: string; definition: WorkflowDefinition; input: Record<string, unknown>; resources: DryRunResources; adapterSpy?: (...args: never[]) => unknown };
+
 const issue = (code: string, message: string, nodeId?: string, guidance = 'Correct the workflow definition and run the preview again.'): DryRunIssue => ({ code, message, nodeId, guidance });
 const externalTypes = new Set(['action', 'api_action', 'mcp_action', 'browser']);
 const unsafe = /(?:__proto__|prototype|constructor|\+|\(|\)|;|\[\s*['"])/;
@@ -90,56 +92,145 @@ function loopBodyRegions(definition: WorkflowDefinition) {
   return regions;
 }
 
-export async function dryRunWorkflow(input: { workspaceId: string; definition: WorkflowDefinition; input: Record<string, unknown>; resources: DryRunResources; adapterSpy?: (...args: never[]) => unknown }): Promise<DryRunResult> {
-  // Intentionally no adapter, queue, artifact, worker, manifest persistence, audit, or write call.
-  const errors: DryRunIssue[] = []; const warnings: DryRunIssue[] = [];
-  errors.push(...(input.resources.dependencyIssues ?? []));
-  const { nodes, path } = graph(input.definition, input.input, errors);
-  for (const message of workflowDefinitionErrors(input.definition)) errors.push(issue('DEFINITION_INVALID', message));
+function bindingResults(input: DryRunInput, nodes: Map<string, WorkflowNode>, errors: DryRunIssue[], warnings: DryRunIssue[]) {
   const bindings: ReturnType<typeof resolveBinding>[] = [];
   for (const edge of input.definition.edges as ContractBinding[]) {
-    const result = resolveBinding(edge, nodes); bindings.push(result);
+    const result = resolveBinding(edge, nodes);
+    bindings.push(result);
     if (result.issue) errors.push(result.issue);
     if (result.binding?.legacy) warnings.push(issue('LEGACY_PORT_DEFAULT', `${edge.source} → ${edge.target} uses legacy output-to-input ports`, edge.target, 'Save the workflow with explicit ports to remove this compatibility warning.'));
-    if (result.binding && !contractCompatible(result.binding)) errors.push(issue('NODE_SCHEMA_INCOMPATIBLE', `Binding ${edge.source}.${result.binding.sourcePort} is incompatible with ${edge.target}.${result.binding.targetPort}`, edge.target, 'Use matching schema types or add an explicit registered transformation.'));
-  }
-  for (const node of input.definition.nodes) {
-    const required = workflowNodeDefinition(node.type)?.inputPorts.filter((port) => port.required) ?? [];
-    for (const port of required) if (!bindings.some((result) => result.binding?.target === node.id && result.binding.targetPort === port.id)) errors.push(issue('REQUIRED_PORT_UNBOUND', `Required port ${node.id}.${port.id} has no binding`, node.id, 'Connect a compatible value to every required input port.'));
-  }
-  const externalActions: DryRunResult['externalActions'] = []; const requiredApprovals: DryRunResult['requiredApprovals'] = []; const missingResources: DryRunResult['missingResources'] = []; const pinnedAgents: DryRunResult['pinnedAgents'] = [];
-  let maxLoopIterations = 0;
-  for (const node of input.definition.nodes) {
-    const config = node.config;
-    for (const reference of references(config)) {
-      if (unsafe.test(reference)) errors.push(issue('UNSAFE_REFERENCE', `Node ${node.id} has unsafe reference ${reference}`, node.id, 'Use only safe input, variables, or upstream nodes paths.'));
-      else if (reference.startsWith('input.') && valueAtPath({ input: input.input }, reference) === undefined) warnings.push(issue('REFERENCE_UNRESOLVED', `Fixture input does not provide ${reference}`, node.id, 'Provide a fixture value or make the binding optional.'));
+    if (result.binding && !contractCompatible(result.binding)) {
+      errors.push(issue('NODE_SCHEMA_INCOMPATIBLE', `Binding ${edge.source}.${result.binding.sourcePort} is incompatible with ${edge.target}.${result.binding.targetPort}`, edge.target, 'Use matching schema types or add an explicit registered transformation.'));
     }
-    if (node.type === 'trigger' && Array.isArray(config.inputSchema)) for (const field of config.inputSchema as Array<Record<string, unknown>>) if (field.required && typeof field.key === 'string' && input.input[field.key] === undefined) errors.push(issue('INPUT_REQUIRED', `Required fixture input ${field.key} is missing`, node.id, 'Supply the required trigger input.'));
-    if (node.type === 'loop') { const bound = config.maxIterations; if (typeof bound !== 'number' || !Number.isInteger(bound) || bound < 1 || bound > 100) errors.push(issue('LOOP_BOUND_INVALID', `Loop ${node.id} must have a maximum between 1 and 100`, node.id, 'Set a finite integer loop limit from 1 to 100.')); else if (path.includes(node.id)) maxLoopIterations += bound; }
-    if (node.type === 'agent' || node.type === 'mcp_action') { const id = typeof config.agentId === 'string' ? config.agentId : ''; const agent = input.resources.agents.get(id); if (!agent) { missingResources.push({ nodeId: node.id, resourceId: id, kind: 'agent' }); errors.push(issue('RESOURCE_NOT_FOUND', `Agent ${id || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an active workspace agent.')); } else if (!agent.versionId || !agent.version) errors.push(issue('AGENT_VERSION_REQUIRED', `Agent ${id} has no pinned published version`, node.id, 'Publish an agent version before using it in a workflow.')); else pinnedAgents.push({ nodeId: node.id, agentId: id, versionId: agent.versionId, version: agent.version }); }
-    if (externalTypes.has(node.type)) {
-      const resourceId = typeof config.toolId === 'string' ? config.toolId : typeof config.mcpToolId === 'string' ? config.mcpToolId : '';
-      const adapter = node.type === 'mcp_action' ? 'mcp' : node.type === 'action' ? 'legacy_tool' : node.type === 'browser' ? 'browser' : 'api';
-      const resource = node.type === 'mcp_action' ? input.resources.mcpTools.get(resourceId) : input.resources.tools.get(resourceId);
-      if (!resource) { missingResources.push({ nodeId: node.id, resourceId, kind: adapter }); errors.push(issue('RESOURCE_NOT_FOUND', `${adapter} resource ${resourceId || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an enabled resource owned by this workspace.')); }
-      else {
-        if (node.type === 'mcp_action' && resource.agentIds && !resource.agentIds.includes(String(config.agentId))) errors.push(issue('MCP_ACCESS_DENIED', `MCP tool ${resourceId} is not allowlisted for agent ${String(config.agentId)}`, node.id, 'Enable this tool for the selected agent or choose an allowed action.'));
-        const requiresConfirmation = node.type === 'action' ? resource.requiresApproval !== false : resource.risk !== 'read'; externalActions.push({ nodeId: node.id, adapter, resourceId, risk: resource.risk, permissions: [...resource.permissions].sort(), requiresConfirmation }); if (requiresConfirmation) requiredApprovals.push({ nodeId: node.id, reason: 'External write requires confirmation' });
+  }
+  return bindings;
+}
+
+function requiredPortErrors(definition: WorkflowDefinition, bindings: ReturnType<typeof resolveBinding>[]) {
+  const errors: DryRunIssue[] = [];
+  for (const node of definition.nodes) {
+    const required = workflowNodeDefinition(node.type)?.inputPorts.filter((port) => port.required) ?? [];
+    for (const port of required) {
+      if (!bindings.some((result) => result.binding?.target === node.id && result.binding.targetPort === port.id)) {
+        errors.push(issue('REQUIRED_PORT_UNBOUND', `Required port ${node.id}.${port.id} has no binding`, node.id, 'Connect a compatible value to every required input port.'));
       }
     }
-    if (node.type === 'approval') requiredApprovals.push({ nodeId: node.id, reason: 'Human approval node', prompt: typeof config.prompt === 'string' ? config.prompt : undefined });
-    if (!workflowNodeDefinition(node.type)?.available) errors.push(issue('NODE_UNAVAILABLE', `Node ${node.id} has no available runtime adapter`, node.id, 'Replace the unavailable node before execution.'));
   }
-  const bodyRegions = loopBodyRegions(input.definition);
-  const multiplierFor = (nodeId: string) => input.definition.nodes.reduce((total, node) => {
+  return errors;
+}
+
+function inspectNodeReferences(node: WorkflowNode, input: DryRunInput, errors: DryRunIssue[], warnings: DryRunIssue[]) {
+  for (const reference of references(node.config)) {
+    if (unsafe.test(reference)) {
+      errors.push(issue('UNSAFE_REFERENCE', `Node ${node.id} has unsafe reference ${reference}`, node.id, 'Use only safe input, variables, or upstream nodes paths.'));
+    } else if (reference.startsWith('input.') && valueAtPath({ input: input.input }, reference) === undefined) {
+      warnings.push(issue('REFERENCE_UNRESOLVED', `Fixture input does not provide ${reference}`, node.id, 'Provide a fixture value or make the binding optional.'));
+    }
+  }
+}
+
+function inspectTriggerInput(node: WorkflowNode, input: DryRunInput, errors: DryRunIssue[]) {
+  if (node.type !== 'trigger' || !Array.isArray(node.config.inputSchema)) return;
+  for (const field of node.config.inputSchema as Array<Record<string, unknown>>) {
+    if (field.required && typeof field.key === 'string' && input.input[field.key] === undefined) {
+      errors.push(issue('INPUT_REQUIRED', `Required fixture input ${field.key} is missing`, node.id, 'Supply the required trigger input.'));
+    }
+  }
+}
+
+function inspectLoopBound(node: WorkflowNode, path: string[], errors: DryRunIssue[]) {
+  if (node.type !== 'loop') return 0;
+  const bound = node.config.maxIterations;
+  if (typeof bound !== 'number' || !Number.isInteger(bound) || bound < 1 || bound > 100) {
+    errors.push(issue('LOOP_BOUND_INVALID', `Loop ${node.id} must have a maximum between 1 and 100`, node.id, 'Set a finite integer loop limit from 1 to 100.'));
+    return 0;
+  }
+  return path.includes(node.id) ? bound : 0;
+}
+
+function inspectAgentResource(node: WorkflowNode, input: DryRunInput, errors: DryRunIssue[], missingResources: DryRunResult['missingResources'], pinnedAgents: DryRunResult['pinnedAgents']) {
+  if (node.type !== 'agent' && node.type !== 'mcp_action') return;
+  const id = typeof node.config.agentId === 'string' ? node.config.agentId : '';
+  const agent = input.resources.agents.get(id);
+  if (!agent) {
+    missingResources.push({ nodeId: node.id, resourceId: id, kind: 'agent' });
+    errors.push(issue('RESOURCE_NOT_FOUND', `Agent ${id || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an active workspace agent.'));
+  } else if (!agent.versionId || !agent.version) {
+    errors.push(issue('AGENT_VERSION_REQUIRED', `Agent ${id} has no pinned published version`, node.id, 'Publish an agent version before using it in a workflow.'));
+  } else {
+    pinnedAgents.push({ nodeId: node.id, agentId: id, versionId: agent.versionId, version: agent.version });
+  }
+}
+
+function externalAdapter(node: WorkflowNode): DryRunResult['externalActions'][number]['adapter'] {
+  if (node.type === 'mcp_action') return 'mcp';
+  if (node.type === 'action') return 'legacy_tool';
+  if (node.type === 'browser') return 'browser';
+  return 'api';
+}
+
+function inspectExternalResource(
+  node: WorkflowNode,
+  input: DryRunInput,
+  errors: DryRunIssue[],
+  externalActions: DryRunResult['externalActions'],
+  requiredApprovals: DryRunResult['requiredApprovals'],
+  missingResources: DryRunResult['missingResources'],
+) {
+  if (!externalTypes.has(node.type)) return;
+  const resourceId = typeof node.config.toolId === 'string' ? node.config.toolId : typeof node.config.mcpToolId === 'string' ? node.config.mcpToolId : '';
+  const adapter = externalAdapter(node);
+  const resource = node.type === 'mcp_action' ? input.resources.mcpTools.get(resourceId) : input.resources.tools.get(resourceId);
+  if (!resource) {
+    missingResources.push({ nodeId: node.id, resourceId, kind: adapter });
+    errors.push(issue('RESOURCE_NOT_FOUND', `${adapter} resource ${resourceId || '(missing)'} is unavailable in this workspace`, node.id, 'Choose an enabled resource owned by this workspace.'));
+    return;
+  }
+  if (node.type === 'mcp_action' && resource.agentIds && !resource.agentIds.includes(String(node.config.agentId))) {
+    errors.push(issue('MCP_ACCESS_DENIED', `MCP tool ${resourceId} is not allowlisted for agent ${String(node.config.agentId)}`, node.id, 'Enable this tool for the selected agent or choose an allowed action.'));
+  }
+  const requiresConfirmation = node.type === 'action' ? resource.requiresApproval !== false : resource.risk !== 'read';
+  externalActions.push({ nodeId: node.id, adapter, resourceId, risk: resource.risk, permissions: [...resource.permissions].sort(), requiresConfirmation });
+  if (requiresConfirmation) requiredApprovals.push({ nodeId: node.id, reason: 'External write requires confirmation' });
+}
+
+function inspectNode(node: WorkflowNode, input: DryRunInput, path: string[], results: {
+  errors: DryRunIssue[];
+  warnings: DryRunIssue[];
+  externalActions: DryRunResult['externalActions'];
+  requiredApprovals: DryRunResult['requiredApprovals'];
+  missingResources: DryRunResult['missingResources'];
+  pinnedAgents: DryRunResult['pinnedAgents'];
+}) {
+  inspectNodeReferences(node, input, results.errors, results.warnings);
+  inspectTriggerInput(node, input, results.errors);
+  const loopIterations = inspectLoopBound(node, path, results.errors);
+  inspectAgentResource(node, input, results.errors, results.missingResources, results.pinnedAgents);
+  inspectExternalResource(node, input, results.errors, results.externalActions, results.requiredApprovals, results.missingResources);
+  if (node.type === 'approval') results.requiredApprovals.push({ nodeId: node.id, reason: 'Human approval node', prompt: typeof node.config.prompt === 'string' ? node.config.prompt : undefined });
+  if (!workflowNodeDefinition(node.type)?.available) results.errors.push(issue('NODE_UNAVAILABLE', `Node ${node.id} has no available runtime adapter`, node.id, 'Replace the unavailable node before execution.'));
+  return loopIterations;
+}
+
+function estimateNodeMultiplier(nodeId: string, definition: WorkflowDefinition, path: string[], bodyRegions: Map<string, Set<string>>) {
+  return definition.nodes.reduce((total, node) => {
     const bound = node.config.maxIterations;
-    return node.type === 'loop' && path.includes(node.id) && bodyRegions.get(node.id)?.has(nodeId)
-      && typeof bound === 'number' && Number.isInteger(bound) && bound >= 1 && bound <= 100
-      ? total * bound
-      : total;
+    const participatesInLoop = node.type === 'loop' && path.includes(node.id) && bodyRegions.get(node.id)?.has(nodeId);
+    const hasValidBound = typeof bound === 'number' && Number.isInteger(bound) && bound >= 1 && bound <= 100;
+    return participatesInLoop && hasValidBound ? total * bound : total;
   }, 1);
-  const estimatedBudgets = {
+}
+
+function nodeExecutionCount(nodeId: string, node: WorkflowNode | undefined, multiplier: number) {
+  if (node?.type !== 'loop') return multiplier;
+  const bound = node.config.maxIterations;
+  if (typeof bound !== 'number' || !Number.isInteger(bound) || bound < 1 || bound > 100) return multiplier;
+  return multiplier * (bound + 1);
+}
+
+function estimateBudgets(input: DryRunInput, path: string[], nodes: Map<string, WorkflowNode>, bodyRegions: Map<string, Set<string>>, externalActions: DryRunResult['externalActions'], maxLoopIterations: number) {
+  const multiplierFor = (nodeId: string) => estimateNodeMultiplier(nodeId, input.definition, path, bodyRegions);
+  return {
     agentCalls: input.definition.nodes
       .filter((node) => node.type === 'agent' && path.includes(node.id))
       .reduce((total, node) => total + multiplierFor(node.id), 0),
@@ -147,21 +238,14 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
     externalActions: externalActions
       .filter((action) => path.includes(action.nodeId))
       .reduce((total, action) => total + multiplierFor(action.nodeId), 0),
-    maxNodeExecutions: path.reduce((total, nodeId) => {
-      const node = nodes.get(nodeId);
-      const bound = node?.config.maxIterations;
-      return total + (node?.type === 'loop'
-        && typeof bound === 'number'
-        && Number.isInteger(bound)
-        && bound >= 1
-        && bound <= 100
-        ? multiplierFor(nodeId) * (bound + 1)
-        : multiplierFor(nodeId));
-    }, 0),
+    maxNodeExecutions: path.reduce((total, nodeId) => total + nodeExecutionCount(nodeId, nodes.get(nodeId), multiplierFor(nodeId)), 0),
   };
-  const definitionHash = canonicalJsonHash(input.definition); const inputHash = canonicalJsonHash(input.input);
+}
+
+function dependencySnapshot(input: DryRunInput): Record<string, unknown> {
+  if (input.resources.dependencies) return input.resources.dependencies;
   const sorted = <T extends { id: string }>(items: Iterable<T>) => [...items].sort((left, right) => left.id.localeCompare(right.id));
-  const dependencies = input.resources.dependencies ?? {
+  return {
     agents: Object.fromEntries(sorted(input.resources.agents.values()).map((agent) => [agent.id, agent])),
     prompts: {},
     models: {},
@@ -182,7 +266,40 @@ export async function dryRunWorkflow(input: { workspaceId: string; definition: W
     artifactTemplates: {},
     runtime: { version: process.env.RUNTIME_VERSION ?? '0.1.0', stateSchemaVersion: 1 as const },
   };
+}
+
+export async function dryRunWorkflow(input: DryRunInput): Promise<DryRunResult> {
+  // Intentionally no adapter, queue, artifact, worker, manifest persistence, audit, or write call.
+  const errors: DryRunIssue[] = [];
+  const warnings: DryRunIssue[] = [];
+  errors.push(...(input.resources.dependencyIssues ?? []));
+
+  const { nodes, path } = graph(input.definition, input.input, errors);
+  for (const message of workflowDefinitionErrors(input.definition)) errors.push(issue('DEFINITION_INVALID', message));
+  const bindings = bindingResults(input, nodes, errors, warnings);
+  errors.push(...requiredPortErrors(input.definition, bindings));
+
+  const externalActions: DryRunResult['externalActions'] = [];
+  const requiredApprovals: DryRunResult['requiredApprovals'] = [];
+  const missingResources: DryRunResult['missingResources'] = [];
+  const pinnedAgents: DryRunResult['pinnedAgents'] = [];
+  let maxLoopIterations = 0;
+  const nodeResults = { errors, warnings, externalActions, requiredApprovals, missingResources, pinnedAgents };
+  for (const node of input.definition.nodes) {
+    maxLoopIterations += inspectNode(node, input, path, nodeResults);
+  }
+
+  const bodyRegions = loopBodyRegions(input.definition);
+  const estimatedBudgets = estimateBudgets(input, path, nodes, bodyRegions, externalActions, maxLoopIterations);
+  const definitionHash = canonicalJsonHash(input.definition);
+  const inputHash = canonicalJsonHash(input.input);
+  const dependencies = dependencySnapshot(input);
   const dependenciesHash = canonicalJsonHash(dependencies);
-  const manifest = { definitionHash, inputHash, dependenciesHash, previewHash: canonicalJsonHash({ definitionHash, inputHash, dependenciesHash, path, bindings, externalActions, requiredApprovals, pinnedAgents, estimatedBudgets }) };
+  const manifest = {
+    definitionHash,
+    inputHash,
+    dependenciesHash,
+    previewHash: canonicalJsonHash({ definitionHash, inputHash, dependenciesHash, path, bindings, externalActions, requiredApprovals, pinnedAgents, estimatedBudgets }),
+  };
   return { valid: errors.length === 0, executionPath: path, bindings, errors, warnings, externalActions, requiredApprovals, missingResources, pinnedAgents, estimatedBudgets, manifest };
 }

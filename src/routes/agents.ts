@@ -42,11 +42,14 @@ async function validateTools(workspaceId: string, toolIds: string[]) {
   return new Set(result.rows.map((row) => row.id)).size === new Set(toolIds).size;
 }
 
-export async function agentRoutes(app: FastifyInstance) {
+function registerAgentGetRootRoute(app: FastifyInstance) {
   app.get('/', { preHandler: app.authenticate }, asyncRoute(async (request) => {
     const result = await query('SELECT * FROM agents WHERE workspace_id=$1 ORDER BY updated_at DESC', [request.user.workspaceId]);
     return { data: result.rows };
   }));
+}
+
+function registerAgentPostRootRoute(app: FastifyInstance) {
   app.post('/', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(agentInput, request.body, reply); if (!input) return;
     if (input.avatar?.type === 'image') return reply.code(400).send({ error: 'AGENT_AVATAR_UPLOAD_REQUIRED' });
@@ -55,6 +58,9 @@ export async function agentRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'agent.created', 'agent', result.rows[0].id);
     return reply.code(201).send(result.rows[0]);
   }));
+}
+
+function registerAgentPostGeneratePromptRoute(app: FastifyInstance) {
   app.post('/generate-prompt', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(agentPromptRequestSchema, request.body, reply); if (!input) return;
     const generated = await generateAgentPrompt(request.user.workspaceId, input);
@@ -65,6 +71,9 @@ export async function agentRoutes(app: FastifyInstance) {
     });
     return generated;
   }));
+}
+
+function registerAgentGetByIdMcpAccessRoute(app: FastifyInstance) {
   app.get('/:id/mcp-access', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const params = parse(z.object({ id: z.string().uuid() }), request.params, reply);
     if (!params) return;
@@ -72,6 +81,9 @@ export async function agentRoutes(app: FastifyInstance) {
     if (!access) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
     return access;
   }));
+}
+
+function registerAgentGetByIdVersionsRoute(app: FastifyInstance) {
   app.get('/:id/versions', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const params = parse(z.object({ id: z.string().uuid() }), request.params, reply);
     if (!params) return;
@@ -89,6 +101,9 @@ export async function agentRoutes(app: FastifyInstance) {
     );
     return { data: versions.rows };
   }));
+}
+
+function registerAgentPostByIdPublishRoute(app: FastifyInstance) {
   app.post('/:id/publish', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const params = parse(z.object({ id: z.string().uuid() }), request.params, reply);
     if (!params) return;
@@ -103,11 +118,17 @@ export async function agentRoutes(app: FastifyInstance) {
     });
     return reply.code(201).send(published);
   }));
+}
+
+function registerAgentGetByIdRoute(app: FastifyInstance) {
   app.get('/:id', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const result = await query('SELECT * FROM agents WHERE id=$1 AND workspace_id=$2', [(request.params as { id: string }).id, request.user.workspaceId]);
     if (!result.rowCount) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
     return result.rows[0];
   }));
+}
+
+function registerAgentPatchByIdRoute(app: FastifyInstance) {
   app.patch('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const input = parse(agentInput.partial(), request.body, reply); if (!input) return;
     const agentId = (request.params as { id: string }).id;
@@ -128,6 +149,9 @@ export async function agentRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'agent.updated', 'agent', result.rows[0].id, { fields: entries.map(([name]) => name) });
     return result.rows[0];
   }));
+}
+
+function registerAgentPostByIdAvatarImageRoute(app: FastifyInstance) {
   app.post('/:id/avatar/image', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const agentId = (request.params as { id: string }).id;
     const upload = await request.file({ limits: { fileSize: 2 * 1024 * 1024, files: 1 } });
@@ -137,6 +161,9 @@ export async function agentRoutes(app: FastifyInstance) {
     await audit(request.user.workspaceId, request.user.sub, 'agent.avatar_uploaded', 'agent', agentId, { sizeBytes: asset.size_bytes });
     return reply.code(201).send(agent);
   }));
+}
+
+function registerAgentGetByIdAvatarImageRoute(app: FastifyInstance) {
   app.get('/:id/avatar/image', { preHandler: app.authenticate }, asyncRoute(async (request, reply) => {
     const asset = await findAgentAvatar(request.user.workspaceId, (request.params as { id: string }).id);
     if (!asset) return reply.code(404).send({ error: 'AGENT_AVATAR_NOT_FOUND' });
@@ -148,16 +175,37 @@ export async function agentRoutes(app: FastifyInstance) {
     reply.header('x-content-type-options', 'nosniff');
     return reply.send(file.stream);
   }));
+}
+
+function registerAgentDeleteByIdAvatarRoute(app: FastifyInstance) {
   app.delete('/:id/avatar', { preHandler: (request) => app.authorize(request, ['owner', 'admin', 'member']) }, asyncRoute(async (request, reply) => {
     const agentId = (request.params as { id: string }).id;
     await deleteAgentAvatar(request.user.workspaceId, agentId);
     await audit(request.user.workspaceId, request.user.sub, 'agent.avatar_reset', 'agent', agentId);
     return reply.code(204).send();
   }));
+}
+
+function registerAgentDeleteByIdRoute(app: FastifyInstance) {
   app.delete('/:id', { preHandler: (request) => app.authorize(request, ['owner', 'admin']) }, asyncRoute(async (request, reply) => {
     const result = await query('UPDATE agents SET status=$1,updated_at=now() WHERE id=$2 AND workspace_id=$3 RETURNING id', ['archived', (request.params as { id: string }).id, request.user.workspaceId]);
     if (!result.rowCount) return reply.code(404).send({ error: 'AGENT_NOT_FOUND' });
     await audit(request.user.workspaceId, request.user.sub, 'agent.archived', 'agent', result.rows[0].id);
     return reply.code(204).send();
   }));
+}
+
+export async function agentRoutes(app: FastifyInstance) {
+  registerAgentGetRootRoute(app);
+  registerAgentPostRootRoute(app);
+  registerAgentPostGeneratePromptRoute(app);
+  registerAgentGetByIdMcpAccessRoute(app);
+  registerAgentGetByIdVersionsRoute(app);
+  registerAgentPostByIdPublishRoute(app);
+  registerAgentGetByIdRoute(app);
+  registerAgentPatchByIdRoute(app);
+  registerAgentPostByIdAvatarImageRoute(app);
+  registerAgentGetByIdAvatarImageRoute(app);
+  registerAgentDeleteByIdAvatarRoute(app);
+  registerAgentDeleteByIdRoute(app);
 }

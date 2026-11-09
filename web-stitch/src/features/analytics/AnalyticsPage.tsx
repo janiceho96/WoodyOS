@@ -10,15 +10,7 @@ import { AgentAvatar } from '../../components/agents/AgentAvatar';
 
 type Range = 1 | 7 | 30;
 
-export function AnalyticsPage() {
-  const { data } = useWorkspace();
-  const [range, setRange] = useState<Range>(7);
-  const analyticsQuery = useQuery({
-    queryKey: ['operations-analytics', range],
-    queryFn: () => api.analytics(range),
-    placeholderData: (previous) => previous,
-  });
-  const analytics = analyticsQuery.data ?? data.analytics;
+function analyticsSummary(analytics: Analytics | undefined, range: Range) {
   const completed = Number(analytics?.tasks.completed_tasks ?? 0);
   const failed = Number(analytics?.tasks.failed_tasks ?? 0);
   const running = Number(analytics?.tasks.running_tasks ?? 0);
@@ -33,6 +25,19 @@ export function AnalyticsPage() {
   const days = fillDaily(range, analytics?.daily ?? []);
   const chartMode: 'cost' | 'tokens' = pricingAvailable ? 'cost' : 'tokens';
   const maximumTrend = Math.max(...days.map((day) => chartMode === 'cost' ? day.cost : day.tokens), 0);
+  return { completed, failed, running, outcomes, successRate, averageDuration, inputTokens, outputTokens, tokens, cost, pricingAvailable, days, chartMode, maximumTrend };
+}
+
+export function AnalyticsPage() {
+  const { data } = useWorkspace();
+  const [range, setRange] = useState<Range>(7);
+  const analyticsQuery = useQuery({
+    queryKey: ['operations-analytics', range],
+    queryFn: () => api.analytics(range),
+    placeholderData: (previous) => previous,
+  });
+  const analytics = analyticsQuery.data ?? data.analytics;
+  const { completed, failed, running, outcomes, successRate, averageDuration, inputTokens, outputTokens, tokens, cost, pricingAvailable, days, chartMode, maximumTrend } = analyticsSummary(analytics, range);
 
   return <div className="analytics-page analytics-redesign">
     <PageHeader eyebrow="Operations" title="Analytics" description="Understand what Woody costs, how reliably work finishes, which agents are effective, and how much provider capacity remains." actions={<div className="range-switch" role="group" aria-label="Analytics date range">{([1, 7, 30] as const).map((value) => <button type="button" key={value} className={range === value ? 'active' : ''} aria-pressed={range === value} onClick={() => setRange(value)}>{value === 1 ? '24h' : `${value}d`}</button>)}</div>}/>

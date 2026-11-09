@@ -322,11 +322,7 @@ def add_style_content(slide, heading: str, chunk: list[str], theme: dict):
             add_card(slide, f"{line_index + 1}", line[:700], 5.25, 1.55 + line_index * 0.92, 6.65, 0.76, theme)
 
 
-def generate_pptx(title: str, blocks: list[dict], raw_theme: dict | None = None) -> bytes:
-    theme = ppt_theme(raw_theme)
-    presentation = Presentation()
-    presentation.slide_width = PptxInches(13.333)
-    presentation.slide_height = PptxInches(7.5)
+def add_pptx_title_slide(presentation, title: str, theme: dict) -> None:
     title_slide = presentation.slides.add_slide(presentation.slide_layouts[6])
     setup_slide(title_slide, theme)
     if theme["style"] != "minimal-light":
@@ -336,59 +332,91 @@ def generate_pptx(title: str, blocks: list[dict], raw_theme: dict | None = None)
     add_text(title_slide, strip_markdown(title), 0.75, 1.55, 9.8, 2.2, font=theme["headingFont"], size=35, color=theme["text"], bold=True)
     add_text(title_slide, "A structured presentation generated from your verified workflow output.", 0.75, 4.35, 7.5, 0.6, font=theme["bodyFont"], size=16, color=theme["muted"])
     add_text(title_slide, "WOODY AGENT OS", 0.75, 6.68, 4.0, 0.28, font=theme["bodyFont"], size=9, color=theme["success"], bold=True)
-    slide_number = 1
-    for section_title, section_blocks in presentation_sections(title, blocks):
-        bullet_lines: list[str] = []
-        tables: list[list[list[str]]] = []
-        for block in section_blocks:
-            if block["type"] == "paragraph": bullet_lines.append(strip_markdown(block["text"]))
-            elif block["type"] == "list": bullet_lines.extend(strip_markdown(item) for item in block["items"])
-            elif block["type"] == "heading": bullet_lines.append(strip_markdown(block["text"]))
-            elif block["type"] == "code": bullet_lines.append(block["text"][:800])
-            elif block["type"] == "table": tables.append(block["rows"])
-        preserved_lines: list[str] = []
-        for line in bullet_lines:
-            words = line.split()
-            current = ""
-            for word in words:
-                if len(current) + len(word) + 1 > 760 and current:
-                    preserved_lines.append(current)
-                    current = word
-                else:
-                    current = f"{current} {word}".strip()
-            if current or not words:
+
+
+def pptx_section_content(section_blocks: list[dict]) -> tuple[list[str], list[list[list[str]]]]:
+    bullet_lines: list[str] = []
+    tables: list[list[list[str]]] = []
+    for block in section_blocks:
+        if block["type"] == "paragraph":
+            bullet_lines.append(strip_markdown(block["text"]))
+        elif block["type"] == "list":
+            bullet_lines.extend(strip_markdown(item) for item in block["items"])
+        elif block["type"] == "heading":
+            bullet_lines.append(strip_markdown(block["text"]))
+        elif block["type"] == "code":
+            bullet_lines.append(block["text"][:800])
+        elif block["type"] == "table":
+            tables.append(block["rows"])
+    return bullet_lines, tables
+
+
+def wrap_pptx_bullet_lines(bullet_lines: list[str]) -> list[list[str]]:
+    preserved_lines: list[str] = []
+    for line in bullet_lines:
+        words = line.split()
+        current = ""
+        for word in words:
+            if len(current) + len(word) + 1 > 760 and current:
                 preserved_lines.append(current)
-        chunks = [preserved_lines[index:index + 6] for index in range(0, len(preserved_lines), 6)] or [[]]
-        for chunk_index, chunk in enumerate(chunks):
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+        if current or not words:
+            preserved_lines.append(current)
+    return [preserved_lines[index:index + 6] for index in range(0, len(preserved_lines), 6)] or [[]]
+
+
+def add_pptx_content_slides(presentation, section_title: str, chunks: list[list[str]], theme: dict, slide_number: int) -> int:
+    for chunk_index, chunk in enumerate(chunks):
+        slide_number += 1
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        setup_slide(slide, theme, slide_number)
+        heading = section_title if chunk_index == 0 else f"{section_title} · continued"
+        add_style_content(slide, heading, chunk, theme)
+    return slide_number
+
+
+def add_pptx_table_slides(presentation, section_title: str, tables: list[list[list[str]]], theme: dict, slide_number: int) -> int:
+    for table_index, rows in enumerate(tables):
+        header, data_rows = rows[0], rows[1:]
+        pages = [data_rows[index:index + 14] for index in range(0, len(data_rows), 14)] or [[]]
+        for page_index, page_rows in enumerate(pages):
+            page = [header, *page_rows]
+            cols = len(header)
             slide_number += 1
             slide = presentation.slides.add_slide(presentation.slide_layouts[6])
             setup_slide(slide, theme, slide_number)
-            heading = section_title if chunk_index == 0 else f"{section_title} · continued"
-            add_style_content(slide, heading, chunk, theme)
-        for table_index, rows in enumerate(tables):
-            header, data_rows = rows[0], rows[1:]
-            pages = [data_rows[index:index + 14] for index in range(0, len(data_rows), 14)] or [[]]
-            for page_index, page_rows in enumerate(pages):
-                page = [header, *page_rows]
-                cols = len(header)
-                slide_number += 1
-                slide = presentation.slides.add_slide(presentation.slide_layouts[6])
-                setup_slide(slide, theme, slide_number)
-                continuation = f" · page {page_index + 1}" if len(pages) > 1 else ""
-                add_text(slide, f"{section_title} — Table {table_index + 1}{continuation}", 0.75, 0.52, 11.6, 0.7, font=theme["headingFont"], size=23, color=theme["text"], bold=True)
-                shape = slide.shapes.add_table(len(page), cols, PptxInches(0.6), PptxInches(1.5), PptxInches(12.1), PptxInches(5.3))
-                table = shape.table
-                for row_index, row in enumerate(page):
-                    for col_index, value in enumerate(row):
-                        cell = table.cell(row_index, col_index)
-                        cell.text = strip_markdown(value)
-                        cell.text_frame.paragraphs[0].font.size = PptxPt(12)
-                        cell.fill.solid()
-                        cell.fill.fore_color.rgb = ppt_color(theme["primary"] if row_index == 0 else theme["surface"])
-                        cell.text_frame.paragraphs[0].font.color.rgb = ppt_color(theme["text"])
-                        cell.text_frame.paragraphs[0].alignment = PP_ALIGN.LEFT
-                        if row_index == 0:
-                            cell.text_frame.paragraphs[0].font.bold = True
+            continuation = f" · page {page_index + 1}" if len(pages) > 1 else ""
+            add_text(slide, f"{section_title} — Table {table_index + 1}{continuation}", 0.75, 0.52, 11.6, 0.7, font=theme["headingFont"], size=23, color=theme["text"], bold=True)
+            shape = slide.shapes.add_table(len(page), cols, PptxInches(0.6), PptxInches(1.5), PptxInches(12.1), PptxInches(5.3))
+            table = shape.table
+            for row_index, row in enumerate(page):
+                for col_index, value in enumerate(row):
+                    cell = table.cell(row_index, col_index)
+                    cell.text = strip_markdown(value)
+                    cell.text_frame.paragraphs[0].font.size = PptxPt(12)
+                    cell.fill.solid()
+                    cell.fill.fore_color.rgb = ppt_color(theme["primary"] if row_index == 0 else theme["surface"])
+                    cell.text_frame.paragraphs[0].font.color.rgb = ppt_color(theme["text"])
+                    cell.text_frame.paragraphs[0].alignment = PP_ALIGN.LEFT
+                    if row_index == 0:
+                        cell.text_frame.paragraphs[0].font.bold = True
+    return slide_number
+
+
+def generate_pptx(title: str, blocks: list[dict], raw_theme: dict | None = None) -> bytes:
+    theme = ppt_theme(raw_theme)
+    presentation = Presentation()
+    presentation.slide_width = PptxInches(13.333)
+    presentation.slide_height = PptxInches(7.5)
+    add_pptx_title_slide(presentation, title, theme)
+    slide_number = 1
+    for section_title, section_blocks in presentation_sections(title, blocks):
+        bullet_lines, tables = pptx_section_content(section_blocks)
+        chunks = wrap_pptx_bullet_lines(bullet_lines)
+        slide_number = add_pptx_content_slides(presentation, section_title, chunks, theme, slide_number)
+        slide_number = add_pptx_table_slides(presentation, section_title, tables, theme, slide_number)
     target = io.BytesIO()
     presentation.save(target)
     return target.getvalue()

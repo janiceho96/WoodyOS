@@ -73,21 +73,35 @@ async function publicRuntimeConfig(workspaceId: string) {
   };
 }
 
-function safeProviderFailure(cause: unknown) {
-  const status = cause && typeof cause === 'object' && 'status' in cause ? Number((cause as { status?: unknown }).status) : 0;
-  const reportedCode = cause && typeof cause === 'object' && 'code' in cause && typeof (cause as { code?: unknown }).code === 'string'
+function reportedProviderCode(cause: unknown) {
+  return cause && typeof cause === 'object' && 'code' in cause && typeof (cause as { code?: unknown }).code === 'string'
     ? String((cause as { code: string }).code)
     : '';
-  const code = reportedCode.startsWith('AI_PROVIDER_') ? reportedCode
-    : status === 401 || status === 403 ? 'AI_PROVIDER_AUTH_FAILED'
-      : status === 404 ? 'AI_PROVIDER_MODEL_NOT_FOUND'
-        : status === 429 ? 'AI_PROVIDER_RATE_LIMITED'
-          : 'AI_PROVIDER_REQUEST_FAILED';
-  const message = code === 'AI_PROVIDER_AUTH_FAILED' ? 'The provider rejected the API key.'
-    : code === 'AI_PROVIDER_MODEL_NOT_FOUND' ? 'The configured model was not found.'
-      : code === 'AI_PROVIDER_RATE_LIMITED' ? 'The provider rate limit was reached.'
-        : code.startsWith('AI_PROVIDER_ENDPOINT') || code === 'AI_PROVIDER_REDIRECT_BLOCKED' ? (cause instanceof Error ? cause.message : 'The provider endpoint is not allowed.')
-          : 'Woody could not complete a test request to this provider.';
+}
+
+function providerFailureCode(cause: unknown, status: number) {
+  const reportedCode = reportedProviderCode(cause);
+  if (reportedCode.startsWith('AI_PROVIDER_')) return reportedCode;
+  if (status === 401 || status === 403) return 'AI_PROVIDER_AUTH_FAILED';
+  if (status === 404) return 'AI_PROVIDER_MODEL_NOT_FOUND';
+  if (status === 429) return 'AI_PROVIDER_RATE_LIMITED';
+  return 'AI_PROVIDER_REQUEST_FAILED';
+}
+
+function providerFailureMessage(cause: unknown, code: string) {
+  if (code === 'AI_PROVIDER_AUTH_FAILED') return 'The provider rejected the API key.';
+  if (code === 'AI_PROVIDER_MODEL_NOT_FOUND') return 'The configured model was not found.';
+  if (code === 'AI_PROVIDER_RATE_LIMITED') return 'The provider rate limit was reached.';
+  if (code.startsWith('AI_PROVIDER_ENDPOINT') || code === 'AI_PROVIDER_REDIRECT_BLOCKED') {
+    return cause instanceof Error ? cause.message : 'The provider endpoint is not allowed.';
+  }
+  return 'Woody could not complete a test request to this provider.';
+}
+
+function safeProviderFailure(cause: unknown) {
+  const status = cause && typeof cause === 'object' && 'status' in cause ? Number((cause as { status?: unknown }).status) : 0;
+  const code = providerFailureCode(cause, status);
+  const message = providerFailureMessage(cause, code);
   return { code, message };
 }
 
